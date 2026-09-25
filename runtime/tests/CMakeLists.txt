@@ -156,3 +156,9 @@ add_test(NAME gemv_ptq1_gpu_test COMMAND gemv_ptq1_gpu_test)
 add_executable(gpu_link_2gpu_test gpu_link_2gpu_test.cpp)
 target_link_libraries(gpu_link_2gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME gpu_link_2gpu_test COMMAND gpu_link_2gpu_test)
+
+# WP-4: the TP gate's validation matrix (exact refusal strings, --tp/--devices parsing, arch
+# match helper) -- pure C++ against server/include/tp_plan.hpp; no CUDA, no linkage, GPU-free.
+add_executable(tp_config_cpu_test tp_config_cpu_test.cpp)
+set_target_properties(tp_config_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME tp_config_cpu_test COMMAND tp_config_cpu_test)
