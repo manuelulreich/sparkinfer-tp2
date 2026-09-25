@@ -150,3 +150,9 @@ set_target_properties(gemv_ptq1_gpu_test PROPERTIES CXX_STANDARD 17)
 target_include_directories(gemv_ptq1_gpu_test PRIVATE ../include)
 target_link_libraries(gemv_ptq1_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME gemv_ptq1_gpu_test COMMAND gemv_ptq1_gpu_test)
+
+# WP-3: 2-rank comm (allreduce/maxreduce) on the 2-GPU pair. Skips (exit 0, repo precedent)
+# unless >=2 GPUs and >=96 MiB free VRAM per card - an LLM is resident on this box (lean mode).
+add_executable(gpu_link_2gpu_test gpu_link_2gpu_test.cpp)
+target_link_libraries(gpu_link_2gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME gpu_link_2gpu_test COMMAND gpu_link_2gpu_test)

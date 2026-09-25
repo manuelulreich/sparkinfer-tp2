@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <ctime>
 #include "model_engine.hpp"
+#include "tp_plan.hpp"      // the tensor-parallel plan (g_tp/g_devices) model_engine.cpp reads
 #include "video_input.hpp"   // video_decoder_available() for /v1/models input_modalities
 #include "sparkinfer/kernels/deterministic.h"
 
@@ -949,6 +950,15 @@ std::vector<int> load_prefix_token_ids() {
 
 }  // namespace
 
+// The tensor-parallel plan (dual-gpu WP-4): set in main from --tp/--devices, the
+// SPARKINFER_TP/SPARKINFER_DEVICES env, or the defaults. Defined here, OUTSIDE the
+// anonymous namespace, so that model_engine.cpp -- a separate translation unit -- reads
+// exactly these objects; tp_plan.hpp declares them extern in this same namespace.
+namespace sparkinfer_server {
+int g_tp = 1;
+std::vector<int> g_devices;  // empty = not given: the effective list is {0..tp-1}
+}  // namespace sparkinfer_server
+
 int main(int argc, char** argv) {
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -958,6 +968,20 @@ int main(int argc, char** argv) {
     std::string tokenizer_json;
     bool model_name_explicit = false;   // --model-name given: never second-guess the operator
     int ctx = 0;
+    bool tp_flag = false, devices_flag = false;  // --tp/--devices given: env fallbacks below must not override
+
+    // The single usage text, shared by -h and by every flag/env parse error below.
+    const auto usage = [&]() {
+        fprintf(stderr,
+                "usage: %s -m model.gguf [--host 127.0.0.1] [--port 8080] [--ctx N] "
+                "[--tokenizer path/to/tokenizer.json] [--model-name ID] [--api-key KEY] "
+                "[--draft-model DSPARK_DIR] [--tp N] [--devices A,B,...]\n"
+                "  --tp N            tensor-parallel size: how many CUDA devices the model splits across\n"
+                "                    (env SPARKINFER_TP)\n"
+                "  --devices A,B,... which CUDA device ids to span (env SPARKINFER_DEVICES)\n"
+                "  tensor parallel defaults: tp=1, devices=0 -- today's behaviour, unchanged\n",
+                argv[0]);
+    };
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -970,13 +994,51 @@ int main(int argc, char** argv) {
         else if (need("--tokenizer")) tokenizer_json = argv[++i];
         else if (need("--model-name")) { g_model_name = argv[++i]; model_name_explicit = true; }
         else if (need("--draft-model")) draft_model = argv[++i];
+        else if (need("--tp")) {
+            if (!sparkinfer_server::parse_tp_value(argv[i + 1], &sparkinfer_server::g_tp)) {
+                fprintf(stderr, "error: --tp: invalid value '%s' (expected an integer >= 1)\n", argv[i + 1]);
+                usage();
+                return 2;
+            }
+            tp_flag = true;
+            ++i;
+        }
+        else if (need("--devices")) {
+            std::string err;
+            if (!sparkinfer_server::parse_device_list(argv[i + 1], &sparkinfer_server::g_devices, &err)) {
+                fprintf(stderr, "error: --devices: %s\n", err.c_str());
+                usage();
+                return 2;
+            }
+            devices_flag = true;
+            ++i;
+        }
         else if (a == "-h" || a == "--help") {
-            fprintf(stderr,
-                    "usage: %s -m model.gguf [--host 127.0.0.1] [--port 8080] [--ctx N] "
-                    "[--tokenizer path/to/tokenizer.json] [--model-name ID] [--api-key KEY] "
-                    "[--draft-model DSPARK_DIR]\n",
-                    argv[0]);
+            usage();
             return 0;
+        }
+    }
+
+    // Env fallback (flag > env > default), mirroring SPARKINFER_DRAFT_MODEL above: the same
+    // two knobs for containers.
+    if (!tp_flag) {
+        const std::string tp_env = env_string("SPARKINFER_TP");
+        if (!tp_env.empty() && !sparkinfer_server::parse_tp_value(tp_env, &sparkinfer_server::g_tp)) {
+            fprintf(stderr, "error: SPARKINFER_TP: invalid value '%s' (expected an integer >= 1)\n",
+                    tp_env.c_str());
+            usage();
+            return 2;
+        }
+    }
+    if (!devices_flag) {
+        const std::string devices_env = env_string("SPARKINFER_DEVICES");
+        if (!devices_env.empty()) {
+            std::string err;
+            if (!sparkinfer_server::parse_device_list(devices_env, &sparkinfer_server::g_devices, &err)) {
+                fprintf(stderr, "error: SPARKINFER_DEVICES: %s\n", err.c_str());
+                usage();
+                return 2;
+            }
         }
     }
 

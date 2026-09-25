@@ -14,6 +14,7 @@
 #include "sparkinfer/safetensors.h"
 #include "image_input.hpp"
 #include "video_input.hpp"
+#include "tp_plan.hpp"
 #include "sparkinfer/moe/engine.h"
 #include "sparkinfer/runtime.h"
 
@@ -215,10 +216,54 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     terminate_lmcache_sidecar(impl_->lmcache_sidecar_pid);
     impl_->lmcache_sidecar_pid = -1;
 
+    // Device gate (dual-gpu WP-4): today's "no CUDA device" refusal generalized to the
+    // tensor-parallel plan set by --tp/--devices (or the env): enough devices for the
+    // requested tp, every requested id present. The tp=1 default validates {0} against the
+    // count and produces exactly the legacy refusal; the arch check (warn-only, below) is
+    // the third item of the plan's gate and needs CUDA, so it stays here, not in tp_plan.hpp.
+    const TpPlan plan{g_tp, g_devices};
+    const std::vector<int> eff = effective_devices(plan);
+
     int ndev = 0;
-    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
-        fprintf(stderr, "[sparkinfer-server] no CUDA device\n");
-        return false;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;  // a failed query is "no device"
+    {
+        const TpValidation v = validate_tp_plan(plan.tp, eff, ndev);
+        if (!v.ok) {
+            fprintf(stderr, "%s", v.error.c_str());
+            return false;
+        }
+    }
+    if (plan.tp > 1 || !plan.devices.empty()) {
+        // The resolved plan, so the log shows what the operator asked for (the default
+        // tp=1/no-devices stays silent, as today).
+        std::string ds;
+        for (size_t i = 0; i < eff.size(); ++i) {
+            if (i) ds += ",";
+            ds += std::to_string(eff[i]);
+        }
+        fprintf(stderr, "[sparkinfer-server] tensor-parallel plan: tp=%d devices=%s (%s)\n",
+                plan.tp, ds.c_str(), plan.devices.empty() ? "auto" : "explicit");
+    }
+    if (eff.size() > 1) {
+        // The split is only safe across same-architecture cards; a mismatch across the
+        // requested ones is a warning, not a failure -- the plan's gate is count/range, and
+        // the layout work keys kernels on each card's cc, so a mixed pair degrades rather
+        // than corrupting.
+        struct Cc { int dev, major, minor; };
+        std::vector<Cc> ccs;
+        for (int dev : eff) {
+            cudaDeviceProp p{};
+            if (cudaGetDeviceProperties(&p, dev) == cudaSuccess)
+                ccs.push_back({dev, p.major, p.minor});
+        }
+        for (size_t i = 1; i < ccs.size(); ++i) {
+            if (!same_cc(ccs[0].major, ccs[0].minor, ccs[i].major, ccs[i].minor))
+                fprintf(stderr,
+                        "[sparkinfer-server] WARN: tensor parallelism across different "
+                        "architectures: device %d is cc %d.%d, device %d is cc %d.%d (continuing)\n",
+                        ccs[0].dev, ccs[0].major, ccs[0].minor,
+                        ccs[i].dev, ccs[i].major, ccs[i].minor);
+        }
     }
 
     // Three-way dispatch on what `-m` actually points at: a .gguf file (every model shipped so
@@ -272,7 +317,13 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             qwen3_model_label(impl_->cfg), impl_->cfg.n_layers, impl_->cfg.n_experts,
             impl_->cfg.top_k, impl_->cfg.max_seq);
 
-    impl_->rt = sparkinfer::Runtime::create({});
+    // The runtime is created with the resolved plan: at the tp=1 default this is
+    // value-identical to the legacy default config (device 0, single row), and
+    // initialize() fills the per-device property table.
+    sparkinfer::RuntimeConfig rcfg;
+    rcfg.tp = plan.tp;
+    rcfg.devices = eff;
+    impl_->rt = sparkinfer::Runtime::create(rcfg);
     impl_->rt->initialize();
 
     sparkinfer::KVCacheConfig kvc;
