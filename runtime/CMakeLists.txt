@@ -198,4 +198,10 @@ if(BUILD_EXAMPLES)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+    # WP-1 (dual-gpu): P2P probe + NCCL smoke for the 2x RTX 5060 Ti pair. NCCL is dlopen'd at
+    # runtime from the box's wheel copy -- never linked, never added to the build system (dual-gpu/03
+    # §2 rule 2) -- so this target builds and runs on a box with no libnccl present at all.
+    add_executable(p2p_probe examples/p2p_probe.cpp)
+    target_include_directories(p2p_probe PRIVATE include)
+    target_link_libraries(p2p_probe PRIVATE sparkinfer_runtime CUDA::cudart)
 endif()

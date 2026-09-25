@@ -1,0 +1,3 @@
+index, name, memory.total [MiB], memory.free [MiB], utilization.gpu [%]
+0, NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 1109 MiB, 100 %
+1, NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 1109 MiB, 100 %

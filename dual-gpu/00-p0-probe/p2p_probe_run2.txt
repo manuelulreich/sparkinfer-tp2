@@ -1,0 +1,133 @@
+p2p_probe: 2 GPU(s), CUDA runtime 13.4, started 2026-09-25 16:55:38 (epoch 1790348138)
+=== [1] per-card identity and VRAM (before the probe) ===
+  card 0: NVIDIA GeForce RTX 5060 Ti     SM 12.0   36 SMs   VRAM total  15888.6 MiB  free    975.1 MiB
+  card 1: NVIDIA GeForce RTX 5060 Ti     SM 12.0   36 SMs   VRAM total  15888.6 MiB  free    975.1 MiB
+=== [2] cudaDeviceCanAccessPeer ===
+  card0 -> card1 : yes
+  card1 -> card0 : yes
+  (topology for this pair: PHB, PCIe + host bridge -- no NVLink; any P2P is root-complex-routed at best, see dual-gpu/01)
+=== [3] device->device copies (P2P path, if available) ===
+  D2D (P2P) card0->card1 1048576 B:  median    7.04 GB/s  (min   5.74, max   7.06, 8 reps)
+  D2D (P2P) card0->card1 16777216 B:  median    6.53 GB/s  (min   6.51, max   6.55, 8 reps)
+  D2D (P2P) card0->card1 67108864 B:  median    6.52 GB/s  (min   6.28, max   6.61, 8 reps)
+  D2D (P2P) card1->card0 1048576 B:  median    6.77 GB/s  (min   6.09, max   7.17, 8 reps)
+  D2D (P2P) card1->card0 16777216 B:  median    6.54 GB/s  (min   6.51, max   6.93, 8 reps)
+  D2D (P2P) card1->card0 67108864 B:  median    6.57 GB/s  (min   6.37, max   6.62, 8 reps)
+=== [4] pinned-host staging (device -> pinned -> device; always available) ===
+  staging card0->card1 1048576 B:  leg1 d2h    6.69 GB/s  leg2 h2d    6.49 GB/s  total    3.29 GB/s  (8 reps)
+  staging card0->card1 16777216 B:  leg1 d2h    6.84 GB/s  leg2 h2d    6.57 GB/s  total    3.35 GB/s  (8 reps)
+  staging card0->card1 67108864 B:  leg1 d2h    6.84 GB/s  leg2 h2d    6.57 GB/s  total    3.35 GB/s  (8 reps)
+  staging card1->card0 1048576 B:  leg1 d2h    6.73 GB/s  leg2 h2d    6.61 GB/s  total    3.33 GB/s  (8 reps)
+  staging card1->card0 16777216 B:  leg1 d2h    6.84 GB/s  leg2 h2d    6.66 GB/s  total    3.38 GB/s  (8 reps)
+  staging card1->card0 67108864 B:  leg1 d2h    6.84 GB/s  leg2 h2d    6.67 GB/s  total    3.38 GB/s  (8 reps)
+=== [5] NCCL smoke (dlopen /tmp/opencode/nccl_new/libnccl.so.2) ===
+  NCCL_DEBUG=INFO  NCCL_DEBUG_SUBSYS=INIT,NET,SHM   (NCCL stderr -> dual-gpu/00-p0-probe/nccl_smoke_run2.log)
+  ncclGetVersion() = 23203  (major 2, minor 32, patch 3)
+Bench:230330:230355 [0] NCCL INFO ENV/Plugin: Could not find: libnccl-env.so
+Bench:230330:230355 [0] NCCL INFO cudaDriverVersion 13030
+Bench:230330:230355 [0] NCCL INFO NCCL version 2.32.3+cuda13.4
+Bench:230330:230355 [0] NCCL INFO NCCL git version unknown unknown
+Bench:230330:230355 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so
+Bench:230330:230355 [0] NCCL INFO Could not open libibverbs.so
+Bench:230330:230355 [0] NCCL INFO dlvsym failed on mlx5dv_get_data_direct_sysfs_path - /lib/x86_64-linux-gnu/libmlx5.so.1: undefined symbol: mlx5dv_get_data_direct_sysfs_path, version MLX5_1.25 version MLX5_1.25
+Bench:230330:230355 [0] NCCL INFO dlvsym failed on mlx5dv_reg_dmabuf_mr - /lib/x86_64-linux-gnu/libmlx5.so.1: undefined symbol: mlx5dv_reg_dmabuf_mr, version MLX5_1.25 version MLX5_1.25
+Bench:230330:230355 [0] NCCL INFO NET/IB : No device found.
+Bench:230330:230355 [0] NCCL INFO NET/IB : Using [RO]; OOB enp0s31f6:192.168.181.16<0>
+
+[2026-09-25 16:55:41] Bench:230330:230355 [0] plugin/net.cc:229 (ncclNetPluginInit) NCCL ATTN Failed to initialize NET plugin IB
+Bench:230330:230355 [0] NCCL INFO NET/Socket : Using [0]enp0s31f6:192.168.181.16<0> [1]br-d4612fac17ae:172.20.0.1<0> [2]vethc3f950b:fe80::f033:f9ff:feb9:cda1%vethc3f950b<0>
+Bench:230330:230355 [0] NCCL INFO Initialized NET plugin Socket
+Bench:230330:230355 [0] NCCL INFO Assigned NET plugin Socket to comm
+Bench:230330:230355 [0] NCCL INFO RMA/Plugin: Could not find: libnccl-rma.so
+Bench:230330:230355 [0] NCCL INFO RMA/Plugin: Failed to initialize plugin 
+
+[2026-09-25 16:55:41] Bench:230330:230355 [0] transport/rma_socket.cc:32 (ncclRmaSocketProxyInit) NCCL WARN RMA/Socket : rma_socket requires GDRCopy; and GDR Copy is not available
+Bench:230330:230355 [0] NCCL INFO RMA/Plugin: Failed to initialize plugin 
+Bench:230330:230355 [0] NCCL INFO RMA/Plugin: Failed to initialize any plugin
+Bench:230330:230355 [0] NCCL INFO GIN/Plugin: Could not find: libnccl-gin.so
+Bench:230330:230355 [0] NCCL INFO GIN/Plugin: Failed to initialize any GIN plugin
+Bench:230330:230355 [0] NCCL INFO Using network Socket
+Bench:230330:230355 [0] NCCL INFO Loaded NVML from libnvidia-ml.so.1
+Bench:230330:230356 [1] NCCL INFO Initialized NET plugin Socket
+Bench:230330:230356 [1] NCCL INFO Assigned NET plugin Socket to comm
+Bench:230330:230356 [1] NCCL INFO RMA/Plugin: Failed to initialize any plugin
+Bench:230330:230356 [1] NCCL INFO GIN/Plugin: Failed to initialize any GIN plugin
+Bench:230330:230356 [1] NCCL INFO Using network Socket
+Bench:230330:230355 [0] NCCL INFO [Rank 0] ncclCommInitRank comm 0x70936c01c310 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 1000 commId 0x862ec7c98218e61b - Init START
+Bench:230330:230356 [1] NCCL INFO [Rank 1] ncclCommInitRank comm 0x709364008970 rank 1 nranks 2 cudaDev 1 nvmlDev 1 busId 2000 commId 0x862ec7c98218e61b - Init START
+Bench:230330:230356 [1] NCCL INFO RAS client listening socket at 127.0.0.1<28028>
+Bench:230330:230355 [0] NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 0 'enp0s31f6'
+Bench:230330:230355 [0] NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 1 'br-d4612fac17ae'
+Bench:230330:230355 [0] NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 2 'vethc3f950b'
+Bench:230330:230356 [1] NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 0 'enp0s31f6'
+Bench:230330:230356 [1] NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 1 'br-d4612fac17ae'
+Bench:230330:230356 [1] NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 2 'vethc3f950b'
+Bench:230330:230356 [1] NCCL INFO ncclTopoGetCpuAffinity: Affinity for GPU 1 is empty, ignoring. (GPU affinity =  ; CPU affinity = 0-3).
+Bench:230330:230356 [1] NCCL INFO NVLS multicast support is not available on dev 1, transport disabled, symmetric multimem disabled
+Bench:230330:230355 [0] NCCL INFO ncclTopoGetCpuAffinity: Affinity for GPU 0 is empty, ignoring. (GPU affinity =  ; CPU affinity = 0-3).
+Bench:230330:230355 [0] NCCL INFO NVLS multicast support is not available on dev 0, transport disabled, symmetric multimem disabled
+Bench:230330:230355 [0] NCCL INFO Rank 0: 3 Net devices
+Bench:230330:230355 [0] NCCL INFO Rank 0: 0 CollNet devices
+Bench:230330:230356 [1] NCCL INFO Rank 1: 3 Net devices
+Bench:230330:230356 [1] NCCL INFO Rank 1: 0 CollNet devices
+Bench:230330:230355 [0] NCCL INFO Local Net device counts across ranks: min 3 max 3
+Bench:230330:230355 [0] NCCL INFO Local CollNet device counts across ranks: min 0 max 0
+Bench:230330:230355 [0] NCCL INFO comm 0x70936c01c310 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+Bench:230330:230355 [0] NCCL INFO Channel 00/02 : 0 1
+Bench:230330:230355 [0] NCCL INFO Channel 01/02 : 0 1
+Bench:230330:230355 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1
+Bench:230330:230355 [0] NCCL INFO P2P Chunksize set to 131072
+Bench:230330:230355 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so
+Bench:230330:230355 [0] NCCL INFO Check P2P Type isAllDirectP2p 0 directMode 1 isAllCudaP2p 1
+Bench:230330:230376 [0] NCCL INFO [Proxy Service] Device 0 CPU core 3
+Bench:230330:230376 [0] NCCL INFO proxy listening socket at 192.168.181.16<48961>
+Bench:230330:230377 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 1
+Bench:230330:230356 [1] NCCL INFO comm 0x709364008970 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+Bench:230330:230356 [1] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0
+Bench:230330:230356 [1] NCCL INFO P2P Chunksize set to 131072
+Bench:230330:230356 [1] NCCL INFO Check P2P Type isAllDirectP2p 0 directMode 1 isAllCudaP2p 1
+Bench:230330:230378 [0] NCCL INFO [Proxy Service] Device 1 CPU core 3
+Bench:230330:230378 [1] NCCL INFO proxy listening socket at 192.168.181.16<46695>
+Bench:230330:230379 [0] NCCL INFO [Proxy Service UDS] Device 1 CPU core 1
+Bench:230330:230356 [1] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so
+Bench:230330:230356 [1] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+Bench:230330:230356 [1] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+Bench:230330:230356 [1] NCCL INFO symmetricSupport 1, cuMemEnable 1, globalGinSupport 0, cuMemGdrSupport 0, contiguousRanksPerHost 2, crossNicSupport 1
+Bench:230330:230355 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+Bench:230330:230355 [0] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+Bench:230330:230355 [0] NCCL INFO symmetricSupport 1, cuMemEnable 1, globalGinSupport 0, cuMemGdrSupport 0, contiguousRanksPerHost 2, crossNicSupport 1
+Bench:230330:230355 [0] NCCL INFO CC Off, workFifoBytes 1048576
+Bench:230330:230356 [1] NCCL INFO ncclCommInitRank comm 0x709364008970 rank 1 nranks 2 cudaDev 1 nvmlDev 1 busId 2000 commId 0x862ec7c98218e61b - Init COMPLETE
+Bench:230330:230356 [1] NCCL INFO Init timings - ncclCommInitRank: rank 1 nranks 2 total 1.43 (kernels 1.30, alloc 0.08, bootstrap 0.00, allgathers 0.00, topo 0.03, graphs 0.00, connections 0.01, rest 0.00)
+Bench:230330:230355 [0] NCCL INFO ncclCommInitRank comm 0x70936c01c310 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 1000 commId 0x862ec7c98218e61b - Init COMPLETE
+Bench:230330:230355 [0] NCCL INFO Init timings - ncclCommInitRank: rank 0 nranks 2 total 1.43 (kernels 1.30, alloc 0.08, bootstrap 0.00, allgathers 0.00, topo 0.03, graphs 0.00, connections 0.01, rest 0.00)
+Bench:230330:230355 [0] NCCL INFO Symmetric VA size=16GB
+Bench:230330:230356 [1] NCCL INFO Symmetric VA size=16GB
+Bench:230330:230378 [1] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-yBF4m9 size 9637888 ptr 0x70932d59a000
+Bench:230330:230376 [0] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-pbXech size 9637888 ptr 0x70932decc000
+Bench:230330:230376 [0] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-by4BEv size 9637888 ptr 0x70932cc68000
+Bench:230330:230376 [0] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-zJFn8C size 4096 ptr 0x7095acbab000
+Bench:230330:230355 [0] NCCL INFO Channel 00 : 0[0] -> 1[1] via SHM/direct
+Bench:230330:230376 [0] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-0Xk92c size 4096 ptr 0x7095acaca000
+Bench:230330:230355 [0] NCCL INFO Channel 01 : 0[0] -> 1[1] via SHM/direct
+Bench:230330:230378 [1] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-JcIoCc size 9637888 ptr 0x70932c336000
+Bench:230330:230378 [1] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-n4dPxH size 4096 ptr 0x7095acac8000
+Bench:230330:230356 [1] NCCL INFO Channel 00 : 1[1] -> 0[0] via SHM/direct
+Bench:230330:230378 [1] NCCL INFO MMAP allocated shareable host buffer /dev/shm/nccl-t4jUbz size 4096 ptr 0x7095acac6000
+Bench:230330:230356 [1] NCCL INFO Channel 01 : 1[1] -> 0[0] via SHM/direct
+Bench:230330:230356 [1] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-pbXech size 9637888 ptr 0x7093276ce000
+Bench:230330:230356 [1] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-zJFn8C size 4096 ptr 0x7095ac77d000
+Bench:230330:230356 [1] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-by4BEv size 9637888 ptr 0x709315b8c000
+Bench:230330:230356 [1] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-0Xk92c size 4096 ptr 0x7095ac77b000
+Bench:230330:230355 [0] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-yBF4m9 size 9637888 ptr 0x70931525a000
+Bench:230330:230355 [0] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-n4dPxH size 4096 ptr 0x7095ac779000
+Bench:230330:230355 [0] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-JcIoCc size 9637888 ptr 0x709314928000
+Bench:230330:230355 [0] NCCL INFO MMAP imported shareable host buffer /dev/shm/nccl-t4jUbz size 4096 ptr 0x7095ac777000
+Bench:230330:230356 [1] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+Bench:230330:230355 [0] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+  RESULT: 2-rank ncclAllReduce of 1024 float32 completed; per-element sum check: MISMATCH
+  (which transport NCCL selected, and its measured bandwidth: dual-gpu/00-p0-probe/nccl_smoke_run2.log)
+=== [6] per-card VRAM (after the probe; must match [1] within a few MB) ===
+  card 0: NVIDIA GeForce RTX 5060 Ti     SM 12.0   36 SMs   VRAM total  15888.6 MiB  free    815.1 MiB
+  card 1: NVIDIA GeForce RTX 5060 Ti     SM 12.0   36 SMs   VRAM total  15888.6 MiB  free    813.1 MiB
+probe wall time: 3298 ms  (D2D/staging above ran with the LLM resident -- contention applies; see the plan's R7)

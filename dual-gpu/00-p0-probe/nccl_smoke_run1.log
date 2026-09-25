@@ -1,0 +1,1 @@
+  NCCL smoke TIMED OUT (120 s) -- init or allreduce wedged; see dual-gpu/00-p0-probe/nccl_smoke_run1.log
