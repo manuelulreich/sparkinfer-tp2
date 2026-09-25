@@ -2,7 +2,7 @@
   "$schema_version": 1,
   "meta": {
     "project": "sparkinfer",
-    "goal": "Run the Qwen3.8-27B NVFP4 checkpoint on two RTX 5060 Ti (16 GB each, sm_120) with tensor-parallel tp=2 over P2P, no new dependencies (no NCCL), preserving the single-active-request DSpark losslessness property and the existing serving surface.",
+    "goal": "Run the Qwen3.8-27B NVFP4 checkpoint on two RTX 5060 Ti (16 GB each, sm_120) with tensor-parallel tp=2 over P2P. Dependency policy (revised 2026-09-25, user decision): one allowed C runtime dependency — NVIDIA NCCL for the 2-GPU collective ops (hand-rolled 2-node design kept as the recorded fallback, CHG-0005); no-Python-stack preserved, 2.5 MB promise re-stated as binary + libnccl. Preserves the single-active-request DSpark losslessness property and the existing serving surface.",
     "created": "2026-09-25",
     "hardware": {
       "gpus": "2x NVIDIA RTX 5060 Ti",
@@ -249,7 +249,7 @@
         "bench.sh/evaluate.sh/accuracy.sh: run tp=2 on the target box; compare against llama.cpp with --tensor-split 2,2 as the apples-to-apples single-binary baseline",
         "Eval bot: new hardware target (dual 5060 Ti box) or a tp=2 arm on existing 5090 pairs; scoring labels (XL..XS) defined for the new target -- governance decision (R6)",
         ".github/workflows/rtx5090-required.yml: new guard for tp-related paths (or an explicit exemption)",
-        "docker image: build unchanged (no new deps), new smoke target"
+        "docker image: gains libnccl (the re-stated 2.5 MB promise, re-baselined once with the measured size delta), new smoke target"
       ],
       "status": "pending-audit"
     },
@@ -384,20 +384,20 @@
       "severity": "blocker",
       "subsystem": "device-init",
       "category": "comm",
-      "file": "(new module; proposed: runtime/src/gpu_link.cpp + runtime/include/sparkinfer/gpu_link.h)",
+      "file": "(new module: runtime/src/gpu_link.cpp + runtime/include/sparkinfer/gpu_link.h — thin wrapper owning one 2-rank NCCL communicator; hand-rolled 2-node fallback behind the same API if R8 is dead)",
       "line": null,
       "symbol": null,
       "snippet": null,
       "current": "No inter-GPU communication code exists anywhere in the repo (0 hits for CanAccessPeer/NCCL/peer-copy in source trees). A tp=2 design with no comm path cannot reduce across the two halves of any layer output.",
-      "change": null,
+      "change": "2026-09-25 (user decision): NCCL-based. One 2-rank communicator (init outside graph capture, destroy at shutdown); allreduce = ncclAllReduce(bf16) on per-device streams; maxreduce = ncclMax over vocab-split lm_head logits (greedy = cross-device max of local maxima; sampling = Gumbel-max compare). NCCL selects P2P vs SHM host-staging automatically, so G1 is informational (recorded by the WP-1 probe), not a design branch. Fallback (R8): the original hand-rolled design — peer copy + local add, P2P-mapped or pinned-staging, one API, no host sync — behind the identical header: zero rework upstream, original no-deps promise restored.",
       "depends_on": [
         "CHG-0006",
         "CHG-0027"
       ],
-      "verification": "Dedicated tests: 2-GPU all-reduce vs host reference (bf16), cross-context event ordering, P2P-vs-staged bandwidth report",
+      "verification": "Dedicated tests: 2-GPU all-reduce vs host reference (bf16), NCCL transport forced/observed (NCCL_P2P=0/1), cross-context event ordering, 100x init/teardown leak check, P2P-vs-staged bandwidth report",
       "source": "manual",
       "status": "confirmed",
-      "notes": "Scope: 2-GPU ring all-reduce (each device copies its half to the peer, both add), P2P mapped-memory fast path, pinned-host staging fallback. Keep it dependency-free (no NCCL) to preserve the 2.5 MB / no-Python-stack promise."
+      "notes": "REVISED 2026-09-25 (user decision): comm layer is NCCL (NVIDIA's optimized collective library) behind the gpu_link wrapper. The original hand-rolled scope (2-GPU ring all-reduce: each device copies its half to the peer, both add; P2P mapped-memory fast path; pinned-host staging fallback) is kept as the recorded fallback if NCCL cannot run on this pair (R8, answered by the WP-1 probe). No-Python-stack preserved either way; the 2.5 MB promise is re-stated as binary + libnccl (CHG-0032)."
     },
     {
       "id": "CHG-0006",
@@ -906,13 +906,13 @@
       "line": null,
       "symbol": "build",
       "snippet": null,
-      "current": "Superbuild: kernels -> moe -> runtime -> (server). CUDA arches 89/90/100/120; 120 covers the 5060 Ti. No external comms library anywhere.",
-      "change": null,
+      "current": "Superbuild: kernels -> moe -> runtime -> (server). CUDA arches 89/90/100/120; 120 covers the 5060 Ti. No external comms library anywhere (that changes under the 2026-09-25 decision — see change/notes).",
+      "change": "2026-09-25 (user decision): one C runtime dependency allowed — NVIDIA NCCL (Apache-2.0): the superbuild gains the NCCL link (find_package / FetchContent / vendor dir — decided in WP-3); no-Python-stack preserved (plain .so, no Python in the path); the 2.5 MB single-binary promise is re-stated as 'binary + libnccl' and the CI size/attestation check is re-baselined once, with the measured delta recorded (WP-16). If R8 (sm_120) kills NCCL on this box, the hand-rolled comm (CHG-0005 fallback) restores the original promise.",
       "depends_on": [],
-      "verification": "No new dependencies (the 2.5 MB / no-Python-stack promise is a hard constraint: all-reduce is hand-rolled P2P code, no NCCL); new p2p_probe example and (if needed) a comm target land in the existing superbuild ordering",
+      "verification": "Dependency policy per the 2026-09-25 decision: exactly one new C runtime dep (NCCL), no Python anywhere in the build or runtime path; CI size/attestation check re-baselined with the measured libnccl delta; new p2p_probe example and the comm target land in the existing superbuild ordering",
       "source": "manual",
       "status": "confirmed",
-      "notes": ""
+      "notes": "2026-09-25: user relaxed the no-dependency constraint to allow NCCL for the 2-GPU all-reduce (NVIDIA's optimized collective library; its transport selection absorbs the P2P-vs-staging branch). No-Python-stack stands; the 2.5 MB promise is re-stated as binary + libnccl. See CHG-0005 for the fallback design."
     },
     {
       "id": "CHG-0033",

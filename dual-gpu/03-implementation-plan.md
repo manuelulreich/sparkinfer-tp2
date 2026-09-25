@@ -1,6 +1,6 @@
 # Dual-GPU (tp=2) — implementation plan & execution brief
 
-**Status:** ready for execution by a fresh agent session · **Created:** 2026-09-25 · **Base tree:** fork `manuelulreich/sparkinfer-tp2` @ `20a4fbd`, branch `dual-gpu-plan`
+**Status:** ready for execution by a fresh agent session · **Created:** 2026-09-25 · **Revised:** 2026-09-25 — user decision: **NCCL is now the one allowed C dependency** (comm layer re-scoped; §2 rule 2, WP-1, WP-3, WP-11, R8) · **Base tree:** fork `manuelulreich/sparkinfer-tp2` @ `20a4fbd`, branch `dual-gpu-plan`
 **Companions:** `01-identification-plan.md` (method, risks R1–R7) · `02-change-manifest.json` (the ledger — **source of truth**) · `02-change-manifest.md` (rendered) · `scan.py` / `render.py` (re-runnable)
 
 ---
@@ -10,19 +10,20 @@
 *First thing a new session reads. Every session must append a dated line here and commit it before ending.*
 
 - **2026-09-25 — session 1 (planning machine, no GPUs):** program identified (01), manifest built (02, 3,115 items), this brief written. **No dual-GPU code exists yet; the probe has not run; no gate (G1–G4) is resolved.**
+- **2026-09-25 (later, same day) — user decision:** the dependency policy is relaxed — **NVIDIA NCCL is now the one allowed C runtime dependency** for the 2-GPU collective ops. The no-Python-stack promise stands; the 2.5 MB promise is *re-stated* as binary + libnccl (documented, not a silent break); the hand-rolled 2-node design stays as the recorded fallback (WP-3; new risk R8; manifest CHG-0005/0032 re-anchored in the same commit).
 - **Next session starts at WP-1** (or at the first WP whose exit criteria are not yet met, if a probe report is already in `dual-gpu/00-p0-probe/`).
 
 ---
 
 ## 1. Bootstrap — copy this into the new agentic session
 
-> You are continuing the dual-GPU (tensor-parallel 2, P2P) program for **sparkinfer**, a native C++/CUDA LLM inference runtime (single 2.5 MB binary, no Python stack). This machine has **two NVIDIA RTX 5060 Ti** (16 GB each, sm_120, PCIe — no NVLink) and **is also serving a live LLM on a different engine right now** — so only a small slice of each card's VRAM is free for your work.
+> You are continuing the dual-GPU (tensor-parallel 2, P2P) program for **sparkinfer**, a native C++/CUDA LLM inference runtime (single 2.5 MB binary, no Python stack; **one** allowed C runtime dependency: NVIDIA NCCL, for the 2-GPU collective ops — see §2 rule 2). This machine has **two NVIDIA RTX 5060 Ti** (16 GB each, sm_120, PCIe — no NVLink) and **is also serving a live LLM on a different engine right now** — so only a small slice of each card's VRAM is free for your work.
 >
 > **Setup:** `git clone -b dual-gpu-plan https://github.com/manuelulreich/sparkinfer-tp2.git` — or, into an existing sparkinfer checkout: `git remote add tp2 https://github.com/manuelulreich/sparkinfer-tp2.git && git fetch tp2 && git checkout -b dual-gpu-plan tp2/dual-gpu-plan`.
 >
 > **Read, in order:** (1) `dual-gpu/03-implementation-plan.md` — this file; (2) `dual-gpu/01-identification-plan.md` — method + risk register; (3) skim `dual-gpu/02-change-manifest.md` — the item ledger.
 >
-> **Hard rules:** (1) while the LLM is resident, all VRAM use is **explicit small allocations** — never auto-size from "free VRAM", and never touch, throttle, or kill the resident LLM; (2) **tp=1 behaviour stays byte-identical** at every commit; (3) **no new dependencies** (no NCCL, no libraries — the comm layer is hand-rolled CUDA); (4) the serving API surface only grows; (5) before ending the session: update `dual-gpu/03-implementation-plan.md` §0, update manifest item statuses, re-render (`python3 dual-gpu/scan.py && python3 dual-gpu/render.py`), and commit (`dual-gpu:` prefix). If the session has no GitHub credentials, leave commits local and list them in §0.
+> **Hard rules:** (1) while the LLM is resident, all VRAM use is **explicit small allocations** — never auto-size from "free VRAM", and never touch, throttle, or kill the resident LLM; (2) **tp=1 behaviour stays byte-identical** at every commit; (3) **dependency policy: exactly one allowed C runtime dependency — NVIDIA NCCL (Apache-2.0)** for the 2-GPU collectives, behind the `gpu_link` wrapper; if NCCL proves unusable on this box, the wrapper's hand-rolled 2-node fallback (CHG-0005 note) ships instead — no *other* libraries, and no Python anywhere in the path; (4) the serving API surface only grows; (5) before ending the session: update `dual-gpu/03-implementation-plan.md` §0, update manifest item statuses, re-render (`python3 dual-gpu/scan.py && python3 dual-gpu/render.py`), and commit (`dual-gpu:` prefix). If the session has no GitHub credentials, leave commits local and list them in §0.
 >
 > **First actions:** run the pre-check below, then **WP-1** (the P2P probe) unless `dual-gpu/00-p0-probe/` already contains a report.
 >
@@ -47,7 +48,7 @@
 
 **Non-negotiable constraints** (violating any of these is a program failure, not a bug to discuss):
 1. **tp=1 stays byte-identical** — no token, behavior, or perf change for existing users; the org's standing eval-bot gates (5090: token-match vs llama.cpp, no-regression tiers, DSpark lossless) pass unmodified. The on-box agent cannot run the 5090 bot (org-pinned hardware); it verifies tp=1 invariance by code-path argument + the in-repo GPU tests that fit the current regime; the bot is the human's/org's job and the final arbiter.
-2. **No new dependencies** — no NCCL, no libraries; the 2.5 MB / no-Python-stack promise stands.
+2. **Dependency policy (revised 2026-09-25, on user decision): exactly one allowed C runtime dependency — NVIDIA NCCL (Apache-2.0)** for the 2-GPU collective ops, behind the thin `gpu_link` wrapper (WP-3). The **no-Python-stack** promise stands intact (NCCL is a plain shared library — linked or dlopen'd, no Python anywhere in the path). The **2.5 MB single-binary** promise is **re-stated, not silently broken**: deployment becomes *binary + libnccl*; the size delta is measured and recorded once (WP-16), and the CI size/attestation check is re-baselined with it. **Fallback:** if NCCL cannot init on this hardware (the open sm_120 prebuild question — answered by WP-1's probe; risk R8), `gpu_link` implements the original hand-rolled 2-node design instead (two peer copies + a local add, P2P-mapped or pinned-staging, one API, no host sync) — same call sites, zero rework upstream, and the original promise restored.
 3. **The serving surface only grows** — no existing endpoint or flag changes meaning.
 4. **DSpark stays byte-lossless** — re-proven *inside* tp=2 (WP-12), never assumed.
 
@@ -62,7 +63,7 @@
 
 ## 3. The plan in one paragraph
 
-Build a two-GPU tensor-parallel path that is **unreachable at tp=1**: a small comm primitive (`gpu_link` — all-reduce + max-reduce, dual-transport: P2P-mapped or pinned-staging behind one API), a per-tensor ownership map that splits weights / KV / GDN state / `lm_head` across the two 16 GB cards, decode + prefill paths that compute both halves per layer from a single worker thread and fuse **one all-reduce per layer** (the hidden state is bit-identical at every layer boundary, so only the row-split deltas reduce — kilobytes, not megabytes), two event-paired CUDA graphs per session (the always-valid scheme), a replicated DSpark drafter with the lossless gate re-proven under tp=2, the vision tower on card 0, and a hard boundary that rejects the lmcache sidecar under tp=2. The work order below is arranged so the first code to land (the probe) is 100% new-file, and so a box with an LLM resident can still do *all* functional discovery within the ~500 MB/card window — only the scale integrations need the box to be quiet.
+Build a two-GPU tensor-parallel path that is **unreachable at tp=1**: a thin comm wrapper (`gpu_link` — NCCL's 2-rank all-reduce + max-reduce behind one API; NCCL picks P2P vs host-staging transport itself, and the hand-rolled 2-node design is the recorded fallback if NCCL can't run on this pair), a per-tensor ownership map that splits weights / KV / GDN state / `lm_head` across the two 16 GB cards, decode + prefill paths that compute both halves per layer from a single worker thread and fuse **one all-reduce per layer** (the hidden state is bit-identical at every layer boundary, so only the row-split deltas reduce — kilobytes, not megabytes), two event-paired CUDA graphs per session (the always-valid scheme), a replicated DSpark drafter with the lossless gate re-proven under tp=2, the vision tower on card 0, and a hard boundary that rejects the lmcache sidecar under tp=2. The work order below is arranged so the first code to land (the probe) is 100% new-file, and so a box with an LLM resident can still do *all* functional discovery within the ~500 MB/card window — only the scale integrations need the box to be quiet.
 
 ---
 
@@ -70,22 +71,22 @@ Build a two-GPU tensor-parallel path that is **unreachable at tp=1**: a small co
 
 Mode tags: **[L]** = runnable lean (LLM resident, ≤512 MB/card) · **[L-code]** = code lands in lean mode, full-size verification waits for full mode · **[F]** = full mode only (LLM off, or dedicated box). Order within a mode group is a hard sequence; (∥) = safe to run concurrently (file-ownership rules in §6).
 
-### WP-1 — P2P probe + per-card budget table · **[L]** · *start here*
-**Manifest:** CHG-0006 · resolves CHG-0027 (R1), R7, and the numbers half of CHG-0020 (R3).
-**Do.** Write `runtime/examples/p2p_probe.cpp` + CMake entry (patterns exist in the current examples). It prints: both cards' name/SM/VRAM; `cudaDeviceCanAccessPeer` in both directions; timed device→device copies at 1/16/64 MB, both directions, for (a) the P2P path (if enabled) and (b) the pinned-host staging path (always available); and the **per-card budget table** — 16 GB − weights/2 (≈8.95 GB) − drafter (≈1–1.5 GB when replicated) − GDN state at max batch − runtime overhead = KV remainder → implied context size, side by side with the single-32 GB card's current claim. Buffers are a few MB total — trivially inside the window.
-**Verify.** Run it on this box (during an inter-turn lull if you can catch one; record busy + idle — they will differ). Commit the raw output **verbatim** to `dual-gpu/00-p0-probe/`; write the answers into the manifest notes: **G1** (does P2P exist, and what's the default transport?) and **G2** (does 16 GB/card hold the marketed context, or which `--ctx` does?).
-**Exit.** Probe report committed; G1 and G2 answered on the record.
+### WP-1 — P2P probe + NCCL smoke + per-card budget table · **[L]** · *start here*
+**Manifest:** CHG-0006, CHG-0027 · answers G1/G2; R1, R7, R8, and the numbers half of CHG-0020 (R3).
+**Do.** Write `runtime/examples/p2p_probe.cpp` + CMake entry (patterns exist in the current examples). It prints: both cards' name/SM/VRAM; `cudaDeviceCanAccessPeer` in both directions; timed device→device copies at 1/16/64 MB, both directions, for (a) the P2P path (if enabled) and (b) the pinned-host staging path (always available); the **NCCL smoke** — if `libnccl` is present on the box (check first; if it is absent that is itself a recorded fact, and WP-3's fallback question becomes live): print `ncclGetVersion()`, init a 2-rank communicator across the pair, run one small all-reduce, and capture `NCCL_DEBUG=INFO` so the report records **which transport NCCL selected** (P2P vs SHM host-staging) and at what measured bandwidth; and the **per-card budget table** — 16 GB − weights/2 (≈8.95 GB) − drafter (≈1–1.5 GB when replicated) − GDN state at max batch − runtime overhead = KV remainder → implied context size, side by side with the single-32 GB card's current claim. Buffers are a few MB plus NCCL's internal channel buffers (tens of MB at most) — inside the window; run during an inter-turn lull and free everything on exit.
+**Verify.** Run it on this box (during an inter-turn lull if you can catch one; record busy + idle — they will differ). Commit the raw output **verbatim** to `dual-gpu/00-p0-probe/`; write the answers into the manifest notes: **G1** (does P2P exist, and which transport will the comm layer actually use — NCCL's own report, not a guess) and **G2** (does 16 GB/card hold the marketed context, or which `--ctx` does?).
+**Exit.** Probe report committed; G1 and G2 answered on the record; NCCL version, transport, and sm_120 compatibility on the record — the last of these is the one unknown that can kill the NCCL route (R8), and this is where it dies or lives.
 
 ### WP-2 — Manifest triage + subsystem audit · **[L]** · (∥ — record-keeping only, no code; may run on *any* machine, including the planning box, while WP-1 runs on the GPU box)
 **Manifest:** the 3,081 scan candidates + the 14 subsystem checklists (01's DoD items 1–3).
 **Do.** (1) P1 triage: group candidates by file, then by category; batch-`reject` the device-agnostic call sites (~2,900 of them: kernel call sites, stream/graph plumbing, memory-pool callers) with the shared reason *"device-agnostic call site; receives its per-device slice from the layout map"*; keep the rest live or fold into manual items. (2) P2 audit: walk the 14 subsystem checklists against the **current** tree (`20a4fbd` moved the prefill/GEMM areas: `prefill_gemm_i8.cu`, `batched_prefill.cu`, `qwen35.cpp` are the big ones) — re-anchor stale line numbers, assign severities to confirmed items. The **`kernels` audit (CHG-0029) must produce the per-kernel verdict list** (portable / retune-for-48-SM / rewrite) with a fresh `__global__`/`launch_*` count (471/292 baseline). (3) **The one fact that carries design weight:** does the GDN recurrence have **cross-v-head coupling**? WP-8 is only valid if it does not. If coupling is found, **stop and mark it** — the fallback is slot-level splitting, which is a different design and a human decision, not an agent decision.
 **Exit.** No undecided `candidate`; all 14 subsystems read `audited`; kernel verdict list recorded; GDN-coupling question answered.
 
-### WP-3 — `gpu_link`: the 2-GPU comm primitive · **[L]** · (∥ with WP-4)
-**Manifest:** CHG-0005 + new tests under CHG-0022.
-**Do.** New `runtime/src/gpu_link.cpp` + `include/sparkinfer/gpu_link.h` (follow existing include conventions): (1) **all-reduce-2** — each device async-copies its partial to the peer (P2P-mapped pointer, or two legs through a pinned buffer when G1 = staging), each adds; event-ordered; **no host synchronization anywhere**; (2) **max-reduce** for the vocab-split `lm_head` (greedy = cross-device max of the two local maxima; sampling = Gumbel-max compare on one partial). One public API; transport selected at init from G1; buffers from a small arena. **Implement both transports from day one** — the API is identical, so a G1 surprise costs nothing later.
-**Verify (lean tests — explicit budgets, correctness only).** Two-GPU all-reduce vs a host reference (bf16, 16 B → 1 MB, both transports forced explicitly, not just the G1 choice); cross-context event-ordering test (A must not observe B's result before B's event); bandwidth recorded as **directional** (the LLM steals bandwidth; note busy + idle).
-**tp=1 check.** Module is never instantiated at tp=1 (the test suite proves it unreachable at tp=1).
+### WP-3 — `gpu_link`: the 2-GPU comm wrapper (NCCL-based) · **[L]** · (∥ with WP-4)
+**Manifest:** CHG-0005 (re-scoped 2026-09-25 to NCCL; hand-rolled design kept as the recorded fallback) + new tests under CHG-0022.
+**Do.** New `runtime/src/gpu_link.cpp` + `include/sparkinfer/gpu_link.h` (follow existing include conventions). The module owns **one 2-rank NCCL communicator** (created once at init, *outside* any graph capture; destroyed at shutdown) and exposes exactly two ops: (1) **`allreduce`** — `ncclAllReduce` of bf16 partials, driven on the two per-device streams (2·H per layer — kilobytes; the layer code in WP-9/10 calls it and nothing else); (2) **`maxreduce`** — `ncclMax` over the vocab-split `lm_head` logits (greedy = cross-device max of the two local maxima; sampling = Gumbel-max compare on one partial). **NCCL picks the transport itself** — P2P where available, SHM host-staging where not — which is why G1 no longer branches the design; WP-1's probe records which transport is live and what it costs. **The fallback, in one switch:** if the WP-1 smoke shows NCCL cannot init on this pair (R8 — the open sm_120 prebuild question), `gpu_link` implements the original hand-rolled design behind the same header (peer copy + local add; P2P-mapped or pinned-staging; one API, no host sync anywhere) — same call sites, the rest of the program never sees the difference, and the original no-deps promise is restored.
+**Verify (lean tests — explicit budgets, correctness only).** Two-GPU all-reduce vs a host reference (bf16, 16 B → 1 MB; force the transport via `NCCL_P2P=0/1` where the build honors it — otherwise record which ran); cross-context event-ordering test (A must not observe B's result before B's event); 100× init/teardown repeat (communicators are the classic leak); bandwidth recorded as **directional** (the LLM steals bandwidth; note busy + idle).
+**tp=1 check.** The communicator is never created at tp=1 (the test suite proves it unreachable at tp=1).
 
 ### WP-4 — Device model + configuration surface · **[L]** · (∥ with WP-3)
 **Manifest:** CHG-0001, 0002, 0003, 0004.
@@ -99,7 +100,7 @@ Mode tags: **[L]** = runnable lean (LLM resident, ≤512 MB/card) · **[L-code]*
 **Verify.** `/v1/info` shape test on the 2-card box; injected-fault test (synthetic context-killing error on one card) → server degrades to the "restart required" state from *either* card.
 **tp=1 check.** The stats arrays are simply length 1.
 
-> **Lean-mode milestone M1.** On the 2-GPU box: `--tp 2` boots two contexts; the all-reduce passes on real hardware (G1 answered, on the record); `/metrics` shows both cards; in-regime tp=1 suite green.
+> **Lean-mode milestone M1.** On the 2-GPU box: `--tp 2` boots two contexts; the all-reduce passes on real hardware through the wrapper (NCCL or fallback — G1's answer on the record, including which transport and its measured cost); `/metrics` shows both cards; in-regime tp=1 suite green.
 
 ### WP-6 — Per-tensor ownership map + weight loaders · **[L-code / F]**
 **Manifest:** CHG-0011 (finalizes 01-Appendix-A as code).
@@ -120,7 +121,7 @@ Mode tags: **[L]** = runnable lean (LLM resident, ≤512 MB/card) · **[L-code]*
 **tp=1 check.** One allocation, as today.
 
 ### WP-9 — Decode path: per-layer split + per-layer all-reduce · **[L-code / F]**
-**Manifest:** CHG-0012, 0014 (+ decode half of CHG-0015). **Gated by:** G1 (transport variant; the code is the same either way).
+**Manifest:** CHG-0012, 0014 (+ decode half of CHG-0015). **Gated by:** G1, informationally only — the wrapper hides the transport, so the layer code is the same whether NCCL used P2P or staging.
 **Do.** The worker (one thread, per-device stream sets, no `setDevice`) runs each of the 64 layers split: full-attn q/k/v column-split by KV group, `o_proj` row-split; GDN projections block-split, out-proj row-split; FFN gate/up column + down row. **The invariant that makes this cheap: the hidden state is bit-identical on both devices at every layer boundary** — so only the layer's row-split deltas reduce, in **one fused all-reduce per layer** (2·H bf16 per partial — kilobytes, not megabytes) via `gpu_link`; the residual is added locally and never travels. `lm_head` → per-vocab-half logits → max-reduce (greedy) / Gumbel compare (sampling). Packed decode: same pattern per row group.
 **Verify.** Lean: **one-layer** split-vs-unsplit reference runs — full-layer variant ≈ 400–500 MB peak per card (unsplit 280 + split 140 + activations); if the window is tighter, sub-layer variants: FFN block only (~150–250 MB), then GDN block only — same assertions, smaller sizes; one heavy item resident at a time, freed between runs. Full mode: full-model decode vs unsplit reference. The token-stream check follows R2's honest framing: the **invariant** is split-vs-unsplit under identical numerics plus the DSpark-internal gate (re-proven in WP-12); absolute drift vs the tp=1 reference is *measured and recorded* (→ CHG-0028), not gated here.
 **tp=1 check.** The decode loop keeps its textual single-device path; all split code sits inside the tp>1 branch.
@@ -133,10 +134,10 @@ Mode tags: **[L]** = runnable lean (LLM resident, ≤512 MB/card) · **[L-code]*
 
 > **Lean-mode milestone M2 (code-complete).** Everything above exists and is unit-tested in-regime; the only unverified pieces are the full-size integrations — **the 27B load (WP-6/F) and full-model decode/prefill (WP-9/10/F)** — which pass when the box goes full mode.
 
-### WP-11 — CUDA graphs under two contexts · **[L-code / F]**
+### WP-11 — CUDA graphs with the comm layer under two contexts · **[L-code / F]**
 **Manifest:** CHG-0013 (R5). **Gates:** G4.
-**Do.** Default scheme (always valid, staging or P2P): **two per-session decode graphs** (one per device), event-paired at each layer-end all-reduce point; per-session parking lot (max 64) becomes per-device; prefill + DFlash-verify graphs captured per device. Capture stays under the recursive mutex; **the invariants in `qwen35.h` are restated for two contexts** (the capture-poisoning hazard is per-context, so two contexts *weaken* the cross-thread hazard — write the rules down, don't imply them). The G4 test: a graph in context A containing a memcpy node into B's memory, peer access enabled **at capture** — if it passes, the single-graph variant is *available* for later perf work; it is never required.
-**Verify.** The capture test suite (both contexts; peer-enabled and staging configurations; graph-vs-eager byte-match for a few tokens per configuration); the 16-concurrent-burst test re-proven with two contexts (submit-time work vs capture serialization).
+**Do.** Default scheme (always valid, any transport): **two per-session decode graphs** (one per device), event-paired at each layer-end all-reduce point; per-session parking lot (max 64) becomes per-device; prefill + DFlash-verify graphs captured per device. **The G4 test, NCCL edition:** NCCL's collectives are graph-capturable in principle (communicator created *before* capture; each rank's op captured on its own stream) — the test captures a 2-rank `ncclAllReduce` in both contexts and checks **graph-vs-eager byte-match**; the fragile corner is the SHM (host-staging) transport inside a capture, and if that fails on this box the fallback is the same two-graph scheme with the NCCL op *outside* the graph, event-bracketed around it (eager op, identical invariants, zero other change). Capture stays under the recursive mutex; **the invariants in `qwen35.h` are restated for two contexts** (the capture-poisoning hazard is per-context, so two contexts *weaken* the cross-thread hazard — write the rules down, don't imply them). A single cross-device graph, should any future capture mode ever make it legal, remains an *optional* perf upgrade — never a requirement.
+**Verify.** The capture test suite (both contexts; P2P and SHM/staging transport configurations; graph-vs-eager byte-match for a few tokens per configuration); the 16-concurrent-burst test re-proven with two contexts (submit-time work vs capture serialization).
 **tp=1 check.** One graph, as today — same capture code with one device.
 
 ### WP-12 — DSpark under tp=2 · **[L-code / F]**
@@ -147,7 +148,7 @@ Mode tags: **[L]** = runnable lean (LLM resident, ≤512 MB/card) · **[L-code]*
 
 ### WP-13 — Vision tower + lmcache boundary · **[L-code / F]**
 **Manifest:** CHG-0031, 0017.
-**Do.** The vision tower (27B serves images and video — this is in-scope, not exotic) runs **on card 0** and broadcasts its `[n_img, H]` embedding block (P2P or staged per G1) into the prefill once per image batch. The lmcache sidecar (forked process with its own CUDA setup): **tp=2 + sidecar is rejected at load with a clear message** (decision (a) — the dual-GPU KV tier is deferred to v2); the sidecar's own single-GPU mode is unaffected.
+**Do.** The vision tower (27B serves images and video — this is in-scope, not exotic) runs **on card 0** and broadcasts its `[n_img, H]` embedding block (via the comm wrapper; transport per G1) into the prefill once per image batch. The lmcache sidecar (forked process with its own CUDA setup): **tp=2 + sidecar is rejected at load with a clear message** (decision (a) — the dual-GPU KV tier is deferred to v2); the sidecar's own single-GPU mode is unaffected.
 **Verify.** Image requests round-trip under tp=2 (small images — a lean functional test is fine); the rejection test.
 **tp=1 check.** Vision runs exactly as today; the rejection is a config check.
 
@@ -159,12 +160,12 @@ Mode tags: **[L]** = runnable lean (LLM resident, ≤512 MB/card) · **[L-code]*
 
 ### WP-15 — Test harness + bench + tp=2 eval gates · **[F]**
 **Manifest:** CHG-0022, 0023, 0028.
-**Do.** (1) The existing ~20 GPU tests run per device via `SPARKINFER_TEST_DEVICE=n` with **no code change**; the new P2P/all-reduce/capture tests from WP-3/WP-11 are formalized into the suite. (2) Dual-box bench tooling: clock pinning for **both** cards (today `_common.sh` pins one and reads `head -1`); the llama.cpp apples-to-apples baseline becomes `--tensor-split 2,2` on the same box; `bench.sh`/`evaluate.sh`/`accuracy.sh` gain a tp=2 target mode. (3) The **tp=2 eval-gate set**, per G3: **re-baseline, never loosen** — token-match on the dual box, DSpark lossless *inside* tp=2 (WP-12's numbers), no-regression tiers — while the single-GPU 5090 bot gates keep running unmodified for tp=1.
+**Do.** (1) The existing ~20 GPU tests run per device via `SPARKINFER_TEST_DEVICE=n` with **no code change**; the new comm-wrapper (both transports) and capture tests from WP-3/WP-11 are formalized into the suite. (2) Dual-box bench tooling: clock pinning for **both** cards (today `_common.sh` pins one and reads `head -1`); the llama.cpp apples-to-apples baseline becomes `--tensor-split 2,2` on the same box; `bench.sh`/`evaluate.sh`/`accuracy.sh` gain a tp=2 target mode. (3) The **tp=2 eval-gate set**, per G3: **re-baseline, never loosen** — token-match on the dual box, DSpark lossless *inside* tp=2 (WP-12's numbers), no-regression tiers — while the single-GPU 5090 bot gates keep running unmodified for tp=1.
 **tp=1 check.** The standing bot gates are re-run and green by *this WP's own run*, not by assumption.
 
 ### WP-16 — Docker + documentation · **[L-code / F]**
 **Manifest:** CHG-0025, 0026, 0032, 0033.
-**Do.** Entrypoint passes `--tp`/`--devices` through; docker smoke target for two-card boxes; image otherwise unchanged (no new deps — the size/attestation CI check stays green). README: **2×16 GB as a first-class run mode** — the P2P prerequisite (G1's verdict, honestly, including the R7 measured-bandwidth caveat: where the path is root-complex-routed, tp=2 is *correct* and its all-reduce cost is what the probe *measured*, not the datasheet), the G2 budget note, docker + from-source instructions. `server/README`: new flag rows, `/v1/info` and `/metrics` shapes. miner-guide/CONTRIBUTING: how tp=2 PRs are benchmarked and what counts as a regression (the G3 decision, whatever it is). CHANGELOG entry.
+**Do.** Entrypoint passes `--tp`/`--devices` through; docker smoke target for two-card boxes; the image **gains `libnccl`** — the size/attestation CI check is re-baselined *once*, with the measured size delta on the record (the re-stated-promise half of the 2026-09-25 dependency decision, documented, not a silent break). README: **2×16 GB as a first-class run mode** — the P2P prerequisite (G1's verdict, honestly, including the R7 measured-bandwidth caveat: where the path is root-complex-routed or NCCL falls back to host staging, tp=2 is *correct* and its all-reduce cost is what the probe *measured*, not the datasheet), the G2 budget note, docker + from-source instructions. `server/README`: new flag rows, `/v1/info` and `/metrics` shapes. miner-guide/CONTRIBUTING: how tp=2 PRs are benchmarked and what counts as a regression (the G3 decision, whatever it is). CHANGELOG entry.
 
 ### WP-17 — Eval-bot governance landing · **[F]**
 **Manifest:** CHG-0024, 0028. **Gated by:** G3 (the one decision in this program that waits on a human outside the repo).
@@ -198,7 +199,7 @@ One agent can do all of this serially; the WPs are partitioned so a **parent age
 |---|---|---|
 | A | `runtime/examples/p2p_probe.cpp`, CMake examples entry, `dual-gpu/00-p0-probe/` | WP-1 |
 | B | `dual-gpu/` record files (02 manifest json/md) | WP-2 |
-| C | `runtime/src/gpu_link.*`, `include/sparkinfer/gpu_link.h`, comm tests | WP-3 |
+| C | `runtime/src/gpu_link.*`, `include/sparkinfer/gpu_link.h`, the NCCL link wiring in CMake, comm tests | WP-3 |
 | D | `runtime/src/runtime.cpp`, `RuntimeConfig`, `runtime/src/model_engine.cpp`, server CLI/usage | WP-4, WP-5 |
 | E | the three weight loaders, the `tp_layout` table | WP-6 |
 | F | the KV-cache pool files | WP-7 |
@@ -221,19 +222,20 @@ One agent can do all of this serially; the WPs are partitioned so a **parent age
 
 | Risk | Resolved by | Recorded in |
 |---|---|---|
-| R1 — no P2P on this consumer pair at all | WP-1 (G1); WP-3 ships both transports regardless, so the order never changes | CHG-0027 note + `00-p0-probe/` |
+| R1 — no P2P on this consumer pair at all | **Downgraded from fatal to a performance fact:** NCCL's SHM (host-staging) transport works without P2P, so tp=2 is correct either way; WP-1 (G1) records which transport is live and its measured cost | CHG-0027 note + `00-p0-probe/` |
 | R2 — numerics drift (split GEMMs + bf16 reduce vs single card) | WP-12 measures it *inside* tp=2 (DSpark gate re-proven under the same split); WP-15 sets the gates from the numbers — re-baseline, never loosen | CHG-0028 |
 | R3 — 16 GB/card budget doesn't hold at marketed context | WP-1 (G2, the table) → WP-6 (empirical load; lowered default `--ctx` *with a message* if needed) | CHG-0020 |
 | R4 — kernels tuned for 170-SM 5090 on 48-SM cards | WP-2 audit (verdict list) → WP-14 (arch-keyed retune) | CHG-0029 sub-items |
 | R5 — graphs can't span contexts; P2P nodes need peer access at capture | WP-11 (G4, the capture test; two-graphs default is the always-valid scheme) | CHG-0013 note |
 | R6 — the eval bot only knows one 5090 | G3 (org) → WP-17 (form (c) needs no org action) | CHG-0024 |
-| R7 — P2P "exists" but is root-complex-routed / slow | WP-1 measures it; WP-16's README carries the honest performance note | CHG-0027 / CHG-0005 |
+| R7 — P2P "exists" but is root-complex-routed / slow (or NCCL picks host staging) | WP-1 measures it; WP-16's README carries the honest performance note | CHG-0027 / CHG-0005 |
+| R8 (new 2026-09-25) — the NCCL build in use does not support consumer sm_120, or refuses to init on this PCIe-only pair | WP-1's NCCL smoke decides it on day one, on the target box; if it is dead, `gpu_link`'s hand-rolled fallback (CHG-0005 note) ships and the original no-deps promise is restored | `00-p0-probe/` + CHG-0005 note |
 
 ---
 
 ## 8. What this plan deliberately does not do
 
-- No change to the llama.cpp baseline; no new dependencies; no org-policy change beyond the single G3 ask; **no pull request is opened against the org repo at any point** — the human decides when that happens (WP-17 is the only governance-touching WP, and its form (c) needs no org action at all).
+- No change to the llama.cpp baseline; no dependencies beyond the one allowed (NCCL — §2 rule 2, with its recorded fallback); no org-policy change beyond the single G3 ask; **no pull request is opened against the org repo at any point** — the human decides when that happens (WP-17 is the only governance-touching WP, and its form (c) needs no org action at all).
 - **No gate outcome is pre-decided.** Where 01 records a "default proposal" (drafter replicated, vision on card 0, lmcache deferred, two-graphs, whole-server failure, max-temp pacing), that proposal is the plan's default — and a WP changes it only when a *new measured fact* (WP-1's probe, WP-12's numerics) says so, with the manifest note updated in the same commit.
 - The tp=1 user sees zero difference. That is the contract; the tp=1 check in every WP is its enforcement.
 
