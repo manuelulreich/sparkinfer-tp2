@@ -40,7 +40,7 @@ It is **not** the implementation plan. It defines no code, no APIs, and no patch
 - **O2 (→ R7):** even where P2P exists, is the path a direct peer DMA or is it routed through the root complex (ACS/IOMMU), making it far slower than the link spec?
 - **O3 (→ R3):** does 16 GB/card hold weights/2 + drafter + GDN state + the KV pool the operator wants? The 262k-context claim may have to be re-stated for 2×16 GB.
 
-**Model facts used throughout (Qwen3.8-27B, per `Qwen35Config`):** 64 layers = 16 full-attention (GQA, **8 KV heads**) + 48 Gated-DeltaNet (48 value-heads per layer; q-heads = 3 per v-head, `gdn_qh_block`); `dense_ffn` (`n_experts=1`, `top_k=1`) — the FFN is one large SwiGLU, not an expert bank; 35B-A3B would carry 256 experts (→ 128/128 split). Exact hidden dim, FFN width, head dim, and full-attn q-head count are read from the config in P3 — they are deliberately *not* assumed here.
+**Model facts used throughout (Qwen3.8-27B, per `Qwen35Config`):** 64 layers = 16 full-attention (GQA, **4 KV heads** — 24:4, 6 q per kv) + 48 Gated-DeltaNet (48 value-heads per layer; 16 q + 16 k heads, 3 v per q/k head, `gdn_qh_block`); `dense_ffn` (`n_experts=1`, `top_k=1`) — the FFN is one large SwiGLU, not an expert bank; 35B-A3B would carry 256 experts (→ 128/128 split). Exact hidden dim, FFN width, head dim, and full-attn q-head count are read from the config in P3 — they are deliberately *not* assumed here.
 
 ## 3. How changes are recorded (the record-keeping contract)
 
@@ -159,23 +159,23 @@ Phases run in order except P1, which is independent and may overlap P0. Each pha
 
 ## Appendix A — Proposed default TP=2 layout, Qwen3.8-27B
 
-*Seed for P3 (to be finalized against `Qwen35Config`; hidden dim `H`, FFN width `F`, head dim `d_h`, full-attn q-head count `n_q` are read from the config, not assumed). Convention: **device A = KV-head group 0–3 / v-heads 0–23; device B = KV-head group 4–7 / v-heads 24–47.** Replicated tensors live on both cards and are never re-broadcast within a step.*
+*Seed for P3 (to be finalized against `Qwen35Config`; hidden dim `H`, FFN width `F`, head dim `d_h`, full-attn q-head count `n_q` are read from the config, not assumed). Convention: **device A = KV-head group 0–1 / v-heads 0–23; device B = KV-head group 2–3 / v-heads 24–47.** Replicated tensors live on both cards and are never re-broadcast within a step.*
 
 | Tensor (per occurrence) | Split axis | A holds | B holds | Notes |
 |---|---|---|---|---|
 | `embed_tokens` [V, H] | — (replicated) | all | all | shared with the drafter; input lookup only |
 | Layer norms (RMSNorm [H]) | — (replicated) | all | all | elementwise over the full hidden state, which is identical on both devices |
 | **Full-attn (16 layers)** | | | | |
-| `q_proj` [H, n_q·d_h], `k_proj`/`v_proj` [H, 8·d_h] | **columns, by KV-head group** | cols of KV group 0–3 (and their q-heads) | cols of KV group 4–7 (and their q-heads) | q-heads travel with their KV head so a head never straddles cards |
+| `q_proj` [H, n_q·d_h], `k_proj`/`v_proj` [H, 4·d_h] | **columns, by KV-head group** | cols of KV group 0–1 (and their q-heads 0–11) | cols of KV group 2–3 (and their q-heads 12–23) | q-heads travel with their KV head so a head never straddles cards |
 | `o_proj` [n_q·d_h, H] | **rows, by q-head group** | rows for its q-heads → partial [·, H] | the other rows → partial [·, H] | summed at the layer-end all-reduce (below) |
 | **GDN (48 layers)** | | | | |
-| GDN q/k/v/gate projections | **columns, by v-head block** (`gdn_qh_block`: 3 q + 1 v per block) | v-heads 0–23 blocks | v-heads 24–47 blocks | output projection row-split like `o_proj` |
+| GDN q/k/v/gate projections | **columns, by v-head block** (`gdn_qh_block`: 1 q + 1 k + 3 v per block) | v-heads 0–23 blocks | v-heads 24–47 blocks | output projection row-split like `o_proj` |
 | `lin_state` (fp32), conv state (bf16) | **per v-head** | v-heads 0–23 | v-heads 24–47 | the clean split: no cross-head coupling in the GDN update — *verified in P2* (CHG-0009) |
 | **Dense FFN (all 64 layers, `n_experts=1`)** | | | | |
 | `gate`/`up` [H, F] | **columns** | F/2 | F/2 | SwiGLU pair stays in lockstep per device |
 | `down` [F, H] | **rows** | F/2 rows → partial [·, H] | F/2 rows → partial [·, H] | fused into the layer-end all-reduce |
 | `lm_head` [H, V] | **rows, by vocab half** | V/2 rows → logits [·, V/2] | V/2 rows → logits [·, V/2] | **not** a full all-reduce: greedy = max of the two local maxima; sampling = Gumbel-max per device, then one cross-device compare |
-| **KV cache (the 16 full-attn layers only)** | **KV heads** | KV-heads 0–3 per {K,V}, pool + int8 scale pool + windowed ring + block table | KV-heads 4–7, same structure | one logical block = a pair of physical blocks (one per pool); prefix refcounts per pool; admission capacity = min over pools |
+| **KV cache (the 16 full-attn layers only)** | **KV heads** | KV-heads 0–1 per {K,V}, pool + int8 scale pool + windowed ring + block table | KV-heads 2–3, same structure | one logical block = a pair of physical blocks (one per pool); prefix refcounts per pool; admission capacity = min over pools |
 | **DSpark drafter (5 layers)** | — (replicated, default) | full copy | full copy | CHG-0030(b): it is small (5 layers); gated on the R3 budget table; shared embed/lm_head already replicated |
 | **Vision tower** | — (single home, default) | full tower (card A) | — | embeddings [n_img, H] broadcast via the comm wrapper once per image batch (P2P or staged, per G1) (CHG-0031) |
 | **MoE router / experts** | n/a on 27B (dense FFN above) | — | — | 35B-A3B only: experts 0–127 on A, 128–255 on B; router replicated or broadcast (CHG-0010) |

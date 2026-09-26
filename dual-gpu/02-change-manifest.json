@@ -433,7 +433,7 @@
       "verification": "tp=2: each device's pool holds its KV-head slice; attention on each device reads only its own pool; pool byte budgets match the configured split",
       "source": "manual",
       "status": "confirmed",
-      "notes": "Head split must be even per the model config (8 KV heads -> 4/4); if a future model has odd heads, fall back to slot-level (per-layer-pair) split."
+      "notes": "Head split must be even per the model config (4 KV heads -> 2/2); if a future model has odd heads, fall back to slot-level (per-layer-pair) split."
     },
     {
       "id": "CHG-0008",
