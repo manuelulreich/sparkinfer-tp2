@@ -114,7 +114,7 @@ Phases run in order except P1, which is independent and may overlap P0. Each pha
 *Exit:*
 
 - Zero `change: null` among `confirmed` items.
-- Appendix A is **arithmetically verified**: per-card byte budget ≤ 16 GB − reserve, with the numbers, and the head-count splits (8→4/4 KV, 48→24/24 v-heads) match the config exactly.
+- Appendix A is **arithmetically verified**: per-card byte budget ≤ 16 GB − reserve, with the numbers, and the head-count splits (4→2/2 KV, 48→24/24 v-heads) match the config exactly.
 
 ### P4 — Verification-matrix design
 
@@ -153,7 +153,7 @@ Phases run in order except P1, which is independent and may overlap P0. Each pha
 2. **Every `confirmed` item has a non-null `change`** (the design is recorded) and a severity.
 3. **All 14 subsystems are `audited`** (no `pending-audit`).
 4. **The P0 probe report is committed** in `dual-gpu/00-p0-probe/`; R1/R7 are answered with measured numbers, the NCCL smoke records the live transport (or the R8 fallback decision), and the per-card budget table lands.
-5. **Appendix A is complete and arithmetically verified** — per-card byte budget ≤ 16 GB − reserve, head splits exact (4/4 KV, 24/24 v-heads), and it matches the real `Qwen35Config`.
+5. **Appendix A is complete and arithmetically verified** — per-card byte budget ≤ 16 GB − reserve, head splits exact (2/2 KV, 24/24 v-heads), and it matches the real `Qwen35Config`.
 6. **The verification matrix covers every confirmed item**, and the **tp=1 byte-identical contract** is stated as the standing gate for every PR.
 7. **The tp=2 eval-gate question is decided or explicitly deferred** (CHG-0024/0028) — the next step must know whether its PR sequence is bot-scored, arm-scored, or runbook-validated.
 
