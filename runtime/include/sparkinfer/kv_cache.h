@@ -54,6 +54,16 @@ struct KVCacheConfig {
     int window_pass_tokens = 0;   // longest prefill pass a windowed slot must survive
     int max_seq_tokens = 0;       // per-sequence context the pool was sized for (required to cap)
     std::vector<char> slot_windowed;   // per POOL SLOT: 1 = windowed ring, 0 = full context
+
+    // TP KV-HEAD WINDOW (dual-gpu WP-7, the 2+2 split). This pool covers only a slice of the
+    // model's KV heads: [kv_head_start, kv_head_start + kv_head_count). count 0 = all heads --
+    // the tp=1 default, a single pool of the whole head set, byte-identical to the old layout.
+    // The window mirrors the tp table's K/V convention (tp_layout.hpp head_window: contiguous
+    // window per rank, last rank takes any remainder), so pool head j == model KV head
+    // kv_head_start + j and lines up with this rank's k_proj/v_proj weights. num_kv_heads above
+    // stays the MODEL's total head count; the window carves what this pool (this device) holds.
+    int kv_head_start = 0;
+    int kv_head_count = 0;
 };
 
 // Layer -> pool-slot map for the hybrid interval rule these models share: with
@@ -189,6 +199,17 @@ public:
     int max_blocks_per_seq() const;
     int num_free_blocks() const;
     int num_total_blocks() const;
+
+    // TP KV-head window actually in force for this pool (see KVCacheConfig): count 0 means all
+    // heads. An out-of-range window is clamped back to all heads (and warned once), never to a
+    // smaller pool, so a mis-sized caller degrades to the safe layout instead of a silent one.
+    int kv_head_start() const;
+    int kv_head_count() const;
+    // Per-physical-pool refcounts for a logical block: one id names ONE block in the K pool AND
+    // one in the V pool (the shared logical numbering), and holders are counted per pool. -1 when
+    // the id is out of range; a block is on the free list iff both pools show 0.
+    int block_ref_k(int block) const;
+    int block_ref_v(int block) const;
 
 private:
     struct Impl;

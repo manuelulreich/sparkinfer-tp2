@@ -170,3 +170,12 @@ add_test(NAME tp_config_cpu_test COMMAND tp_config_cpu_test)
 add_executable(tp_layout_cpu_test tp_layout_cpu_test.cpp)
 set_target_properties(tp_layout_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME tp_layout_cpu_test COMMAND tp_layout_cpu_test)
+
+# WP-7: the KV-cache split (2+2 KV heads, per-device pools) -- the head-window tiling
+# mirrored from tp_layout's K/V convention, the G2 33,024 B/token per-token figure, the
+# 262k/131k per-card fit, the min-across-pools admission rule (pure C++), plus ONE explicit
+# few-MB GPU paging run (a few blocks, 2+2 heads, skip-guarded, never auto-sized) -- the
+# real KVCacheManager on its 2-head window, per-pool refcounts and prefix restore included.
+add_executable(kv_split_cpu_test kv_split_cpu_test.cpp)
+target_link_libraries(kv_split_cpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME kv_split_cpu_test COMMAND kv_split_cpu_test)

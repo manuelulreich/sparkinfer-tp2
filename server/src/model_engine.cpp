@@ -392,7 +392,17 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     kvc.layer_slot = sparkinfer::hybrid_kv_layer_slots(impl_->cfg.n_layers, impl_->cfg.hybrid,
                                                        impl_->cfg.full_attn_interval);
     const int kvL = sparkinfer::kv_slot_count(kvc.layer_slot, impl_->cfg.n_layers);
-    const size_t epb = (size_t)16 * impl_->cfg.n_kv_heads * impl_->cfg.head_dim;
+    // PER-DEVICE KV BUDGET (dual-gpu WP-7, the 2+2 split): at tp>1 this manager is rank 0's
+    // pool, which holds only rank 0's KV-head window -- n_kv_heads/tp by the tp table's
+    // head_window convention (contiguous window, last rank the remainder) -- so the per-block
+    // elements and the budget below are this card's share, never a single-card total. The
+    // tp=1 default is all heads, i.e. the old formula byte-identically (and kvc keeps
+    // kv_head_count = 0, the manager's "all heads" pool).
+    const int kvh_rank = (plan.tp > 1 && impl_->cfg.n_kv_heads > 0)
+        ? (std::max(1, impl_->cfg.n_kv_heads / plan.tp))
+        : impl_->cfg.n_kv_heads;
+    if (plan.tp > 1) { kvc.kv_head_start = 0; kvc.kv_head_count = kvh_rank; }
+    const size_t epb = (size_t)16 * kvh_rank * impl_->cfg.head_dim;
     const size_t blocks = (size_t)impl_->cfg.max_seq / 16 + 8;
     // pool_bytes is a bf16-DENOMINATED BUDGET, not an allocation: KVCacheManager derives
     // total_blocks = pool_bytes / (n_slots * 2 * bf16_bytes_per_block) and then mallocs at the
@@ -400,6 +410,8 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     // is correct as written -- it must stay even when int8_kv is on, or capacity halves. What has
     // to match kvc.layer_slot is the SLOT COUNT: passing n_layers while the manager counts 16
     // slots would hand out 4x the blocks for the same memory rather than shrinking the pool.
+    // At tp>1 the budget is this device's (per the rank's head window above); the other ranks'
+    // pools in Wave 3 H size the same way from their own windows.
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
         kvc, (size_t)kvL * 2 * epb * 2 * blocks);
 
@@ -410,6 +422,11 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             kvc.int8_kv ? 1 : 0, kvL, impl_->cfg.n_layers, blocks,
             (double)kvL * 2.0 * epb * (kvc.int8_kv ? 1.0 : 2.0) * blocks
                 / (1024.0 * 1024.0 * 1024.0));
+    if (plan.tp > 1)
+        fprintf(stderr,
+                " (per-device: this rank's pool holds %d of %d KV heads; admission is the min "
+                "across pools)\n",
+                kvh_rank, impl_->cfg.n_kv_heads);
 
     // Per-rank NVFP4 fit estimates (dual-gpu WP-6): a pure-arithmetic mirror of
     // the two real per-device gates in qwen35.cpp, printed per rank so a plan can

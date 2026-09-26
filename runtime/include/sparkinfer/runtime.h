@@ -11,7 +11,9 @@ namespace sparkinfer {
 
 struct RuntimeConfig {
     int device_id = 0;
-    size_t kv_cache_bytes = 0;      // 0 = auto (80% of free VRAM)
+    size_t kv_cache_bytes = 0;      // 0 = auto (80% of this device's free VRAM; at tp>1 the
+                                     // budget is per-device -- each card's own free amount,
+                                     // never a single-card total; the tp=1 default is unchanged)
     size_t expert_cache_bytes = 0;  // MoE expert residency budget
     int max_batch_size = 256;
     int max_seq_len = 32768;

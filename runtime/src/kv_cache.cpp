@@ -1,11 +1,24 @@
 // Paged KV-cache manager.
 //
 // One flat device pool holds K and V for every layer:
-//   k_pool: [num_layers, num_blocks, block_size, num_kv_heads, head_dim] (bf16)
+//   k_pool: [num_layers, num_blocks, block_size, kv_heads, head_dim] (bf16)
 // A free-list of block ids backs allocation; each sequence gets a row in a
 // device block-table array mapping its logical blocks to physical block ids,
 // shared across layers (paging is layer-independent; the layer offset is applied
 // to the pool base, not the table).
+//
+// Tensor parallelism (WP-7, the 2+2 split): this is one DEVICE's pool. When
+// kv_head_count > 0 (see KVCacheConfig) the pools carry only this device's KV-head
+// window -- the tp table's K/V convention (tp_layout.hpp head_window: contiguous
+// window per rank, last rank the remainder) -- so a 27B 4-KV-head model at tp=2 is
+// two pools of 2 heads each, K and V. One shared logical block numbering spans both
+// pools (a block id names one block in the K pool and one in the V pool, allocated
+// and released as a pair), and the per-physical-pool refcounts (refs_k/refs_v) are
+// kept in lockstep, so a block returns to the free list exactly when the old single
+// count did. At the tp=1 default (kv_head_count == 0 = all heads) every size, the
+// allocation order and the block numbering are byte-identical to the single-pool
+// layout. Cross-device admission (the scheduler's rule) is the min of the pools'
+// free counts.
 
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/device_health.h"
@@ -42,6 +55,10 @@ constexpr int kMaxSeqs = 256;
 
 struct KVCacheManager::Impl {
     KVCacheConfig cfg;
+    // The TP KV-head window in force (0 count = all heads): which of cfg.num_kv_heads this pool
+    // holds. See the KVCacheConfig note and the file header for the convention.
+    int kv_head_start = 0;
+    int kv_head_count = 0;
     int total_blocks = 0;
     int max_blocks_per_seq = 0;
     size_t elems_per_block = 0;      // block_size * num_kv_heads * head_dim
@@ -72,18 +89,28 @@ struct KVCacheManager::Impl {
     std::vector<int> free_list_win;
     std::unordered_map<uint64_t, std::vector<int>> seq_ring;   // seq -> its ring blocks
     std::vector<int> free_list;
-    // Holders per physical block: every sequence listing it plus every retained list (prefix
-    // cache entries). A block is on free_list exactly when its count is zero.
-    std::vector<int> refs;
+    // Holders per physical pool: one refcount vector per pool (K and V). A block id names one
+    // block in EACH pool (the shared logical numbering), and every holder operation -- sequence
+    // ownership, prefix retention, release -- touches the two pools in lockstep, so a block is on
+    // free_list exactly when both counts are zero: the per-pool split of the old single count.
+    std::vector<int> refs_k;
+    std::vector<int> refs_v;
 
     void unref(int b) {
-        if (b < 0 || b >= (int)refs.size() || refs[b] <= 0) {
+        if (b < 0 || b >= (int)refs_k.size() || refs_k[b] <= 0 || refs_v[b] <= 0) {
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true))
                 fprintf(stderr, "[kv] released block %d that has no holder -- refcount bug\n", b);
             return;
         }
-        if (--refs[b] == 0) free_list.push_back(b);
+        const int rk = --refs_k[b];
+        const int rv = --refs_v[b];
+        if (rk == 0 && rv == 0) free_list.push_back(b);
+    }
+    // Both pools of a block gain a holder (the lockstep step of the per-pool refcounts).
+    void ref(int b) {
+        refs_k[b]++;
+        refs_v[b]++;
     }
     // Take a ring for seq_id if it has none. The device row is written once, ring-repeated over
     // the whole table stride, so a later grow() never has to touch it again.
@@ -122,8 +149,27 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     // halving the long-context KV read for the tensor-core flash-decode. Opt-in via cfg.int8_kv (the
     // Qwen3 example mains set it from SPARKINFER_KV_INT8, default on); other consumers stay bf16.
     impl_->int8_kv = cfg.int8_kv;
+    // The TP head window (WP-7): which slice of the model's KV heads THIS pool covers. 0 = all
+    // (the tp=1 default, the whole-heads single pool, byte-identical to the old layout); otherwise
+    // the rank's contiguous window per the tp table's K/V convention. An out-of-range window is a
+    // caller bug: clamp to all heads and say so once -- a pool that silently lost heads would
+    // serve stale KV in half the heads, which is worse than the full layout.
+    impl_->kv_head_start = cfg.kv_head_start;
+    impl_->kv_head_count = cfg.kv_head_count;
+    if (cfg.kv_head_count > 0 && (cfg.kv_head_start < 0 ||
+            cfg.kv_head_start + cfg.kv_head_count > cfg.num_kv_heads)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr, "[kv] KV-head window [%d, %d) exceeds the model's %d KV heads -- "
+                            "pooling all %d heads instead\n",
+                    cfg.kv_head_start, cfg.kv_head_start + cfg.kv_head_count, cfg.num_kv_heads,
+                    cfg.num_kv_heads);
+        impl_->kv_head_start = 0;
+        impl_->kv_head_count = 0;
+    }
+    const int heads_here = impl_->kv_head_count > 0 ? impl_->kv_head_count : cfg.num_kv_heads;
     const int elem_bytes = impl_->int8_kv ? 1 : (int)sizeof(unsigned short);
-    const size_t elems_per_block = (size_t)cfg.block_size * cfg.num_kv_heads * cfg.head_dim;
+    const size_t elems_per_block = (size_t)cfg.block_size * heads_here * cfg.head_dim;
     // total_blocks sized against the bf16 budget so callers/capacity are unchanged; int8 just mallocs
     // fewer bytes (+ the small scale pools).
     const size_t bytes_per_block = elems_per_block * sizeof(unsigned short); // bf16 budget
@@ -231,7 +277,8 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
 
     impl_->free_list.reserve(impl_->total_blocks);
     for (int i = impl_->total_blocks - 1; i >= 0; --i) impl_->free_list.push_back(i);
-    impl_->refs.assign(impl_->total_blocks, 0);
+    impl_->refs_k.assign(impl_->total_blocks, 0);
+    impl_->refs_v.assign(impl_->total_blocks, 0);
     for (int i = kMaxSeqs - 1; i >= 0; --i) impl_->free_slots.push_back(i);
 }
 
@@ -277,7 +324,8 @@ bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {
     for (int i = 0; i < grow; i++) {
         const int b = impl_->free_list.back();
         impl_->free_list.pop_back();
-        impl_->refs[b] = 1;
+        impl_->refs_k[b] = 1;   // the sequence's single holder, in both pools
+        impl_->refs_v[b] = 1;
         blocks.push_back(b);
     }
 
@@ -330,7 +378,7 @@ std::vector<int> KVCacheManager::retain_prefix_blocks(uint64_t seq_id, int n_blo
     auto it = impl_->seq_blocks.find(seq_id);
     if (n_blocks <= 0 || it == impl_->seq_blocks.end() || (int)it->second.size() < n_blocks) return out;
     out.assign(it->second.begin(), it->second.begin() + n_blocks);
-    for (int b : out) impl_->refs[b]++;
+    for (int b : out) impl_->ref(b);
     return out;
 }
 
@@ -355,9 +403,11 @@ bool KVCacheManager::allocate_with_prefix(uint64_t seq_id, const std::vector<int
     if (need > impl_->max_blocks_per_seq || (int)prefix.size() > need) return false;
     auto existing = impl_->seq_blocks.find(seq_id);
     if (existing != impl_->seq_blocks.end() && !existing->second.empty()) return false;
-    // A block nobody holds is back on the free list and may already belong to someone else.
+    // A block nobody holds in EITHER pool is back on the free list and may already belong to
+    // someone else; a prefix must be live in both to be shared.
     for (int b : prefix)
-        if (b < 0 || b >= impl_->total_blocks || impl_->refs[b] <= 0) return false;
+        if (b < 0 || b >= impl_->total_blocks ||
+            impl_->refs_k[b] <= 0 || impl_->refs_v[b] <= 0) return false;
     const int grow = need - (int)prefix.size();
     if ((int)impl_->free_list.size() < grow) return false;
 
@@ -373,11 +423,12 @@ bool KVCacheManager::allocate_with_prefix(uint64_t seq_id, const std::vector<int
 
     auto& blocks = impl_->seq_blocks[seq_id];
     blocks = prefix;
-    for (int b : prefix) impl_->refs[b]++;
+    for (int b : prefix) impl_->ref(b);
     for (int i = 0; i < grow; i++) {
         const int b = impl_->free_list.back();
         impl_->free_list.pop_back();
-        impl_->refs[b] = 1;
+        impl_->refs_k[b] = 1;
+        impl_->refs_v[b] = 1;
         blocks.push_back(b);
     }
     cu(cudaMemcpy(impl_->d_block_tables + (size_t)slot * impl_->max_blocks_per_seq, blocks.data(),
@@ -469,5 +520,13 @@ int    KVCacheManager::block_size() const { return impl_->cfg.block_size; }
 int    KVCacheManager::max_blocks_per_seq() const { return impl_->max_blocks_per_seq; }
 int    KVCacheManager::num_free_blocks() const { return (int)impl_->free_list.size(); }
 int    KVCacheManager::num_total_blocks() const { return impl_->total_blocks; }
+int    KVCacheManager::kv_head_start() const { return impl_->kv_head_start; }
+int    KVCacheManager::kv_head_count() const { return impl_->kv_head_count; }
+int    KVCacheManager::block_ref_k(int block) const {
+    return (block >= 0 && block < (int)impl_->refs_k.size()) ? impl_->refs_k[block] : -1;
+}
+int    KVCacheManager::block_ref_v(int block) const {
+    return (block >= 0 && block < (int)impl_->refs_v.size()) ? impl_->refs_v[block] : -1;
+}
 
 } // namespace sparkinfer
