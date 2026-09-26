@@ -15,8 +15,8 @@
     "source_plan": "dual-gpu/01-identification-plan.md",
     "consumed_by": "03-implementation-plan.md (next step): only items with status planned/implemented/verified flow into the final plan's PR decomposition",
     "last_scan": {
-      "new_items": 207,
-      "total_items": 3474
+      "new_items": 5,
+      "total_items": 3479
     }
   },
   "status_lifecycle": {
@@ -510,7 +510,7 @@
       "verification": "tp=2 load succeeds on two 16 GB cards with per-device residency <= budget; tp=1 path unchanged and byte-identical",
       "source": "manual",
       "status": "confirmed",
-      "notes": "Consumes the per-tensor ownership map (P3 deliverable). The free-VRAM preflight gates become per-device decisions (an fp4 copy may fit on card A and not card B)."
+      "notes": "Consumes the per-tensor ownership map (P3 deliverable). The free-VRAM preflight gates become per-device decisions (an fp4 copy may fit on card A and not card B). 2026-09-26 (WP-6/Wave 2): the per-tensor ownership map (P3 deliverable) this item consumes has landed as runtime/include/sparkinfer/tp_layout.hpp with the per-rank on-disk budget audit (see CHG-0035). The actual per-device weight allocation remains Wave 3 (qwen35.cpp)."
     },
     {
       "id": "CHG-0012",
@@ -947,6 +947,25 @@
       "source": "manual",
       "status": "confirmed",
       "notes": "WP-2 decision: (a) any fatal CUDA/NVML error on EITHER GPU downgrades the whole server. Rationale: with tp=2 the two cards are one logical unit (shared KV block numbering, per-layer collectives, one thermal budget), so per-card isolation (b) would buy almost nothing at 16 GB/card (one dead card usually means the model no longer fits) while costing far more code. device_health already holds the global flag; tp=2 only changes the trigger to either-device and logs which card."
+    },
+    {
+      "id": "CHG-0035",
+      "severity": "blocker",
+      "subsystem": "weight-loading",
+      "category": "weight-loading",
+      "file": "runtime/include/sparkinfer/tp_layout.hpp",
+      "line": 1,
+      "symbol": "tp::Table / placement() / rank_on_disk_bytes()",
+      "snippet": null,
+      "current": "No per-tensor tensor-parallel ownership map exists: every loader (GGUF, compressed-tensors, flat .bin) allocates the whole model (17,916,112,584 B for the 27B NVFP4 file) into one device; there is no per-rank split, no visual-tower placement rule, no per-card budget audit, and no map for the loaders to consult before the Wave-3 per-device allocation work.",
+      "change": "New pure-C++ module runtime/include/sparkinfer/tp_layout.hpp: Qwen35Config x effective-device-count -> per-tensor {rank, axis, element-ranges} table (grouped q/kv head pairing, GDN v-block travel, dense-FFN feature split, expert-index split for 35B/MoE, lm_head rows, visual tower single-homed to rank 0, two-tier fallback for MTP-era/HF-MoE names); class-aware on-disk byte model (nvfp4 payload + inner-dim scale blocks + f32 companions; bf16/f32 classes) with per-rank on-disk totals (S/2 + R, file-exact); process-wide set/get; inventory cross-check bridges into gguf.cpp/safetensors.cpp (qwen38-gated byte audit); ModelEngine::load builds the table at load time and, when tp>1, prints a per-rank NVFP4 fit estimate. Pinned by runtime/tests/tp_layout_cpu_test.cpp. The actual per-device weight allocation is deliberately left to Wave 3 (qwen35.cpp, CHG-0011).",
+      "depends_on": [
+        "CHG-0001"
+      ],
+      "verification": "tp_layout_cpu_test: 27B canonical (no-MTP, 24q/4kv) per-rank on-disk 8,497,852,484 B +/- 8 KB (table prints the truer companion-intact 8,497,854,088 B; rank-0 physical 9,419,314,280 B; per-card average 8,543.57 MiB = file/2 8,543.07 + 0.502 MiB; G2 8,536 MiB -> +7.57 MiB); 35B/muse/classic placement-only; rank symmetry; tp=1 degenerate invariance. In-regime 14/14 (13 _cpu_test + cpu_reference); full superbuild BUILD-EXIT 0; TP gate (CHG-0003) byte-identical; runtime/src/models/ untouched.",
+      "source": "manual",
+      "status": "implemented",
+      "notes": "Landed, Wave 2 (2026-09-26; tp=2 WP-6): the 1,105-line table reproduces the 27B canonical file exactly as S 16,993,005,704 + V 921,460,192 + R 1,349,632 + H 297,056 = 17,916,112,584 B; per-rank on-disk 8,497,854,088 B (target S/2+R 8,497,852,484, delta 1,604 B = 401 companion pairs x 4 B); per-card average 8,543.57 MiB vs G2 8,536 MiB (+7.57 MiB, supersedes the earlier +0.757 MiB line). O/GdnOut denominators left unhalved per the Decisions-E list (O = qdim, GdnOut = nv x lhd). TP gate model_engine.cpp L219-267 byte-identical; bridges are bookkeeping-only; the per-device allocation consumer stays in Wave-3 H."
     },
     {
       "id": "CHG-0035",
@@ -56041,6 +56060,86 @@
       "source": "scan",
       "status": "rejected",
       "notes": "Rejected at Wave-1 re-scan (2026-09-25): by-product of WP-4 (device gate replaced by validate_tp_plan from tp_plan.hpp; new lines in the load() gate); underlying site already covered by audited sibling CHG-0003 for this file."
+    },
+    {
+      "id": "CHG-3475",
+      "subsystem": "runtime",
+      "category": "memory-pool",
+      "file": "runtime/src/gguf.cpp",
+      "line": 268,
+      "symbol": "Cursor",
+      "snippet": "// out-of-bounds pointer that is later dereferenced (e.g. cudaMemcpy on upload).",
+      "current": "Auto-located call site (see snippet); audit in P2.",
+      "change": null,
+      "depends_on": [],
+      "verification": "",
+      "source": "scan",
+      "status": "rejected",
+      "notes": "REJECTED - WP-6 byproduct (2026-09-26): a comment line in the loader bridge that contains the literal cudaMemcpy (out-of-bounds-pointer guard documentation); not a call site. The call site above is triaged (CHG-1009/CHG-2337, both rejected)."
+    },
+    {
+      "id": "CHG-3476",
+      "subsystem": "runtime",
+      "category": "memory-pool",
+      "file": "runtime/src/safetensors.cpp",
+      "line": 347,
+      "symbol": "JsonCursor",
+      "snippet": "// not produce an out-of-bounds pointer a later cudaMemcpy would dereference.",
+      "current": "Auto-located call site (see snippet); audit in P2.",
+      "change": null,
+      "depends_on": [],
+      "verification": "",
+      "source": "scan",
+      "status": "rejected",
+      "notes": "REJECTED - WP-6 byproduct (2026-09-26): a comment line in the loader bridge that contains the literal cudaMemcpy; not a call site. The call site above is triaged (CHG-1858, rejected)."
+    },
+    {
+      "id": "CHG-3477",
+      "subsystem": "server-tooling",
+      "category": "device-context",
+      "file": "server/src/model_engine.cpp",
+      "line": 231,
+      "symbol": "ModelEngine",
+      "snippet": "if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;  // a failed query is \"no device\"",
+      "current": "Auto-located call site (see snippet); audit in P2.",
+      "change": null,
+      "depends_on": [],
+      "verification": "",
+      "source": "scan",
+      "status": "rejected",
+      "notes": "REJECTED - WP-6 re-surfacing of CHG-3473 (L228 -> L231, +3 from the WP-6 include): WP-4 device-gate by-product, same rationale as the 2026-09-25 rejection."
+    },
+    {
+      "id": "CHG-3478",
+      "subsystem": "server-tooling",
+      "category": "device-context",
+      "file": "server/src/model_engine.cpp",
+      "line": 259,
+      "symbol": "ModelEngine",
+      "snippet": "if (cudaGetDeviceProperties(&p, dev) == cudaSuccess)",
+      "current": "Auto-located call site (see snippet); audit in P2.",
+      "change": null,
+      "depends_on": [],
+      "verification": "",
+      "source": "scan",
+      "status": "rejected",
+      "notes": "REJECTED - WP-6 re-surfacing of CHG-3474 (L256 -> L259, +3 from the WP-6 include): WP-4 device-gate by-product, same rationale as the 2026-09-25 rejection."
+    },
+    {
+      "id": "CHG-3479",
+      "subsystem": "server-tooling",
+      "category": "device-context",
+      "file": "server/src/model_engine.cpp",
+      "line": 442,
+      "symbol": "ModelEngine",
+      "snippet": "const bool have_cc = cudaGetDeviceProperties(&dp, eff[r]) == cudaSuccess;",
+      "current": "Auto-located call site (see snippet); audit in P2.",
+      "change": null,
+      "depends_on": [],
+      "verification": "",
+      "source": "scan",
+      "status": "rejected",
+      "notes": "REJECTED - WP-6 byproduct (2026-09-26): read-only cudaGetDeviceProperties in the per-rank NVFP4 fit-estimate block (print-only; no selection, no allocation, no state change). The decision points are the CHG-0003 device gate and the qwen35.cpp free-VRAM gate, both unchanged."
     }
   ]
 }

@@ -162,3 +162,11 @@ add_test(NAME gpu_link_2gpu_test COMMAND gpu_link_2gpu_test)
 add_executable(tp_config_cpu_test tp_config_cpu_test.cpp)
 set_target_properties(tp_config_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME tp_config_cpu_test COMMAND tp_config_cpu_test)
+
+# WP-6: the per-tensor TP placement table -- split/disjoint/cover pattern classes, rank
+# symmetry, the tp=1 degenerate invariance, the two-tier out-of-pattern fallback, and the 27B
+# class-aware on-disk budget audit -- pure C++ against runtime/include/sparkinfer/tp_layout.hpp;
+# no CUDA, no linkage, GPU-free.
+add_executable(tp_layout_cpu_test tp_layout_cpu_test.cpp)
+set_target_properties(tp_layout_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME tp_layout_cpu_test COMMAND tp_layout_cpu_test)

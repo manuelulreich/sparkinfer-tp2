@@ -17,6 +17,7 @@
 #include "tp_plan.hpp"
 #include "sparkinfer/moe/engine.h"
 #include "sparkinfer/runtime.h"
+#include "sparkinfer/tp_layout.hpp"
 
 #include "../../runtime/examples/qwen3_gguf_config.h"
 #include "../../runtime/examples/qwen38_hf_config.h"
@@ -30,6 +31,8 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <fstream>
+#include <iostream>
+#include <cstdlib>
 #include <sys/stat.h>
 #include <nlohmann/json.hpp>
 
@@ -317,6 +320,40 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             qwen3_model_label(impl_->cfg), impl_->cfg.n_layers, impl_->cfg.n_experts,
             impl_->cfg.top_k, impl_->cfg.max_seq);
 
+    // TP placement table (dual-gpu WP-6): built from the just-resolved config and
+    // plan, published process-wide BEFORE any loader or fit estimate below runs, so
+    // every consumer (the weight parsers' inventory cross-checks, the per-rank
+    // fit numbers below, and later the per-device allocators in qwen35.cpp)
+    // agrees on one name->(rank, axis, ranges) map. At the tp=1 default this is
+    // the degenerate table -- every name whole on device 0, no split -- the tp=1
+    // invariance, so an unset or single-device load behaves exactly as before.
+    {
+        const sparkinfer::tp::Conv conv =
+            kind == LoadKind::Gguf ? sparkinfer::tp::Conv::Gguf : sparkinfer::tp::Conv::Hf;
+        const sparkinfer::tp::Table t =
+            sparkinfer::tp::Table::build(impl_->cfg, (int)eff.size(), conv);
+        sparkinfer::tp::set_process_table(std::move(t));
+        if (eff.size() > 1)
+            fprintf(stderr, "[sparkinfer-server] tp placement table: %zu names, %d ranks (%s names)\n",
+                    sparkinfer::tp::get_process_table().entries().size(), (int)eff.size(),
+                    conv == sparkinfer::tp::Conv::Gguf ? "gguf" : "hf");
+        if (kind == LoadKind::Gguf) {
+            // g is the live, opened GGUF (above): table<->file both ways.
+            sparkinfer::tp::log_gguf_tp_inventory(g, std::cerr);
+        } else {
+            // The directory kinds: open the shard set only to enumerate names for
+            // the one-way cross-check (mmap of headers, no weight reads). A layout
+            // the reader cannot open is a warning here -- the real load outcome is
+            // decided by the dispatch below, never by the cross-check.
+            sparkinfer::SafeTensorsModel m;
+            if (m.open(gguf_path))
+                sparkinfer::tp::log_safetensors_tp_inventory(m, std::cerr);
+            else
+                fprintf(stderr, "[sparkinfer-server] tp inventory: could not open safetensors "
+                                "shards in %s (cross-check skipped)\n", gguf_path.c_str());
+        }
+    }
+
     // The runtime is created with the resolved plan: at the tp=1 default this is
     // value-identical to the legacy default config (device 0, single row), and
     // initialize() fills the per-device property table.
@@ -373,6 +410,77 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             kvc.int8_kv ? 1 : 0, kvL, impl_->cfg.n_layers, blocks,
             (double)kvL * 2.0 * epb * (kvc.int8_kv ? 1.0 : 2.0) * blocks
                 / (1024.0 * 1024.0 * 1024.0));
+
+    // Per-rank NVFP4 fit estimates (dual-gpu WP-6): a pure-arithmetic mirror of
+    // the two real per-device gates in qwen35.cpp, printed per rank so a plan can
+    // be eyeballed before the first token. Nothing here allocates or fails.
+    //
+    //   Gguf kind + muse_glimmer: the Muse prefill-fp4 preflight
+    //     (qwen35.cpp:7143-7156,7187) -- per rank, the qkvg / wo / down operand
+    //     shapes at that rank's q/kv head windows (the q width includes the
+    //     folded gate, exactly as the real preflight's 2*qdim_a term), with the
+    //     per-layer and whole-model byte totals and the hpp fit mirrors
+    //     nvfp4_supported(12,0,128,n,k) (shape + cc 12.0 only; the sm_120a
+    //     BUILD requirement and the VRAM budget stay in qwen35.cpp).
+    //
+    //   Hf kind + qwen38: the compressed-tensors lm_head keep
+    //     (qwen35.cpp:8185-8221) -- per rank, the vocab rows that rank owns and
+    //     the keep need at that window (plus the full-head need the current
+    //     replicated keep pays), against the SPARKINFER_Q38_HEAD_NVFP4_RESERVE_MB
+    //     reserve (3072 MB default). The actual keep/decline (free-VRAM
+    //     dependent) still runs in the load path.
+    if (eff.size() > 1) {
+        const sparkinfer::Qwen35Config& fc = impl_->cfg;
+        const int R = (int)eff.size();
+        const size_t H = (size_t)fc.hidden, F = (size_t)fc.moe_ffn;
+        if (kind == LoadKind::Gguf && fc.muse_glimmer) {
+            for (int r = 0; r < R; ++r) {
+                const size_t qh  = (size_t)fc.n_q_heads * (r + 1) / R - (size_t)fc.n_q_heads * r / R;
+                const size_t kvh = (size_t)fc.n_kv_heads * (r + 1) / R - (size_t)fc.n_kv_heads * r / R;
+                const size_t qd = qh * fc.head_dim, kd = kvh * fc.head_dim;
+                cudaDeviceProp dp{};
+                const bool have_cc = cudaGetDeviceProperties(&dp, eff[r]) == cudaSuccess;
+                const size_t qkvg = sparkinfer::tp::nvfp4_muse_qkvg_layer(qd, kd, H);
+                const size_t wo   = sparkinfer::tp::nvfp4_muse_wo_layer(qd, H);
+                const size_t down = sparkinfer::tp::nvfp4_muse_down_layer(H, F);
+                fprintf(stderr,
+                        "[sparkinfer-server] tp fit rank%d (dev %d, cc %d.%d): per layer "
+                        "qkvg %zu MiB (fit %d), wo %zu MiB (fit %d), down %zu MiB (fit %d); "
+                        "model wants qkvg %zu MiB, wo %zu MiB, down %zu MiB over %d layers\n",
+                        r, eff[r], have_cc ? dp.major : -1, have_cc ? dp.minor : -1,
+                        qkvg / (1024 * 1024),
+                        sparkinfer::tp::nvfp4_supported(12, 0, 128, 2 * qd + 2 * kd, H) ? 1 : 0,
+                        wo / (1024 * 1024),
+                        sparkinfer::tp::nvfp4_supported(12, 0, 128, H, qd) ? 1 : 0,
+                        down / (1024 * 1024),
+                        sparkinfer::tp::nvfp4_supported(12, 0, 128, H, F) ? 1 : 0,
+                        (size_t)fc.n_layers * qkvg / (1024 * 1024),
+                        (size_t)fc.n_layers * wo / (1024 * 1024),
+                        (size_t)fc.n_layers * down / (1024 * 1024),
+                        fc.n_layers);
+            }
+        } else if (kind != LoadKind::Gguf && fc.qwen38) {
+            const size_t V = (size_t)fc.vocab;
+            const size_t need_full = sparkinfer::tp::nvfp4_head_keep_need(V, H);
+            const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_RESERVE_MB");
+            const long rv = e ? atol(e) : 3072;
+            const size_t reserve_mb = (rv < 0) ? 0 : (size_t)rv;
+            fprintf(stderr,
+                    "[sparkinfer-server] tp head: the full (replicated) keep needs %zu MiB "
+                    "+ %zu MiB reserve; split per rank it is:\n",
+                    need_full / (1024 * 1024), reserve_mb);
+            for (int r = 0; r < R; ++r) {
+                const size_t rows = V * (size_t)(r + 1) / R - V * (size_t)r / R;
+                fprintf(stderr,
+                        "  rank%d (dev %d): vocab rows %zu, keep need %zu MiB\n",
+                        r, eff[r], rows,
+                        sparkinfer::tp::nvfp4_head_keep_need(rows, H) / (1024 * 1024));
+            }
+            fprintf(stderr,
+                    "[sparkinfer-server] tp head: the actual keep/decline (free-VRAM dependent) "
+                    "still runs in qwen35.cpp's compressed-tensors load (SPARKINFER_Q38_HEAD_NVFP4)\n");
+        }
+    }
 
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = impl_->cfg.n_experts;

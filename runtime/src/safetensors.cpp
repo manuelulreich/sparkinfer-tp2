@@ -6,6 +6,7 @@
 // dependency-free, mmap-based, bounds-checked design.
 
 #include "sparkinfer/safetensors.h"
+#include "sparkinfer/tp_layout.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -446,6 +447,84 @@ const STTensor* SafeTensorsModel::tensor(const std::string& name) const {
     auto it = shard_of_.find(name);
     if (it == shard_of_.end()) return nullptr;
     return shards_[it->second].tensor(name);
+}
+
+// Loader bridge (declared in tp_layout.hpp). One-way only: SafeTensorsModel
+// exposes tensor(name) but no name list (its shard map is private), so we can
+// check every TABLE name against the file, but file-only names (the visual
+// tower, MTP-era tensors, shard headers) cannot be enumerated and are noted
+// as such. Same qwen38 byte gate as the GGUF bridge: for the 27B NVFP4 family
+// we compare each known tensor's file n_bytes against the class model and
+// sum the per-rank file bytes (the per-card budget audit).
+void tp::log_safetensors_tp_inventory(const SafeTensorsModel& m, std::ostream& out) {
+    const Table& t = get_process_table();
+    if (!t.set()) {
+        out << "[tp] safetensors inventory cross-check: table unset (tp=1) -- every name "
+                "resolves whole on device 0, nothing to check\n";
+        return;
+    }
+    const size_t n_ranks = (size_t)t.n_ranks();
+    out << "[tp] safetensors inventory cross-check: table entries=" << t.entries().size()
+        << ", ranks=" << n_ranks
+        << ", conv=" << (t.conv() == Conv::Hf ? "Hf" : (t.conv() == Conv::Flat ? "Flat" : "Gguf"))
+        << "\n";
+
+    size_t found = 0, missing = 0, byte_mismatch = 0;
+    size_t file_bytes_known = 0;
+    std::vector<std::string> missing_names;
+    std::vector<std::string> mismatch_names;
+    for (const auto& e : t.entries()) {
+        const STTensor* ft = m.tensor(e.first);
+        if (!ft) {
+            ++missing;
+            if (missing_names.size() < 12) missing_names.push_back(e.first);
+            continue;
+        }
+        ++found;
+        file_bytes_known += (size_t)ft->n_bytes;
+        if (t.cfg().qwen38 && (size_t)ft->n_bytes != t.on_disk_bytes(e.first)) {
+            ++byte_mismatch;
+            if (mismatch_names.size() < 12) mismatch_names.push_back(e.first);
+        }
+    }
+    out << "  table -> file: " << found << " found, " << missing << " missing";
+    for (const auto& n : missing_names) out << "\n    " << n;
+    if (missing_names.empty()) out << "\n";
+    out << "  (file-only names such as model.visual.* cannot be listed: the loader"
+          << " exposes no name enumeration)\n";
+
+    if (t.cfg().qwen38) {
+        out << "  byte audit (nvfp4 class model): table total on disk = "
+            << t.total_on_disk_bytes() << " B; known-name file bytes = " << file_bytes_known << " B\n";
+        out << "    per rank, model:    ";
+        for (size_t r = 0; r < n_ranks; ++r) out << "rank" << r << "=" << t.rank_on_disk_bytes((int)r) << " B  ";
+        out << "\n    per rank, file:      ";
+        for (size_t r = 0; r < n_ranks; ++r) {
+            size_t s = 0;
+            for (const auto& e : t.entries()) {
+                const STTensor* ft = m.tensor(e.first);
+                if (!ft) continue;
+                const Placement p = t.placement(e.first, (int)r);
+                s += p.denom == 0 ? (size_t)ft->n_bytes
+                                  : tp::rank_on_disk_bytes(class_for(e.second), (size_t)ft->n_bytes,
+                                                            p.split_elements(), p.denom);
+            }
+            out << "rank" << r << "=" << s << " B  ";
+        }
+        out << "\n";
+        if (byte_mismatch) {
+            out << "    per-name mismatches (file != model), first of " << byte_mismatch << ":\n";
+            for (const auto& n : mismatch_names) {
+                const STTensor* ft = m.tensor(n);
+                if (ft) out << "      " << n << ": file=" << ft->n_bytes
+                            << " B, model=" << t.on_disk_bytes(n) << " B\n";
+            }
+        } else {
+            out << "    per-name check: all " << found << " known tensors match the model exactly\n";
+        }
+    } else {
+        out << "  byte audit: skipped (cfg.qwen38 false -- non-NVFP4 family, file bytes not modeled)\n";
+    }
 }
 
 } // namespace sparkinfer

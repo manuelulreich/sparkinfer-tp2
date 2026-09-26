@@ -7,7 +7,7 @@
 >
 > **Plan.** [01-identification-plan.md](01-identification-plan.md) · **Consumed by** 03-implementation-plan.md (next step): only items with status planned/implemented/verified flow into the final plan's PR decomposition
 >
-> **Status.** last scan: {'new_items': 207, 'total_items': 3474} · 3474 items · created 2026-09-25
+> **Status.** last scan: {'new_items': 5, 'total_items': 3479} · 3480 items · created 2026-09-25
 
 ## How to read this file
 
@@ -201,7 +201,7 @@ A `change` of `null` means *the required change has not yet been designed* — t
 
 ## Items
 
-**By status:** `confirmed` × 45 · `implemented` × 5 · `rejected` × 3424
+**By status:** `confirmed` × 45 · `implemented` × 6 · `rejected` × 3429
 
 | id | status | sev | subsystem | category | location | what | current | change (design) | verify |
 |---|---|---|---|---|---|---|---|---|---|
@@ -239,6 +239,7 @@ A `change` of `null` means *the required change has not yet been designed* — t
 | CHG-0032 | confirmed | major | tooling-ci | infra | CMakeLists.txt · `build` |  | Superbuild: kernels -> moe -> runtime -> (server). CUDA arches 89/90/100/120; 120 covers the 5060 Ti. No external comms library anywhere (that changes under the 2026-09-25 decision — see change/notes). | 2026-09-25 (user decision): one C runtime dependency allowed — NVIDIA NCCL (Apache-2.0): the superbuild gains the NCCL link (find_package / FetchContent / vendor dir — decided in WP-3); no-Python-stack preserved (plain .so, no Python in the path); the 2.5 MB single-binary promise is re-stated as 'binary + libnccl' and the CI size/attestation check is re-baselined once, with the measured delta recorded (WP-16). If R8 (sm_120) kills NCCL on this box, the hand-rolled comm (CHG-0005 fallback) restores the original promise. | Dependency policy per the 2026-09-25 decision: exactly one new C runtime dep (NCCL), no Python anywhere in the build or runtime path; CI size/attestation check re-baselined with the measured libnccl d |
 | CHG-0033 | rejected | minor | server-config | config | runtime/python/sparkinfer_runtime/__init__.py · `python bridge (stub)` |  | One-line stub ('# sparkinfer Python bindings'); no code yet. | (null — to be designed) | No action; confirm the stub gains no device assumptions when it is later implemented |
 | CHG-0034 | confirmed | major | device-init | serving | runtime/include/sparkinfer/device_health.h · `note_cuda_error / device_lost` |  | A context-killing CUDA error (e.g. out of memory mid-serve, a lost device) is recorded in a process-global flag; the server then refuses all new work and reports 'unrecoverable device error -- restart required' from one GPU. | (null — to be designed) | Policy decision recorded for two contexts: (a) any fatal error on either GPU downgrades the whole server (default proposal -- matches today's operator expectations and the eval's trust model), (b) per |
+| CHG-0035 | implemented | blocker | weight-loading | weight-loading | runtime/include/sparkinfer/tp_layout.hpp:1 · `tp::Table / placement() / rank_on_disk_bytes()` |  | No per-tensor tensor-parallel ownership map exists: every loader (GGUF, compressed-tensors, flat .bin) allocates the whole model (17,916,112,584 B for the 27B NVFP4 file) into one device; there is no per-rank split, no visual-tower placement rule, no per-card budget audit, and no map for the loaders to consult before the Wave-3 per-device allocation work. | New pure-C++ module runtime/include/sparkinfer/tp_layout.hpp: Qwen35Config x effective-device-count -> per-tensor {rank, axis, element-ranges} table (grouped q/kv head pairing, GDN v-block travel, dense-FFN feature split, expert-index split for 35B/MoE, lm_head rows, visual tower single-homed to rank 0, two-tier fallback for MTP-era/HF-MoE names); class-aware on-disk byte model (nvfp4 payload + inner-dim scale blocks + f32 companions; bf16/f32 classes) with per-rank on-disk totals (S/2 + R, file-exact); process-wide set/get; inventory cross-check bridges into gguf.cpp/safetensors.cpp (qwen38-gated byte audit); ModelEngine::load builds the table at load time and, when tp>1, prints a per-rank NVFP4 fit estimate. Pinned by runtime/tests/tp_layout_cpu_test.cpp. The actual per-device weight allocation is deliberately left to Wave 3 (qwen35.cpp, CHG-0011). | tp_layout_cpu_test: 27B canonical (no-MTP, 24q/4kv) per-rank on-disk 8,497,852,484 B +/- 8 KB (table prints the truer companion-intact 8,497,854,088 B; rank-0 physical 9,419,314,280 B; per-card averag |
 | CHG-0035 | rejected | — | kernels | stream-graph | kernels/csrc/cuda/attention/flash_decode.cu:119 | float scale, cudaStream_t stream) { | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
 | CHG-0036 | rejected | — | kernels | stream-graph | kernels/csrc/cuda/attention/flash_decode.cu:134 | float scale, cudaStream_t stream | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
 | CHG-0037 | rejected | — | kernels | stream-graph | kernels/csrc/cuda/attention/flash_decode_global_hd512.cu:118 | float scale, cudaStream_t stream | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
@@ -3679,6 +3680,11 @@ A `change` of `null` means *the required change has not yet been designed* — t
 | CHG-3472 | rejected | — | runtime-tests | stream-graph | runtime/tests/gpu_link_2gpu_test.cpp:1042 · `Ops` | cudaStreamDestroy(s1); | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
 | CHG-3473 | rejected | — | server-tooling | device-context | server/src/model_engine.cpp:228 · `ModelEngine` | if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;  // a failed query is "no device" | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
 | CHG-3474 | rejected | — | server-tooling | device-context | server/src/model_engine.cpp:256 · `ModelEngine` | if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
+| CHG-3475 | rejected | — | runtime | memory-pool | runtime/src/gguf.cpp:268 · `Cursor` | // out-of-bounds pointer that is later dereferenced (e.g. cudaMemcpy on upload). | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
+| CHG-3476 | rejected | — | runtime | memory-pool | runtime/src/safetensors.cpp:347 · `JsonCursor` | // not produce an out-of-bounds pointer a later cudaMemcpy would dereference. | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
+| CHG-3477 | rejected | — | server-tooling | device-context | server/src/model_engine.cpp:231 · `ModelEngine` | if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;  // a failed query is "no device" | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
+| CHG-3478 | rejected | — | server-tooling | device-context | server/src/model_engine.cpp:259 · `ModelEngine` | if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
+| CHG-3479 | rejected | — | server-tooling | device-context | server/src/model_engine.cpp:442 · `ModelEngine` | const bool have_cc = cudaGetDeviceProperties(&dp, eff[r]) == cudaSuccess; | Auto-located call site (see snippet); audit in P2. | (null — to be designed) |  |
 
 ## Notes
 

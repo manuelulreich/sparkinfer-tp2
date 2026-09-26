@@ -2,6 +2,7 @@
 // arrays skipped), and the tensor table; resolves tensor data pointers.
 
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/tp_layout.hpp"
 
 #include <cstdio>
 #include <algorithm>
@@ -322,6 +323,117 @@ std::vector<std::pair<std::string, std::string>> GGUF::meta_all() const {
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// Loader bridge (declared in tp_layout.hpp): a two-way cross-check of the
+// process TP table against an opened GGUF file -- every table name vs the
+// file, then every file name vs the table -- plus, for the Qwen3.8-27B NVFP4
+// family (cfg.qwen38), a byte-level audit of the class-aware on-disk model
+// against the file's measured tensor sizes, both full per name and summed per
+// rank (the per-card budget). Pure diagnostics: it never throws or fails the
+// load, it just prints what it found.
+void tp::log_gguf_tp_inventory(const GGUF& g, std::ostream& out) {
+    const Table& t = get_process_table();
+    if (!t.set()) {
+        out << "[tp] gguf inventory cross-check: table unset (tp=1) -- every name "
+                "resolves whole on device 0, nothing to check\n";
+        return;
+    }
+    const size_t n_ranks = (size_t)t.n_ranks();
+    const auto& file = g.tensors();
+    out << "[tp] gguf inventory cross-check: table entries=" << t.entries().size()
+        << ", file tensors=" << file.size() << ", ranks=" << n_ranks
+        << ", conv=" << (t.conv() == Conv::Hf ? "Hf" : (t.conv() == Conv::Flat ? "Flat" : "Gguf"))
+        << "\n";
+
+    // Pass A: table -> file. Names the table expects but the file lacks.
+    size_t found = 0, missing = 0, byte_mismatch = 0;
+    size_t file_bytes_known = 0;
+    std::vector<std::string> missing_names;
+    std::vector<std::string> mismatch_names;
+    for (const auto& e : t.entries()) {
+        const GGUFTensor* ft = g.tensor(e.first);
+        if (!ft) {
+            ++missing;
+            if (missing_names.size() < 12) missing_names.push_back(e.first);
+            continue;
+        }
+        ++found;
+        file_bytes_known += (size_t)ft->n_bytes;
+        if (t.cfg().qwen38 && (size_t)ft->n_bytes != t.on_disk_bytes(e.first)) {
+            ++byte_mismatch;
+            if (mismatch_names.size() < 12) mismatch_names.push_back(e.first);
+        }
+    }
+    out << "  table -> file: " << found << " found, " << missing << " missing";
+    if (missing) {
+        out << " (first " << missing_names.size() << " of " << missing << "):";
+        for (const auto& n : missing_names) out << "\n    " << n;
+        if ((size_t)missing > missing_names.size()) out << " ...";
+        out << "\n";
+    } else {
+        out << "\n";
+    }
+
+    // Pass B: file -> table. Names the file has but the table does not: the
+    // f32 norms / NVFP4 scale companions (not modeled tensors), the whole
+    // visual tower, shard-header bytes, and MTP-era tensors on old revisions.
+    size_t unknown = 0;
+    size_t unknown_bytes = 0;
+    std::vector<std::string> unknown_names;
+    for (const auto& kv : file) {
+        if (t.known(kv.first)) continue;
+        ++unknown;
+        unknown_bytes += (size_t)kv.second.n_bytes;
+        if (unknown_names.size() < 12) unknown_names.push_back(kv.first);
+    }
+    std::sort(unknown_names.begin(), unknown_names.end());
+    out << "  file -> table: " << unknown << " unknown names ("
+        << unknown_bytes / (1024.0 * 1024.0) << " MiB)";
+    for (size_t i = 0; i < unknown_names.size(); ++i) {
+        const std::string& n = unknown_names[i];
+        const Placement p = t.placement(n, 0);
+        out << "\n    " << n << "  ->  "
+            << (p.device < 0 ? std::string("replicated (every rank)")
+                             : ("rank " + std::to_string(p.device) + ", whole"));
+    }
+    if ((size_t)unknown > unknown_names.size()) out << "  ... (" << unknown - unknown_names.size() << " more)";
+    out << "\n";
+
+    // Byte audit, 27B NVFP4 family only: other quantizations (q4_k GGUF, ...)
+    // do not follow the class model, so their file bytes are not comparable.
+    if (t.cfg().qwen38) {
+        out << "  byte audit (nvfp4 class model): table total on disk = "
+            << t.total_on_disk_bytes() << " B; known-name file bytes = " << file_bytes_known << " B\n";
+        out << "    per rank, model:    ";
+        for (size_t r = 0; r < n_ranks; ++r) out << "rank" << r << "=" << t.rank_on_disk_bytes((int)r) << " B  ";
+        out << "\n    per rank, file:      ";
+        for (size_t r = 0; r < n_ranks; ++r) {
+            size_t s = 0;
+            for (const auto& e : t.entries()) {
+                const GGUFTensor* ft = g.tensor(e.first);
+                if (!ft) continue;
+                const Placement p = t.placement(e.first, (int)r);
+                s += p.denom == 0 ? (size_t)ft->n_bytes
+                                  : tp::rank_on_disk_bytes(class_for(e.second), (size_t)ft->n_bytes,
+                                                            p.split_elements(), p.denom);
+            }
+            out << "rank" << r << "=" << s << " B  ";
+        }
+        out << "\n";
+        if (byte_mismatch) {
+            out << "    per-name mismatches (file != model), first of " << byte_mismatch << ":\n";
+            for (const auto& n : mismatch_names) {
+                const GGUFTensor* ft = g.tensor(n);
+                if (ft) out << "      " << n << ": file=" << ft->n_bytes
+                            << " B, model=" << t.on_disk_bytes(n) << " B\n";
+            }
+        } else {
+            out << "    per-name check: all " << found << " known tensors match the model exactly\n";
+        }
+    } else {
+        out << "  byte audit: skipped (cfg.qwen38 false -- non-NVFP4 family, file bytes not modeled)\n";
+    }
 }
 
 } // namespace sparkinfer
