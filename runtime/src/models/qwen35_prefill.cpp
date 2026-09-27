@@ -16,6 +16,7 @@
 #include "sparkinfer/ternary_ptq1.h"
 #include "sparkinfer/kernels/hadamard.h"
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/kernels/prefill_gdn_chunk.h"
 #include "sparkinfer/kernels/vision.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/fused.h"
@@ -93,6 +94,19 @@ inline void gdn_extract(const Qwen35PrefillCtx& s, int slot, float* arena) {
         arena + (size_t)slot * n,
         s.gdn_scratch + (size_t)slot * s.cfg.linear_v_heads * HD * HD, n * sizeof(float),
         cudaMemcpyDeviceToDevice, s.stream);
+}
+// One-time note for a windowed instance that must stage through the full-layout scratch. The
+// dflash compact-scan and commit kernels have NO windowed form in this dispatch (the only
+// windowed GDN prefill kernel is the chunked scan, which runs direct against the arena), so
+// their inject/extract round-trips stay; the P3 chunked path lands here only when it declines
+// (short segment, env off, smem opt-in refused, workspace OOM) and then the sequential
+// fallback -- which is also full-v only -- is the one that needs the staging.
+void gdn_scratch_fallback_note(const char* which) {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    fprintf(stderr, "[gdn] windowed instance: %s has no windowed kernel; that slot stages "
+                    "through the full-layout gdn_scratch around it\n", which);
 }
 // A model the packed path cannot drive declines on EVERY step, forever -- a ternary Bonsai-2
 // server at concurrency 4 wrote two of these lines per decode token. Each decline site still
@@ -2148,6 +2162,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             gdn_qkv_z(xn, w, attn_norm_deferred);                    // qkv + z gate (fp8: fused)
             proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
             proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+            // Dual-GPU CHG-0011 (H): this rank's GDN v window, G's idiom. v_count == 0 (tp=1 /
+            // unsplit) makes the windowed calls below degenerate to v0 = 0, vloc = full v count.
+            const int gdn_v0 = s.gdn_window.v_count > 0 ? s.gdn_window.v_start : 0;
             if (multi) {
                 // Each prompt's conv window and recurrence are its own: run both on its slice of the
                 // rows against its session's state -- the same two calls a lone prompt of that
@@ -2165,18 +2182,33 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at,
                         gq + o * lq, gk + o * lq, gv + o * lvdim, len, c.linear_q_heads, vh,
                         c.linear_head_dim, c.linear_conv_kernel, eps, st, nullptr);
-                    // A windowed arena has no prefill-scan kernel in the windowed layout, so the
-                    // segment's slot is staged through the full-layout scratch around the scan.
-                    if (gdn_scr) gdn_inject(s, gdn_state_slot(c, L), s.multi_lin_state[i]);
-                    kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
-                        la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
-                        gdn_scr
-                            ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
-                                  c.linear_head_dim
-                            : s.multi_lin_state[i] + state_at,
-                        att + o * lvdim, len, c.linear_q_heads,
-                        vh, c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/false);
-                    if (gdn_scr) gdn_extract(s, gdn_state_slot(c, L), s.multi_lin_state[i]);
+                    // Windowed instances run the chunked scan DIRECTLY against the slot's
+                    // windowed arena (local v-head grid, global activation indices, local state);
+                    // unsplit instances never pre-attempt and take the dispatcher as-is. Only
+                    // when the chunked path declines (short segment, env off, smem opt-in
+                    // refused, workspace OOM) does a windowed slot fall back to the full-layout
+                    // scratch staging around the sequential scan.
+                    if (!gdn_scr ||
+                        !kernels::launch_prefill_gdn_chunk(
+                            gq + o * lq, gk + o * lq, gv + o * lvdim, la + o * vh,
+                            lb + o * vh, w.ssm_dt, w.ssm_a,
+                            s.multi_lin_state[i] + state_at, att + o * lvdim,
+                            len, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block,
+                            st, /*carry_in=*/false, gdn_v0, gdn_vloc(s))) {
+                        if (gdn_scr) {
+                            gdn_scratch_fallback_note("prefill multi-scan (chunked path declined)");
+                            gdn_inject(s, gdn_state_slot(c, L), s.multi_lin_state[i]);
+                        }
+                        kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
+                            la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
+                            gdn_scr
+                                ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
+                                      c.linear_head_dim
+                                : s.multi_lin_state[i] + state_at,
+                            att + o * lvdim, len, c.linear_q_heads,
+                            vh, c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/false);
+                        if (gdn_scr) gdn_extract(s, gdn_state_slot(c, L), s.multi_lin_state[i]);
+                    }
                 }
             } else {
                 bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
@@ -2190,18 +2222,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     (size_t)gdn_state_slot(c, L) * gdn_vloc(s) * c.linear_head_dim * c.linear_head_dim;
                 // A pass that does not start at position 0 continues the recurrence already in `state`
                 // (the state reset above runs only for pos0 == 0); the scan must load it, not zero it.
-                // A windowed arena has no full-layout scan kernel to run on it, so the slot is staged
-                // through the model's full-layout scratch (injected before, extracted after); an
-                // unsplit model takes exactly today's path (gdn_scr false, layer_state as before).
-                if (gdn_via_scratch(s)) gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
-                kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
-                    gdn_via_scratch(s)
-                        ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
-                              c.linear_head_dim
-                        : layer_state,
-                    att, N, c.linear_q_heads, vh, c.linear_head_dim,
-                    c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
-                if (gdn_via_scratch(s)) gdn_extract(s, gdn_state_slot(c, L), s.lin_state);
+                // Windowed instances run the chunked scan directly on the slot's windowed arena;
+                // unsplit instances never pre-attempt and take today's dispatcher call as-is. Only a
+                // windowed slot whose chunked path declines falls back to the full-layout scratch
+                // staging (inject, scan, extract).
+                const bool gdn_scr = gdn_via_scratch(s);
+                if (!gdn_scr ||
+                    !kernels::launch_prefill_gdn_chunk(
+                        gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
+                        layer_state, att,
+                        N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block,
+                        st, /*carry_in=*/pos0 != 0, gdn_v0, gdn_vloc(s))) {
+                    if (gdn_scr) {
+                        gdn_scratch_fallback_note("prefill single-scan (chunked path declined)");
+                        gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
+                    }
+                    kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
+                        gdn_scr
+                            ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
+                                  c.linear_head_dim
+                            : layer_state,
+                        att, N, c.linear_q_heads, vh, c.linear_head_dim,
+                        c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
+                    if (gdn_scr) gdn_extract(s, gdn_state_slot(c, L), s.lin_state);
+                }
             }
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
             // out_proj off the same NVFP4 bytes, with the residual folded into the block-scaled
@@ -5254,10 +5298,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;
             kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
-            // The compact scan has no windowed kernel: a windowed model stages the slot through
-            // the full-layout scratch (inject, scan, extract); an unsplit model reads the arena
-            // exactly as before.
-            if (gdn_via_scratch(s)) gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
+            // The compact scan has no windowed kernel: its kernels live in the dflash TUs, which
+            // this dispatch leaves read-only (the only windowed GDN prefill kernel here is the
+            // chunked scan, which P3 runs direct). A windowed model therefore stages the slot
+            // through the full-layout scratch (inject, scan, extract); an unsplit model reads the
+            // arena exactly as before. One per-run note explains the round-trip (see the helper).
+            if (gdn_via_scratch(s)) {
+                gdn_scratch_fallback_note("dflash compact-scan");
+                gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
+            }
             const float* state = gdn_via_scratch(s)
                 ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
                       c.linear_head_dim
@@ -6149,8 +6198,10 @@ verify_forward_done:
         // all). The stride then stays v_full*HD^2 in both the scratch case and the unsplit case
         // (where gdn_vloc == vh and the arena itself is the base, as before).
         const bool gdn_scr = gdn_via_scratch(s);
-        if (gdn_scr)
+        if (gdn_scr) {
+            gdn_scratch_fallback_note("dflash batched commit");
             for (int j = 0; j < gdn_state_slots(c); ++j) gdn_inject(s, j, s.lin_state);
+        }
         dflash_kernels::launch_gdn_scan_commit_layers(
             rec_k, (size_t)N * s.linear_qdim, rec_v, (size_t)N * lvdim,
             rec_a, (size_t)N * vh, rec_b, d_gdn_w,
@@ -6169,7 +6220,10 @@ verify_forward_done:
             bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
                 (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
             const bool gdn_scr = gdn_via_scratch(s);
-            if (gdn_scr) gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
+            if (gdn_scr) {
+                gdn_scratch_fallback_note("dflash per-layer commit");
+                gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
+            }
             float* state =
                 gdn_scr
                     ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *

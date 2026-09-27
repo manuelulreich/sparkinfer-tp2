@@ -155,6 +155,14 @@ struct ModelEngine::Impl {
     std::unique_ptr<sparkinfer::KVCacheManager> kv;
     std::unique_ptr<sparkinfer::moe::MoEEngine> engine;
     std::unique_ptr<sparkinfer::Qwen35Model> model;
+    // Dual-GPU Wave 3 (per-device weight split): at tp>1, rank 0 is `model`/`kv` above (the
+    // batch engine's serving instance, pool 0); these hold ranks 1..R-1, each a full
+    // Qwen35Model on its own card holding that rank's slice of the weights + its own KV pool.
+    // They are load-complete but their forward is numerically incomplete until WP-9/10 (the
+    // per-layer all-reduce) -- see the warning printed in load(). `tp_kvs` is declared before
+    // `tp_models` so the models (which hold pointers into the pools) are destroyed first.
+    std::vector<std::unique_ptr<sparkinfer::KVCacheManager>> tp_kvs;
+    std::vector<std::unique_ptr<sparkinfer::Qwen35Model>> tp_models;
     // Owned here, attached to model by pointer; declared before batch_engine so the engine, which
     // drives it, is destroyed first.
     std::unique_ptr<sparkinfer::DFlashDraftModel> draft;
@@ -507,8 +515,18 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     mc.num_layers = impl_->cfg.n_layers;
     impl_->engine = sparkinfer::moe::MoEEngine::create(mc);
 
-    impl_->model = std::make_unique<sparkinfer::Qwen35Model>(
-        impl_->cfg, impl_->kv.get(), impl_->engine.get());
+    // Wave 3 (per-device weight split): rank 0's instance binds to eff[0] and owns rank 0's
+    // GDN v-head window (the leading block, heads [0, v/R)). At the tp=1 default eff == {0} and
+    // the window is the degenerate all-heads one, so this is byte-identical to the unsplit model.
+    {
+        const int R0 = (int)eff.size();
+        const int vfull = impl_->cfg.linear_v_heads;
+        sparkinfer::GdnStateWindow win0;
+        if (plan.tp > 1 && vfull > 0)
+            win0 = {0, vfull / R0};   // rank 0 = [0, vfull/R0)
+        impl_->model = std::make_unique<sparkinfer::Qwen35Model>(
+            impl_->cfg, impl_->kv.get(), impl_->engine.get(), win0, 0, eff[0]);
+    }
 
     if (kind == LoadKind::Gguf) {
         fprintf(stderr, "[sparkinfer-server] loading GGUF ...\n");
@@ -531,6 +549,70 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
                         "supported directly -- convert with runtime/tools/convert_qwen35.py first "
                         "and pass the .bin output directory instead\n", gguf_path.c_str());
         return false;
+    }
+
+    // (dual-GPU D5) Per-card budget audit for the rank-0 instance now that its load succeeded:
+    // the table's on-disk bytes for this rank, this card's free/total, and the per-card estimate
+    // at 128k context vs a 16 GiB card (fits). The tp=1 default (degenerate table) never prints.
+    if (plan.tp > 1)
+        impl_->model->print_tp_audit(131072);
+
+    // Wave 3 (per-device weight split): build ranks 1..R-1, each on its own card with its own KV
+    // pool (sized from the rank's contiguous head window, last rank the remainder) and its own GDN
+    // v-head window, each loading its own slice of the weights from the same checkpoint. The batch
+    // engine above keeps instance 0 / pool 0 as the serving path; these extra instances are
+    // load-complete but their forward is numerically incomplete until the WP-9/10 per-layer
+    // all-reduce (Wave 4 I). tp=1 (or a single effective device) never enters this block.
+    if (plan.tp > 1 && eff.size() > 1) {
+        const int R = (int)eff.size();
+        const int nkv = impl_->cfg.n_kv_heads;
+        const int vfull = impl_->cfg.linear_v_heads;
+        for (int r = 1; r < R; ++r) {
+            // One-time bind of this rank to its card before anything it allocates runs.
+            if (cudaSetDevice(eff[r]) != cudaSuccess) {
+                fprintf(stderr, "[sparkinfer-server] tp rank%d: cudaSetDevice(%d) failed\n",
+                        r, eff[r]);
+                return false;
+            }
+            // This rank's KV head window (contiguous; last rank takes the remainder).
+            const int kv_start = nkv > 0 ? nkv * r / R : 0;
+            int kv_count = nkv > 0 ? nkv * (r + 1) / R - kv_start : 0;
+            kv_count = std::max(1, kv_count);
+            sparkinfer::KVCacheConfig kc = kvc;   // layers/slots/int8 identical to rank 0
+            kc.kv_head_start = kv_start;
+            kc.kv_head_count = kv_count;
+            const size_t epb_r = (size_t)16 * (size_t)kv_count * (size_t)impl_->cfg.head_dim;
+            const size_t blocks_r = (size_t)impl_->cfg.max_seq / 16 + 8;
+            impl_->tp_kvs.emplace_back(std::make_unique<sparkinfer::KVCacheManager>(
+                kc, (size_t)kvL * 2 * epb_r * 2 * blocks_r));
+            // This rank's GDN v-head state window: [vfull*r/R, vfull*(r+1)/R).
+            sparkinfer::GdnStateWindow win;
+            win.v_start = vfull > 0 ? vfull * r / R : 0;
+            win.v_count = vfull > 0 ? vfull * (r + 1) / R - win.v_start : 0;
+            auto mr = std::make_unique<sparkinfer::Qwen35Model>(
+                impl_->cfg, impl_->tp_kvs.back().get(), impl_->engine.get(), win, r, eff[r]);
+            const bool ok =
+                (kind == LoadKind::Gguf) ? mr->load_gguf(gguf_path)
+                : (kind == LoadKind::CompressedTensors) ? mr->load_compressed_tensors(gguf_path)
+                                                        : false;
+            if (!ok) {
+                fprintf(stderr, "[sparkinfer-server] tp rank%d weight load failed\n", r);
+                return false;
+            }
+            impl_->tp_models.emplace_back(std::move(mr));
+            fprintf(stderr, "[sparkinfer-server] tp rank%d (dev %d): KV heads [%d,%d), GDN v [%d,%d) loaded\n",
+                    r, eff[r], kv_start, kv_start + kv_count, win.v_start,
+                    win.v_start + win.v_count);
+            // (dual-GPU D5) This rank's per-card budget-audit line (same 128k-context estimate).
+            impl_->tp_models.back()->print_tp_audit(131072);
+        }
+        // Restore the default device so any post-load host-side work (lmcache, vision) runs as
+        // before; the per-instance binds already happened in each ctor.
+        cudaSetDevice(eff[0]);
+        fprintf(stderr,
+                "[sparkinfer-server] tp>1: %d of %d instances loaded; split-weight forward is "
+                "incomplete until WP-9/10 (Wave 4 I)\n",
+                (int)impl_->tp_models.size() + 1, R);
     }
 
     if (lmcache_enabled()) {

@@ -242,6 +242,15 @@ inline GdnStateWindow gdn_window_normalize(const Qwen35Config& cfg, const GdnSta
     return w;
 }
 
+// (dual-GPU D5) Formats one line of the per-card budget audit for one rank of a tp>1 load.
+// est = on_disk_bytes + 33,024 * ctx (G2 per-token int8 KV: (2,048 data + 16 scale) x 16
+// full-attn layers) + 154,927,104 (G2 GDN per-sequence state); the verdict is against a
+// 16 GiB card (17,179,869,184 B). Free (no CUDA dependency) so the CPU tests can check the
+// exact line text; print_tp_audit feeds it the per-instance numbers.
+std::string tp_audit_line(int rank, int device, unsigned long long on_disk_bytes,
+                           unsigned long long card_free_bytes, unsigned long long card_total_bytes,
+                           int ctx);
+
 // Single-sequence (batch=1) greedy decoder for the Qwen family -- routed-MoE (Qwen3.6) and
 // dense-FFN (Qwen3.8, Qwen3.5) alike, plus Muse Glimmer. Owns scratch buffers and
 // drives embed -> N layers -> final norm -> LM head -> argmax per token.
@@ -250,9 +259,26 @@ public:
     // gdn_window: which slice of the GDN v-head recurrent state this model instance owns
     // (dual-GPU state split). Default (0,0) = all heads = the unsplit, byte-identical tp=1
     // behavior; see GdnStateWindow and gdn_window_normalize for the validity rules.
+    //
+    // rank/device (dual-GPU Wave 3, the per-device weight split): the rank indexes the process
+    // tp-table (tp::get_process_table) and device is the real CUDA id this instance is built
+    // on (the engine's eff[rank]). The ctor does a ONE-TIME cudaSetDevice(device) (and the dtor
+    // mirrors it before its frees) so every buffer this instance allocates and frees lives on its
+    // own card. Defaults (0,0) fire neither call, so the tp=1 default (rank 0 / device 0) is
+    // byte-identical to the unsplit single-device model.
     Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine,
-               GdnStateWindow gdn_window = {});
+               GdnStateWindow gdn_window = {}, int rank = 0, int device = 0);
     ~Qwen35Model();
+
+    // (dual-GPU D5) Prints this instance's rank one per-card budget-audit line: the process
+    // table's on-disk bytes for this rank, this card's free/total (a failed probe falls back
+    // to the nominal 16 GiB card, so the line stays printable headless), and the per-card
+    // estimate at ctx against a 16 GiB card. By design a no-op unless the process table is
+    // set with n_ranks > 1 -- the tp=1 default never prints.
+    void print_tp_audit(int ctx) const;
+    // The loaded weight set (pointers into this instance's owned device buffers). Exposed for
+    // the tp=1 byte-identity checksum in runtime/tests/tp_weights_cpu_test.cpp.
+    const Qwen35Weights& weights() const;
 
     void set_weights(const Qwen35Weights& w);
 

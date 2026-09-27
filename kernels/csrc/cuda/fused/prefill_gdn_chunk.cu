@@ -110,7 +110,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
                                     __nv_bfloat16* __restrict__ u_buf,
                                     float* __restrict__ m_buf,
                                     int n_tokens, int q_heads, int v_heads, bool qh_block,
-                                    bool warp_inv) {
+                                    bool warp_inv, int v0 = 0, int vloc = 0) {
     extern __shared__ char s_raw[];
     __nv_bfloat16* s_k = reinterpret_cast<__nv_bfloat16*>(s_raw);              // [C][HD+PAD]
     __nv_bfloat16* s_x = s_k + (size_t)C * (HD + PAD);                         // [C][HD+PAD] q then v
@@ -127,18 +127,26 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     const int len  = min(C, n_tokens - t0);
     if (len <= 0) return;
 
-    const int qh    = qh_block ? (h / (v_heads / q_heads)) : (h % q_heads);
+    // G's house windowing (dual-GPU CHG-0011): the grid covers this instance's vloc LOCAL
+    // v-heads; vloc == 0 is the unsplit degenerate case (vhl == v_heads, v0 == 0) and every
+    // index below is then today's, bit-identical. Local v-head h maps to the GLOBAL v-head
+    // vhg = h + v0 for every activation/workspace operand (q/k through their group qh,
+    // v/alpha/beta/dt/a directly); only the grid size and the vhg mapping change.
+    const int vhl = vloc > 0 ? vloc : v_heads;
+    if (h >= vhl) return;
+    const int vhg = h + v0;
+    const int qh    = qh_block ? (vhg / (v_heads / q_heads)) : (vhg % q_heads);
     const int q_dim = q_heads * HD;
     const int v_dim = v_heads * HD;
-    const float a_h  = gc_to_f(a[h]);
-    const float dt_h = gc_to_f(dt[h]);
+    const float a_h  = gc_to_f(a[vhg]);
+    const float dt_h = gc_to_f(dt[vhg]);
 
     // ---- gates: per-token log-gate and b, then an inclusive prefix sum over the chunk ----
     for (int i = tid; i < C; i += nthr) {
         if (i < len) {
-            const float al = gc_to_f(alpha[(size_t)(t0 + i) * v_heads + h]);
+            const float al = gc_to_f(alpha[(size_t)(t0 + i) * v_heads + vhg]);
             s_t[i] = gc_softplus(al + dt_h) * a_h;                       // log g_i  (<= 0)
-            s_b[i] = gc_sigmoid(gc_to_f(beta[(size_t)(t0 + i) * v_heads + h]));
+            s_b[i] = gc_sigmoid(gc_to_f(beta[(size_t)(t0 + i) * v_heads + vhg]));
         } else {
             s_t[i] = 0.f;                                                // tail: no decay, no update
             s_b[i] = 0.f;
@@ -150,7 +158,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         for (int i = 0; i < C; i++) { acc += s_t[i]; s_g[i] = acc; }
     }
     __syncthreads();
-    for (int i = tid; i < len; i += nthr) g_buf[(size_t)(t0 + i) * v_heads + h] = s_g[i];
+    for (int i = tid; i < len; i += nthr) g_buf[(size_t)(t0 + i) * v_heads + vhg] = s_g[i];
 
     // ---- stage K and Q ----
     for (int e = tid; e < C * HD; e += nthr) {
@@ -187,7 +195,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         wmma::store_matrix_sync(&sD[warp][0][0], cf, 16, wmma::mem_row_major);
         __syncthreads();
 
-        const size_t mbase = ((size_t)c * v_heads + h) * C * C;
+        const size_t mbase = ((size_t)c * v_heads + vhg) * C * C;
         for (int e = tid; e < C * C; e += nthr) {
             const int i = e / C, j = e - i * C;
             const int w = ((i >> 4) << 1) | (j >> 4);
@@ -300,7 +308,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         for (int si = 0; si < IPT; si++) {
             const int i = i0 + si * ISTR;
             if (i < len)
-                w_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
+                w_buf[((size_t)(t0 + i) * v_heads + vhg) * HD + d] = __float2bfloat16(acc[si]);
         }
     }
     __syncthreads();
@@ -308,7 +316,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     // ---- reuse the Q tile for V, then U0 = T . (b_m v_m) ----
     for (int e = tid; e < C * HD; e += nthr) {
         const int i = e / HD, d = e - i * HD;
-        s_x[i * (HD + PAD) + d] = (i < len) ? v[(size_t)(t0 + i) * v_dim + h * HD + d] : __float2bfloat16(0.f);
+        s_x[i * (HD + PAD) + d] = (i < len) ? v[(size_t)(t0 + i) * v_dim + vhg * HD + d] : __float2bfloat16(0.f);
     }
     __syncthreads();
     {
@@ -337,7 +345,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         for (int si = 0; si < IPT; si++) {
             const int i = i0 + si * ISTR;
             if (i < len)
-                u_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
+                u_buf[((size_t)(t0 + i) * v_heads + vhg) * HD + d] = __float2bfloat16(acc[si]);
         }
     }
 }
@@ -383,7 +391,7 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                     float* __restrict__ state,
                                     __nv_bfloat16* __restrict__ out,
                                     int n_tokens, int q_heads, int v_heads, int n_chunks,
-                                    bool qh_block, int carry) {
+                                    bool qh_block, int carry, int v0 = 0, int vloc = 0) {
     // ONE arena, with three regions reused at disjoint points of the chunk body. That reuse is
     // what keeps JC=64 -- the one-wave launch shape, see launch_prefill_gdn_chunk -- inside the
     // 100 KB an SM has; laid out naively it needs 133 KB and cannot be launched at all.
@@ -425,7 +433,16 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     const int tid  = threadIdx.x;
     const int nthr = blockDim.x;
 
-    const int qh    = qh_block ? (h / (v_heads / q_heads)) : (h % q_heads);
+    // G's house windowing (dual-GPU CHG-0011): h is this instance's LOCAL v-head, vhg = h + v0
+    // the global one. Every activation-side operand (q/k through their group qh, the workspace
+    // rows, out) is addressed by vhg; the recurrent state is addressed by LOCAL h, because
+    // each slot's arena is DENSE [vloc][HD][HD] — a +v0*HD^2 term would land in the next
+    // slot's block and go OOB (G's WP-8 note-2 correction). vloc == 0 (unsplit): vhg == h,
+    // vhl == v_heads, and this is today's exact kernel.
+    const int vhl = vloc > 0 ? vloc : v_heads;
+    if (h >= vhl) return;
+    const int vhg = h + v0;
+    const int qh    = qh_block ? (vhg / (v_heads / q_heads)) : (vhg % q_heads);
     const int q_dim = q_heads * HD;
     const int v_dim = v_heads * HD;
     const float scale = rsqrtf((float)HD);
@@ -463,7 +480,7 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             const int i = e8 / (HD / 8), d = (e8 % (HD / 8)) * 8;
             if (i < lens) {
                 __pipeline_memcpy_async(s_W + i * (HD + PAD) + d,
-                                        w_buf + ((size_t)(t0s + i) * v_heads + h) * HD + d, 16);
+                                        w_buf + ((size_t)(t0s + i) * v_heads + vhg) * HD + d, 16);
                 __pipeline_memcpy_async(s_K + i * (HD + PAD) + d,
                                         k + (size_t)(t0s + i) * q_dim + qh * HD + d, 16);
                 __pipeline_memcpy_async(s_Q + i * (HD + PAD) + d,
@@ -480,7 +497,7 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
 
         // ---- stage the small linear tiles; W/K/Q arrive via the early-issued cp.async ----
         for (int i = tid; i < C; i += nthr)
-            s_g[i] = (i < len) ? g_buf[(size_t)(t0 + i) * v_heads + h] : 0.f;
+            s_g[i] = (i < len) ? g_buf[(size_t)(t0 + i) * v_heads + vhg] : 0.f;
         // Every per-element loop in this chunk body moves FOUR values at a time. At C=JC=32 each
         // of them is exactly C*JC == 1024 elements over 256 threads, so scalar they are 4 trips of
         // 2-3 memory instructions each; the body is bound by how many load/store instructions it
@@ -495,7 +512,7 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         for (int q4 = tid; q4 < J4; q4 += nthr) {
             const int e = q4 * 4, i = e / JC, jj = e - i * JC;
             if (i < len) {
-                const __nv_bfloat16* up = u_buf + ((size_t)(t0 + i) * v_heads + h) * HD + j0 + jj;
+                const __nv_bfloat16* up = u_buf + ((size_t)(t0 + i) * v_heads + vhg) * HD + j0 + jj;
                 const ushort4 u4 = *reinterpret_cast<const ushort4*>(up);
                 const __nv_bfloat16* ub = reinterpret_cast<const __nv_bfloat16*>(&u4);
                 *reinterpret_cast<float4*>(&s_U[e]) =
@@ -507,7 +524,7 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         for (int q4 = tid; q4 < (C * C) / 4; q4 += nthr) {
             const int e = q4 * 4, i = e / C, j = e - i * C;
             *reinterpret_cast<float4*>(&s_M[i * (C + PAD) + j]) =
-                *reinterpret_cast<const float4*>(m_buf + (size_t)e + ((size_t)c * v_heads + h) * C * C);
+                *reinterpret_cast<const float4*>(m_buf + (size_t)e + ((size_t)c * v_heads + vhg) * C * C);
         }
         __pipeline_wait_prior(0);
         if (len < C) {
@@ -637,7 +654,7 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                 const int i = i0 + si * ISTR2;
                 if (t0 + i >= n_tokens) continue;
                 const float y = (s_eg[i] * s_Y[i * JC + jj] + mu[si]) * scale;
-                out[(size_t)(t0 + i) * v_dim + h * HD + j0 + jj] = __float2bfloat16(y);
+                out[(size_t)(t0 + i) * v_dim + vhg * HD + j0 + jj] = __float2bfloat16(y);
             }
             // The epilogue stays scalar on purpose: jj is the thread's own column, so its OPT
             // outputs are ISTR2 rows apart rather than adjacent and there is nothing to widen.
@@ -831,7 +848,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream,
-                              bool carry_in) {
+                              bool carry_in, int v0, int vloc) {
     constexpr int C = 32, HD = 128, PREP_THREADS = 256;
     // State columns per scan block. JC_S is the shape every context used before; JC_B halves the
     // grid — see use_big below for why that is the whole point at long context.
@@ -958,28 +975,32 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         float* m_buf = reinterpret_cast<float*>(base + off_m);
         auto* w_buf = reinterpret_cast<__nv_bfloat16*>(base + off_w);
         auto* u_buf = reinterpret_cast<__nv_bfloat16*>(base + off_u);
-        dim3 gprep(n_chunks, v_heads);
+        // Windowed (dual-GPU CHG-0011): the grid covers the instance's vloc local v-heads;
+        // the kernels map each to the global vhg = h + v0 for activations/out. All the
+        // workspace rows stay full-width (n_* above), so only the grid and vhg change.
+        const int vhl = vloc > 0 ? vloc : v_heads;
+        dim3 gprep(n_chunks, vhl);
         pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
             qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
-            len, q_heads, v_heads, qh_block, prep_warp_inv);
+            len, q_heads, v_heads, qh_block, prep_warp_inv, v0, vloc);
         if (use_regs) {
             pf_gdnc_scan_kernel<C, HD, JC_S, true>
-                <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,
+                <<<dim3(vhl, HD / JC_S), (C * JC_S) / 4,
                    gdnc_scan_smem<C, HD, JC_S, true>(), stream>>>(
                     qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
-                    len, q_heads, v_heads, n_chunks, qh_block, carry);
+                    len, q_heads, v_heads, n_chunks, qh_block, carry, v0, vloc);
         } else if (use_big) {
             pf_gdnc_scan_kernel<C, HD, JC_B>
-                <<<dim3(v_heads, HD / JC_B), (C * JC_B) / 4,
+                <<<dim3(vhl, HD / JC_B), (C * JC_B) / 4,
                    gdnc_scan_smem<C, HD, JC_B>(), stream>>>(
                     qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
-                    len, q_heads, v_heads, n_chunks, qh_block, carry);
+                    len, q_heads, v_heads, n_chunks, qh_block, carry, v0, vloc);
         } else {
             pf_gdnc_scan_kernel<C, HD, JC_S>
-                <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,
+                <<<dim3(vhl, HD / JC_S), (C * JC_S) / 4,
                    gdnc_scan_smem<C, HD, JC_S>(), stream>>>(
                     qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
-                    len, q_heads, v_heads, n_chunks, qh_block, carry);
+                    len, q_heads, v_heads, n_chunks, qh_block, carry, v0, vloc);
         }
         return cudaPeekAtLastError() == cudaSuccess;
     };

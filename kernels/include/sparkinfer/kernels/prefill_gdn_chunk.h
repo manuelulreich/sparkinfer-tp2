@@ -41,13 +41,16 @@ namespace kernels {
 //   SPARKINFER_PREFILL_GDN_CHUNK_MINCTX  (default 128) only chunk at n_tokens >= this.
 // qh_block: v-head -> q/k-head broadcast convention; see launch_qwen36_gdn_ar's own comment
 // (fused.h). Must match whatever the decode-path GDN kernel uses for the same checkpoint.
+// v0/vloc (dual-GPU CHG-0011, G's house pattern): the grid covers the caller's vloc LOCAL
+// v-heads and each maps to the global activation head vhg = h + v0 (state-arena indexing
+// stays local). vloc == 0 (unsplit) degenerates to the historical full-v grid, bit-identical.
 bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               const void* alpha, const void* beta,
                               const void* dt, const void* a,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream = nullptr,
-                              bool carry_in = false);
+                              bool carry_in = false, int v0 = 0, int vloc = 0);
 
 }  // namespace kernels
 }  // namespace sparkinfer

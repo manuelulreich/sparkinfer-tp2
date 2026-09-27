@@ -21,6 +21,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
+#include <map>
 
 #include <mutex>
 #include <thread>
@@ -50,6 +51,7 @@
 #include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/lmcache_bridge_client.h"
 #include "sparkinfer/lmcache_staging.h"
+#include "sparkinfer/tp_layout.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -59,6 +61,7 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 #include <chrono>
 #include <vector>
 #include <string>
@@ -518,6 +521,11 @@ struct Qwen35Model::Impl {
     Qwen35Config cfg;
     KVCacheManager* kv;
     moe::MoEEngine* engine;
+    // Dual-GPU Wave 3: which tp-table rank owns this instance's weights and which CUDA device
+    // it is built on. (0,0) is the unsplit tp=1 default: the ctor never calls cudaSetDevice,
+    // so every allocation and free is byte-identical to the historical single-device path.
+    int rank = 0;
+    int device = 0;
     Qwen35Weights w;
     cudaStream_t stream{};
     cudaStream_t stream_k{}, stream_v{};         // side streams for concurrent K/V projection
@@ -877,9 +885,15 @@ struct Qwen35Model::Impl {
 };
 
 Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine,
-                         GdnStateWindow gdn_window)
+                         GdnStateWindow gdn_window, int rank, int device)
     : p_(new Impl()) {
     p_->cfg = cfg; p_->kv = kv; p_->engine = engine;
+    p_->rank = rank; p_->device = device;
+    // One-time device bind (dual-GPU Wave 3): a split instance is built on its own card, and
+    // every allocation and launch below (and the dtor's frees) then run on that card. (0,0) --
+    // the unsplit tp=1 default -- fires nothing, so that path stays byte-identical to today.
+    if (rank != 0 || device != 0)
+        cu(cudaSetDevice(device), "ctor setDevice");
     // Normalize this instance's GDN v-head state window (dual-GPU state split). A degenerate
     // request (or tp=1) stays degenerate: every allocation below then sizes the full state,
     // byte-identical to the unsplit model.
@@ -1185,6 +1199,11 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
 }
 
 Qwen35Model::~Qwen35Model() {
+    // Mirror the ctor's one-time bind: cudaFree is device-bound, so a split instance must free
+    // on the card it allocated from -- a cross-device free is the classic silent-corruption trap.
+    // The (0,0) default fires nothing (tp=1 invariance).
+    if (p_->rank != 0 || p_->device != 0)
+        cu(cudaSetDevice(p_->device), "dtor setDevice");
     for (void* b : p_->bonsai_dec_bufs) cudaFree(b);
     if (p_->lm_head_fp4_payload) cudaFree(p_->lm_head_fp4_payload);
     if (p_->lm_head_fp4_sf_buf) cudaFree(p_->lm_head_fp4_sf_buf);
@@ -6014,15 +6033,276 @@ void* load_bin(const std::string& path, std::vector<void*>& owned) {
     owned.push_back(d);
     return d;
 }
+
+// ---------------------------------------------------------------------------
+// Per-device weight allocation (dual-GPU Wave 3, CHG-0011). The process-wide
+// tensor-parallel placement table (tp_layout.hpp) is the SINGLE source of
+// truth for which rank owns which slice of each named tensor (D2). ModelEngine::
+// load builds and publishes it before any loader runs; at the tp=1 default it
+// is the degenerate table (every name whole on device 0), so the Whole branch
+// below is byte-identical to the unsplit loaders (the tp=1 invariance). Each of
+// the three loaders (load_weights / load_gguf / load_compressed_tensors) calls
+// tp_decide() before a read and branches:
+//   Skip  -> nullptr, no alloc, no read (another rank owns the name);
+//   Whole -> the loader's existing read path, untouched (tp=1 + replicated);
+//   Slice -> a reduced on-disk allocation + a byte-range read of the owned
+//            sub-blocks (tpl_read2d).
+// ---------------------------------------------------------------------------
+enum class TpDec { Skip, Whole, Slice };
+
+struct TpSlice {
+    tp::Axis axis = tp::Axis::None;
+    size_t denom = 0;
+    std::vector<tp::Range> ranges;
+};
+
+// The table (never a re-derived ratio): see the block comment above.
+inline TpDec tp_decide(const std::string& name, int rank, TpSlice* out) {
+    const tp::Table& t = tp::get_process_table();
+    if (!t.set() || t.n_ranks() <= 1) return TpDec::Whole;   // tp=1 invariance
+    const tp::Placement p = t.placement(name, rank);
+    if (p.device < 0) return TpDec::Whole;                    // replicated (device -1)
+    if (p.device != rank) return TpDec::Skip;                // another rank owns it
+    if (p.axis == tp::Axis::None) return TpDec::Whole;       // whole on this rank
+    if (out) {
+        out->axis = p.axis;
+        out->denom = p.denom;
+        out->ranges = p.ranges;
+    }
+    return TpDec::Slice;
+}
+
+// The pure data movement: copies the elements this rank owns out of a FULL
+// 2-D (or 1-D) tensor held in a host buffer into a contiguous buffer in the
+// SAME physical layout as the source (the existing kernels read it unchanged),
+// sized to the owned elements only -- the result's byte count equals the
+// table's rank_on_disk_bytes for the tensor (the CPU test asserts the two
+// agree).
+//
+//   d0/d1     the two logical dims in the table's orientation (d0 = Axis::Rows,
+//             d1 = Axis::Cols); pass d1 = 1 for a 1-D tensor.
+//   eb        bytes per element (bf16 = 2, f32 = 4; NVFP4 callers pass the
+//             packed/scale streams as [rows, units] u8 matrices -- see the
+//             compressed-tensors call sites).
+//   rows_fast true  = the d0 axis is the in-memory-fast one (GGUF / flat, ggml
+//             [in,out]); false = the d1 axis is fast (HF row-major [out,in]).
+//   axis      the logical axis the split is on (Rows = d0, Cols = d1, OneD = the
+//             single dim of a 1-D tensor).
+//   ranges    the owned half-open element intervals along `axis` (one for a
+//             plain split; up to three for the GDN qkv / conv1d channel axis,
+//             which always lands on the SLOW axis below).
+//   xform     optional per-bf16-element transform applied to the gathered
+//             staging (the A_log / norm+1 paths), only when eb == 2.
+//
+// A split on the SLOW axis copies contiguous byte block(s); a split on the
+// FAST axis copies one sub-block per value of the (full) slow axis. Either way
+// the result tiles the source exactly as a valid smaller matrix in the source's
+// own layout.
+void tpl_gather2d(const char* src, long d0, long d1, int eb, bool rows_fast,
+                 tp::Axis axis, const std::vector<tp::Range>& ranges,
+                 const std::function<void(uint16_t*)>* xform,
+                 std::vector<char>& out) {
+    long fast_ext, slow_ext;
+    bool slow_split;
+    if (axis == tp::Axis::OneD) {
+        // 1-D tensor: the single dim is the element axis. The ranges are element
+        // intervals, so each "row" holds one element (fast_ext = 1) and the ranges
+        // index element positions directly (slow-split: contiguous block(s)).
+        fast_ext = 1; slow_ext = d0; slow_split = true;
+    } else if (rows_fast) {
+        fast_ext = d0; slow_ext = d1;
+        slow_split = (axis == tp::Axis::Cols);
+    } else {
+        fast_ext = d1; slow_ext = d0;
+        slow_split = (axis == tp::Axis::Rows);
+    }
+    if (slow_split) {
+        long owned_slow = 0;
+        for (const tp::Range& r : ranges) owned_slow += (long)r.len;
+        if (owned_slow <= 0) { out.clear(); return; }
+        out.assign((size_t)fast_ext * (size_t)owned_slow * (size_t)eb, 0);
+        size_t off = 0;
+        for (const tp::Range& r : ranges) {
+            const size_t block = (size_t)fast_ext * r.len * (size_t)eb;
+            const char* s = src + (size_t)r.begin * (size_t)fast_ext * (size_t)eb;
+            memcpy(out.data() + off, s, block);
+            off += block;
+        }
+    } else {
+        if (ranges.size() != 1) {
+            fprintf(stderr, "[tp-weights] fast-axis split expects one range, got %zu\n",
+                    ranges.size());
+            out.clear();
+            return;
+        }
+        const size_t b = ranges[0].begin, len = ranges[0].len;
+        if (len <= 0) { out.clear(); return; }
+        const size_t rowb = len * (size_t)eb;
+        const size_t stride = (size_t)fast_ext * (size_t)eb;
+        out.assign((size_t)slow_ext * rowb, 0);
+        for (long s = 0; s < slow_ext; ++s) {
+            const char* src_b = src + (size_t)s * stride + b * (size_t)eb;
+            memcpy(out.data() + (size_t)s * rowb, src_b, rowb);
+        }
+    }
+    if (xform && eb == 2) {
+        uint16_t* e = reinterpret_cast<uint16_t*>(out.data());
+        for (size_t i = 0, n = out.size() / 2; i < n; ++i) (*xform)(e + i);
+    }
+}
+
+// The device-upload twin of tpl_gather2d (H2D into an owned allocation).
+void* tpl_read2d(const char* src, long d0, long d1, int eb, bool rows_fast,
+                 tp::Axis axis, const std::vector<tp::Range>& ranges,
+                 std::vector<void*>& owned,
+                 const std::function<void(uint16_t*)>* xform = nullptr) {
+    std::vector<char> stage;
+    tpl_gather2d(src, d0, d1, eb, rows_fast, axis, ranges, xform, stage);
+    if (stage.empty()) return nullptr;
+    void* d = nullptr;
+    if (cudaMalloc(&d, stage.size()) != cudaSuccess) return nullptr;
+    cudaMemcpy(d, stage.data(), stage.size(), cudaMemcpyHostToDevice);
+    owned.push_back(d);
+    return d;
+}
+
+// The rank's owned extents of a tensor's two logical dims (d0 = the Rows axis,
+// d1 = the Cols axis, in the table's orientation): the full extents when the
+// table is degenerate (tp=1) or the name is whole/replicated, the reduced
+// extents when sliced. For consumers that need the reduced geometry rather than
+// just the pointer (the Q4_K row-scale precompute, which must run over the
+// rows actually resident on this rank).
+void tp_owned_dims(const std::string& name, int rank, long d0, long d1,
+                   long& o0, long& o1) {
+    o0 = d0; o1 = d1;
+    TpSlice sl;
+    if (tp_decide(name, rank, &sl) != TpDec::Slice) return;
+    long owned = 0;
+    for (const tp::Range& r : sl.ranges) owned += (long)r.len;
+    if (sl.axis == tp::Axis::Rows || sl.axis == tp::Axis::OneD) o0 = owned;
+    else if (sl.axis == tp::Axis::Cols) o1 = owned;
+}
+
+// The ggml block geometry of the dequant-supported quant types (block elems,
+// block bytes); false for the dense types (F32/F16/BF16), which gather as
+// plain element buffers (blk_elems = 1, blk_bytes = the element size).
+bool gguf_block_units(int ggml_type, long& blk_elems, size_t& blk_bytes) {
+    switch (ggml_type) {
+        case 8:  blk_elems = 32;  blk_bytes = 34;  return true;   // Q8_0
+        case 12: blk_elems = 256; blk_bytes = 144; return true;   // Q4_K
+        case 13: blk_elems = 256; blk_bytes = 176; return true;   // Q5_K
+        case 14: blk_elems = 256; blk_bytes = 210; return true;   // Q6_K
+        default: return false;
+    }
+}
+
+// One-time, per-(reason, name) stderr note for a table-sliced rank that loads
+// the tensor whole anyway (PTQ1 re-pack, unaligned quant blocks): that rank
+// then holds more on-disk bytes than the table's per-rank budget says. Printed,
+// never silent (D-B).
+void tp_gguf_slice_note(const char* why, const char* name) {
+    static std::map<std::string, bool> done;
+    const std::string k = std::string(why) + "|" + name;
+    if (!done[k]) {
+        done[k] = true;
+        fprintf(stderr, "[tp-weights] %s: %s loaded whole on this rank (not sliceable)\n",
+                why, name);
+    }
+}
+
+// The GGUF-orientation twin of tpl_read2d for a tensor whose on-disk bytes are
+// t->data (an mmap into the file: [dims[1]] rows of dims[0], the ggml FAST
+// axis, row-major). The table's axis is a dim-INDEX axis: Rows = dims[0] =
+// the fast axis, Cols = dims[1] = the slow axis, OneD = the single dim. The
+// result is a contiguous allocation in the SOURCE'S OWN layout, sized to the
+// owned units only: a valid reduced ggml tensor the dequant kernels read
+// unchanged (quant types: whole blocks are the units, so the caller must pass
+// block-aligned ranges; dense types: elements). nullptr when nothing is
+// owned or the alloc fails.
+void* tpl_gguf_read(const GGUFTensor* t, tp::Axis axis,
+                    const std::vector<tp::Range>& ranges,
+                    long blk_elems, size_t blk_bytes,
+                    std::vector<void*>& owned) {
+    const char* src = static_cast<const char*>(t->data);
+    if (t->n_dims <= 1) {
+        if (blk_elems != 1) return nullptr;   // 1-D quant is not tileable here
+        std::vector<char> stage;
+        tpl_gather2d(src, t->dims[0], 1, (int)blk_bytes, false, tp::Axis::OneD, ranges,
+                     nullptr, stage);
+        if (stage.empty()) return nullptr;
+        void* d = nullptr;
+        if (cudaMalloc(&d, stage.size()) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, stage.data(), stage.size(), cudaMemcpyHostToDevice);
+        owned.push_back(d);
+        return d;
+    }
+    if (axis == tp::Axis::OneD) return nullptr;
+    std::vector<tp::Range> u = ranges;
+    tp::Axis ax;
+    if (axis == tp::Axis::Rows) {
+        // dims[0] is the ggml FAST axis: the owned intervals are element runs
+        // along it; remap to block units (block-aligned by the caller) and let
+        // the fast-axis gather take one sub-block per row of the (full) slow
+        // axis.
+        for (auto& r : u) { r.begin /= blk_elems; r.len /= blk_elems; }
+        ax = tp::Axis::Cols;
+    } else {
+        // dims[1] is the slow axis: contiguous row block(s), ranges as-is.
+        ax = tp::Axis::Rows;
+    }
+    return tpl_read2d(src, t->dims[1], t->dims[0] / blk_elems, (int)blk_bytes, false, ax, u, owned);
+}
 }
 
 bool Qwen35Model::load_weights(const std::string& dir) {
     Impl& s = *p_;
-    auto L = [&](const std::string& n) { return load_bin(dir + "/" + n + ".bin", s.owned); };
-    s.w.embed_tokens = L("embed_tokens");
-    s.w.final_norm   = L("final_norm");
-    s.w.lm_head      = L("lm_head");
-    if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) {
+    // Per-rank allocation per the process table (D2). The flat .bin names
+    // (layer_N.wq, embed_tokens, ...) are only known to a Flat-convention
+    // table; the engine builds Gguf/Hf tables, under which every flat name
+    // resolves replicated (Whole on every rank) -- still a valid, if
+    // duplicated, placement. Under a Flat table (or a future engine change
+    // building one) the same calls split: the reads below then carry only
+    // this rank's sub-blocks. tp=1 (degenerate table) -> Whole everywhere ->
+    // byte-identical to the pre-split loader (the tp=1 invariance).
+    {
+        const tp::Table& tt = tp::get_process_table();
+        if (tt.set() && tt.n_ranks() > 1)
+            fprintf(stderr, "[tp-weights] flat .bin on rank %d of %d: names unknown to the "
+                            "Gguf/Hf-convention table load whole (replicated); a "
+                            "Flat-convention table would slice them (best-effort reads)\n",
+                    s.rank, tt.n_ranks());
+    }
+    auto Lt = [&](const std::string& n, long d0, long d1) -> void* {
+        TpSlice sl{};
+        switch (tp_decide(n, s.rank, &sl)) {
+            case TpDec::Whole:
+                return load_bin(dir + "/" + n + ".bin", s.owned);
+            case TpDec::Skip:
+                return nullptr;
+            case TpDec::Slice: {
+                // Best-effort reduced read: the flat file is ggml [in,out] row-major
+                // (d0 fast) raw bf16; read the whole file to host and gather the
+                // owned sub-blocks (1-D tensors: d1 = 1, axis OneD).
+                std::ifstream f(dir + "/" + n + ".bin", std::ios::binary | std::ios::ate);
+                if (!f) return nullptr;
+                std::vector<char> host((size_t)f.tellg());
+                f.seekg(0);
+                f.read(host.data(), host.size());
+                return tpl_read2d(host.data(), d0, d1, 2, true, sl.axis, sl.ranges, s.owned);
+            }
+        }
+        return nullptr;
+    };
+    auto miss = [&](const std::string& n, const void* p) {
+        return !p && tp_decide(n, s.rank, nullptr) != TpDec::Skip;
+    };
+    const long H = s.cfg.hidden, V = s.cfg.vocab;
+    s.w.embed_tokens = Lt("embed_tokens", H, V);
+    s.w.final_norm   = Lt("final_norm", H, 1);
+    s.w.lm_head      = Lt("lm_head", H, V);
+    if (miss("embed_tokens", s.w.embed_tokens) ||
+        miss("final_norm", s.w.final_norm) ||
+        miss("lm_head", s.w.lm_head)) {
         fprintf(stderr, "[compressed-tensors] top-level weights missing (embed=%d final_norm=%d "
                 "lm_head=%d)\n", s.w.embed_tokens != nullptr, s.w.final_norm != nullptr,
                 s.w.lm_head != nullptr);
@@ -6032,16 +6312,25 @@ bool Qwen35Model::load_weights(const std::string& dir) {
     for (int i = 0; i < s.cfg.n_layers; i++) {
         std::string pfx = "layer_" + std::to_string(i) + ".";
         Qwen35LayerWeights& w = s.w.layers[i];
-        w.input_norm     = L(pfx + "input_norm");
-        w.wq = L(pfx + "wq"); w.wk = L(pfx + "wk"); w.wv = L(pfx + "wv"); w.wo = L(pfx + "wo");
-        w.q_norm = L(pfx + "q_norm"); w.k_norm = L(pfx + "k_norm");
-        w.post_attn_norm = L(pfx + "post_attn_norm");
-        w.router_w = L(pfx + "router_w");
-        w.gate = L(pfx + "gate"); w.up = L(pfx + "up"); w.down = L(pfx + "down");
+        const long qout = (long)s.cfg.n_q_heads * s.cfg.head_dim;
+        const long kvout = (long)s.cfg.n_kv_heads * s.cfg.head_dim;
+        const long F = s.cfg.moe_ffn;
+        w.input_norm     = Lt(pfx + "input_norm", H, 1);
+        w.wq = Lt(pfx + "wq", H, qout); w.wk = Lt(pfx + "wk", H, kvout);
+        w.wv = Lt(pfx + "wv", H, kvout); w.wo = Lt(pfx + "wo", qout, H);
+        w.q_norm = Lt(pfx + "q_norm", s.cfg.head_dim, 1);
+        w.k_norm = Lt(pfx + "k_norm", s.cfg.head_dim, 1);
+        w.post_attn_norm = Lt(pfx + "post_attn_norm", H, 1);
+        w.router_w = Lt(pfx + "router_w", H, s.cfg.n_experts);
+        w.gate = Lt(pfx + "gate", H, F); w.up = Lt(pfx + "up", H, F); w.down = Lt(pfx + "down", F, H);
         if (s.cfg.n_shared > 0) {
-            w.shared_gate = L(pfx + "shared_gate"); w.shared_up = L(pfx + "shared_up"); w.shared_down = L(pfx + "shared_down");
+            w.shared_gate = Lt(pfx + "shared_gate", H, F);
+            w.shared_up = Lt(pfx + "shared_up", H, F);
+            w.shared_down = Lt(pfx + "shared_down", F, H);
         }
-        if (!w.wq || !w.gate || !w.router_w) return false;
+        if (miss(pfx + "wq", w.wq) || miss(pfx + "gate", w.gate) ||
+            miss(pfx + "router_w", w.router_w))
+            return false;
     }
     return true;
 }
@@ -6241,6 +6530,32 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dev_quant = [&](const std::string& name, int& qtype) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        // TP (D2/D-B): the table decides this rank's read before anything is
+        // allocated. Skipped: no alloc, no read (another rank owns the name).
+        // Sliced: the on-disk bytes are the ggml blocks themselves, so the
+        // owned sub-blocks upload as a valid reduced tensor of the same type
+        // (block-aligned ranges; the dequant kernels run over the slice).
+        // PTQ1 re-packs whole tensors, so a PTQ1 slice falls through to the
+        // whole load with a printed note (the rank then holds more than the
+        // table's per-rank budget says -- the per-rank audit prints it).
+        {
+            TpSlice sl;
+            const TpDec dec = tp_decide(name, s.rank, &sl);
+            if (dec == TpDec::Skip) { qtype = 0; return nullptr; }
+            if (dec == TpDec::Slice) {
+                long be; size_t bb;
+                if (t->ggml_type == kPtq1GgmlType) {
+                    tp_gguf_slice_note("PTQ1_0 re-pack", name.c_str());
+                } else if (gguf_block_units(t->ggml_type, be, bb) && t->dims[0] % be == 0) {
+                    void* p = tpl_gguf_read(t, sl.axis, sl.ranges, be, bb, s.owned);
+                    if (p) { qtype = t->ggml_type; return p; }
+                    tp_gguf_slice_note("unaligned quant block", name.c_str());
+                } else {
+                    tp_gguf_slice_note("dense type on the quant path", name.c_str());
+                }
+                // fall through: whole load (the tp=1 path stays untouched below)
+            }
+        }
         if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
             UnrotateJob j;
             if (!unrotate_job_init(j, t, name, *sign, had.block_size,
@@ -6285,7 +6600,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (!req || !src_ok || !q6) return q6;
         const int src_type = qtype;            // 14 (Q6_K), 8 (Q8_0) or 13 (Q5_K) -> Q4_K
         const GGUFTensor* t = g.tensor(name);
-        const long nv = t->n_values;
+        long o0 = 0, o1 = 0;
+        tp_owned_dims(name, s.rank, t->dims[0], t->n_dims >= 2 ? t->dims[1] : 1, o0, o1);
+        const long nv = o0 * o1;               // owned count: a sliced rank requants the slice
         if (nv % 256 != 0) return q6;
         void* deq = nullptr;
         if (cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess) return q6;
@@ -6328,7 +6645,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (!src) return src;
         if (qtype != 12 && qtype != 13 && qtype != 14) return src;   // Q4_K / Q5_K / Q6_K
         const GGUFTensor* t = g.tensor(name);
-        const long nv = t->n_values;
+        long o0 = 0, o1 = 0;
+        tp_owned_dims(name, s.rank, t->dims[0], t->n_dims >= 2 ? t->dims[1] : 1, o0, o1);
+        const long nv = o0 * o1;               // owned count: a sliced rank requants the slice
         if (nv % 256 != 0) return src;
         void* deq = nullptr;
         if (cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess) return src;
@@ -6350,6 +6669,57 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
+        // TP (D2): a skipped rank reads nothing; a sliced rank reads the owned
+        // sub-block (dense types gather in element units) and dequants only it
+        // to bf16 (the transpose, when requested, uses the reduced extents).
+        // The whole-load path below stays untouched (tp=1 invariance).
+        {
+            TpSlice sl;
+            const TpDec dec = tp_decide(name, s.rank, &sl);
+            if (dec == TpDec::Skip) return nullptr;
+            if (dec == TpDec::Slice) {
+                const int eb = (t->ggml_type == 0) ? 4 : 2;   // F32 / F16 / BF16
+                void* dq = tpl_gguf_read(t, sl.axis, sl.ranges, 1, (size_t)eb, s.owned);
+                if (dq) {
+                    long o0 = 0, o1 = 0;
+                    tp_owned_dims(name, s.rank, t->dims[0], t->n_dims >= 2 ? t->dims[1] : 1,
+                                  o0, o1);
+                    const long nv = o0 * o1;
+                    void* tmp = nullptr;
+                    if (cudaMalloc(&tmp, (size_t)nv * 2) != cudaSuccess) {
+                        if (!s.owned.empty() && s.owned.back() == dq) s.owned.pop_back();
+                        cudaFree((void*)dq);
+                        return nullptr;
+                    }
+                    kernels::launch_gguf_dequant(t->ggml_type, dq, tmp, nv, s.stream);
+                    if (transpose) {
+                        const int in = (int)o0, out = (int)o1;
+                        void* dst = nullptr;
+                        if (cudaMalloc(&dst, (size_t)nv * 2) != cudaSuccess) {
+                            if (!s.owned.empty() && s.owned.back() == dq) s.owned.pop_back();
+                            cudaFree((void*)dq);
+                            cudaFree(tmp);
+                            return nullptr;
+                        }
+                        if (!s.owned.empty() && s.owned.back() == dq) s.owned.pop_back();
+                        s.owned.push_back(dst);
+                        cudaFree((void*)dq);
+                        cudaFree(tmp);
+                        kernels::launch_transpose_bf16(tmp, dst, out, in, s.stream);
+                        cudaStreamSynchronize(s.stream);
+                        return dst;
+                    }
+                    if (!s.owned.empty() && s.owned.back() == dq) s.owned.pop_back();
+                    cudaFree((void*)dq);
+                    s.owned.push_back(tmp);
+                    cudaStreamSynchronize(s.stream);
+                    return tmp;
+                }
+                // The gather produced nothing (an alloc failed): this rank is
+                // not whole-owning the name, so a miss is the honest answer.
+                return nullptr;
+            }
+        }
         if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
             // The embedding table: un-rotated straight to bf16, no requantization, because a
             // lookup reads rows rather than multiplying by them.
@@ -6613,7 +6983,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             (bonsai_proj_qkv_only && name.find(".attn_qkv.") != std::string::npos) ||
             (bonsai_proj_gate_only && name.find(".attn_gate.") != std::string::npos);
         if (bonsai_native_proj && proj_name_ok && t && t->ggml_type == kPtq1GgmlType &&
-            s.bonsai_rot_xn && t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+            s.bonsai_rot_xn && t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0]) &&
+            tp_decide(name, s.rank, nullptr) == TpDec::Whole) {   // the native upload is whole-tensor only
             // The blocks go up as they are, but the GDN v-head order does NOT: everything that
             // produces a v head stores its 48 heads transposed, and the folded path regroups them
             // while un-rotating. Uploading verbatim skips that, which is why attn_gate (all v) was
@@ -6638,7 +7009,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const GGUFTensor* t = g.tensor(name);
         void* sh = nullptr;
         if (shadow_proj && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot_xn &&
-            t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+            t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0]) &&
+            tp_decide(name, s.rank, nullptr) == TpDec::Whole) {   // the shadow upload is whole-tensor only
             UnrotateJob j;
             if (unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
                 sh = upload_proj_native(t, name, j);
@@ -6656,7 +7028,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto ffn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (bonsai_native_ffn && s.bonsai_ffn_h && t && t->ggml_type == kPtq1GgmlType &&
-            s.bonsai_sign_dev.count(t->dims[0])) {
+            s.bonsai_sign_dev.count(t->dims[0]) &&
+            tp_decide(name, s.rank, nullptr) == TpDec::Whole) {   // the native upload is whole-tensor only
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
                 cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
@@ -6673,7 +7046,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto ffn_q_shadow = [&](const std::string& name, const void* folded) {
         const GGUFTensor* t = g.tensor(name);
         if (!shadow_ffn || !folded || !s.bonsai_ffn_h || !t ||
-            t->ggml_type != kPtq1GgmlType || !s.bonsai_sign_dev.count(t->dims[0])) return;
+            t->ggml_type != kPtq1GgmlType || !s.bonsai_sign_dev.count(t->dims[0]) ||
+            tp_decide(name, s.rank, nullptr) != TpDec::Whole) return;   // the shadow upload is whole-tensor only
         if (void* d = upload_plain_native(t)) {
             s.owned.pop_back();
             s.bonsai_dec_bufs.push_back(d);
@@ -6701,7 +7075,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const GGUFTensor* t = g.tensor(name);
         const bool q5k_ok = mg_lm_q5k && s.cfg.muse_glimmer && t && t->ggml_type == 13;
         if (bonsai_native_head && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
-            s.bonsai_sign_dev.count(t->dims[0])) {
+            s.bonsai_sign_dev.count(t->dims[0]) &&
+            tp_decide(name, s.rank, nullptr) == TpDec::Whole) {   // the native upload is whole-tensor only
             // Straight upload: no un-rotation, no refit, 0.21875 bytes/weight.
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
@@ -6734,7 +7109,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     }();
     auto v_regroup = [&](const std::string& name) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (!t || !had.present || !had.gdn_v_grouped) return nullptr;
+        if (!t || !had.present || !had.gdn_v_grouped ||
+            tp_decide(name, s.rank, nullptr) != TpDec::Whole) return nullptr;   // the regroup is a whole-tensor permute
         const char* key = name.find("ssm_a") != std::string::npos && name.find("alpha") == std::string::npos
                               ? "a"
                         : name.find("ssm_dt") != std::string::npos ? "dt"
@@ -6777,7 +7153,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
 
     if (const GGUFTensor* emb_t = g.tensor("token_embd.weight");
         bonsai_native_embed && emb_t && emb_t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
-        s.bonsai_sign_dev.count(emb_t->dims[0])) {
+        s.bonsai_sign_dev.count(emb_t->dims[0]) &&
+        tp_decide("token_embd.weight", s.rank, nullptr) == TpDec::Whole) {   // the native upload is whole-tensor only
         void* d = nullptr;
         if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
             cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
@@ -6799,7 +7176,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     }
     s.w.lm_head = lm_w(lm, s.w.lm_head_type);                 // native [vocab,hidden] for GEMV
     if (shadow_head && s.w.lm_head_type != kPtq1GgmlType && s.bonsai_rot &&
-        s.bonsai_sign_dev.count(s.cfg.hidden)) {
+        s.bonsai_sign_dev.count(s.cfg.hidden) &&
+        tp_decide(lm, s.rank, nullptr) == TpDec::Whole) {   // the shadow upload is whole-tensor only
         const GGUFTensor* t = g.tensor(lm);
         if (t && t->ggml_type == kPtq1GgmlType && t->dims[0] == s.cfg.hidden) {
             if (void* d = upload_plain_native(t)) {
@@ -6809,7 +7187,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
         }
     }
-    if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
+    // A null pointer is a real miss only if this rank OWNS the name per the placement
+    // table (D2); a skipped rank legitimately holds nothing of it, and the loaders
+    // return null for exactly that case (they never report a skip as a failure).
+    auto miss = [&](const std::string& nm, const void* p) {
+        return !p && tp_decide(nm, s.rank, nullptr) != TpDec::Skip;
+    };
+    if (miss("token_embd.weight", s.w.embed_tokens) ||
+        miss("output_norm.weight", s.w.final_norm) ||
+        miss(lm, s.w.lm_head)) return false;
 
     s.w.layers.resize(c.n_layers);
     for (int i = 0; i < c.n_layers; i++) {
@@ -6817,6 +7203,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         Qwen35LayerWeights& w = s.w.layers[i];
         w.linear_attn = is_linear_layer(c, i);
         w.swa = (i < (int)c.swa_layers.size()) ? c.swa_layers[i] : false;
+        // The per-layer skip-aware twin of `miss` above: true when the pointer is set or
+        // the table assigns this rank none of the name.
+        auto ok = [&](const std::string& nm, const void* p) {
+            return p || tp_decide(nm, s.rank, nullptr) == TpDec::Skip;
+        };
         if (c.muse_glimmer && getenv("SPARKINFER_MG_DEBUG"))
             fprintf(stderr, "[mg-debug] layer %d: linear_attn=%d swa=%d full_attn_interval=%d hybrid=%d\n",
                     i, (int)w.linear_attn, (int)w.swa, c.full_attn_interval, (int)c.hybrid);
@@ -6883,11 +7274,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                     // own destination, which also drops the split entirely.
                     w.wq    = attn_w(b + "attn_q.weight", w.wq_type);
                     w.wgate = attn_w(b + "attn_gate.weight", w.wgate_type);
-                    if (!w.wq || !w.wgate) return false;
+                    if (!ok(b + "attn_q.weight", w.wq) || !ok(b + "attn_gate.weight", w.wgate)) return false;
                 } else {
                 const void* qd = dense(b + "attn_q.weight", false);
                 const void* gd = dense(b + "attn_gate.weight", false);
-                if (!qd || !gd) return false;
+                if (!ok(b + "attn_q.weight", qd) || !ok(b + "attn_gate.weight", gd)) return false;
                 void* combined = nullptr;
                 cu(cudaMalloc(&combined, (size_t)s.qdim * 2 * H * sizeof(bf16)), "qgate interleave alloc");
                 // cu() only logs CUDA errors, it never aborts -- unlike qd/gd above, nothing
@@ -6999,20 +7390,48 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 w.shared_down = dense(b + "ffn_down_shexp.weight", false);
             }
             w.shared_gate_inp = attn_w_opt(b + "ffn_gate_inp_shexp.weight", w.shared_gate_inp_type);
-            const bool have_shared_q = w.shared_gate_q && w.shared_up_q && w.shared_down_q;
-            const bool have_shared_d = w.shared_gate && w.shared_up && w.shared_down;
+            const bool have_shared_q =
+                ok(b + "ffn_gate_shexp.weight", w.shared_gate_q) &&
+                ok(b + "ffn_up_shexp.weight", w.shared_up_q) &&
+                ok(b + "ffn_down_shexp.weight", w.shared_down_q);
+            const bool have_shared_d =
+                ok(b + "ffn_gate_shexp.weight", w.shared_gate) &&
+                ok(b + "ffn_up_shexp.weight", w.shared_up) &&
+                ok(b + "ffn_down_shexp.weight", w.shared_down);
             if (!have_shared_q && !have_shared_d) return false;
             }
         }
+        // Nulls are tolerated here only where the placement table says this rank owns
+        // none of the name (Skipped names load null on purpose); anything else is a miss.
         const bool have_attn = w.linear_attn
-            ? (w.wqkv && w.wqkv_gate && w.ssm_conv && w.ssm_dt && w.ssm_a &&
-               w.ssm_beta && w.ssm_alpha && w.ssm_norm && w.ssm_out)
-            : (w.wq && w.wk && w.wv && w.wo && w.q_norm && w.k_norm);
+            ? (ok(b + "attn_qkv.weight", w.wqkv) && ok(b + "attn_gate.weight", w.wqkv_gate) &&
+               ok(b + "ssm_conv1d.weight", w.ssm_conv) && ok(b + "ssm_dt.bias", w.ssm_dt) &&
+               ok(b + "ssm_a", w.ssm_a) && ok(b + "ssm_beta.weight", w.ssm_beta) &&
+               ok(b + "ssm_alpha.weight", w.ssm_alpha) && ok(b + "ssm_norm.weight", w.ssm_norm) &&
+               ok(b + "ssm_out.weight", w.ssm_out))
+            : (ok(b + "attn_q.weight", w.wq) && ok(b + "attn_k.weight", w.wk) &&
+               ok(b + "attn_v.weight", w.wv) && ok(b + "attn_output.weight", w.wo) &&
+               ok(b + "attn_q_norm.weight", w.q_norm) && ok(b + "attn_k_norm.weight", w.k_norm));
         const bool have_ffn = c.dense_ffn
-            ? (w.gate_q && w.up_q && w.down_q)
-            : (w.router_w && w.gate_q && w.up_q && w.down_q);
-        if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
-        if (c.muse_glimmer && (!w.ffn_norm || !w.post_ffn_norm)) return false;
+            ? (ok(b + "ffn_gate.weight", w.gate_q) && ok(b + "ffn_up.weight", w.up_q) &&
+               ok(b + "ffn_down.weight", w.down_q))
+            : (ok(b + "ffn_gate_inp.weight", w.router_w) &&
+               ok(b + "ffn_gate_exps.weight", w.gate_q) &&
+               ok(b + "ffn_up_exps.weight", w.up_q) &&
+               ok(b + "ffn_down_exps.weight", w.down_q));
+        // post_attn_norm is a fallback chain (attn_post_norm -> post_attention_norm ->
+        // ffn_norm): a null is a miss only if at least one link of the chain is owned here.
+        const bool post_attn_norm_ok = w.post_attn_norm ||
+            (tp_decide(b + "attn_post_norm.weight", s.rank, nullptr) == TpDec::Skip &&
+             tp_decide(b + "post_attention_norm.weight", s.rank, nullptr) == TpDec::Skip &&
+             tp_decide(b + "ffn_norm.weight", s.rank, nullptr) == TpDec::Skip);
+        if (!have_attn || !ok(b + "attn_norm.weight", w.input_norm) || !post_attn_norm_ok ||
+            !have_ffn)
+            return false;
+        if (c.muse_glimmer &&
+            (!ok(b + "ffn_norm.weight", w.ffn_norm) ||
+             !ok(b + "post_ffw_norm.weight", w.post_ffn_norm)))
+            return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
     }
     // ---- eager per-row int8 scales of the routed experts (fused quantized-B MoE prefill GEMM) ----
@@ -7695,6 +8114,46 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     return true;
 }
 
+// (dual-GPU D5) One per-card budget-audit line per rank. The on-disk term is the process
+// table's own per-rank sum (the table is the single source of truth, D2), the card
+// free/total is this instance's device (its ctor bound the context there once), and the
+// estimate uses the G2 constants: 33,024 B/token of int8 KV -- (2,048 data + 16 scale)
+// bytes per full-attn layer x 16 such layers -- plus the 154,927,104 B of GDN per-sequence
+// state, all judged against a 16 GiB card (17,179,869,184 B). A failed probe (a box whose
+// card is too full to even take a context) falls back to the nominal 16 GiB card, so the
+// line is printable everywhere; it then says "fits" by the G2 arithmetic, which is exactly
+// the D5 point: 131k context fits per card, 262k does not.
+std::string tp_audit_line(int rank, int device, unsigned long long on_disk_bytes,
+                          unsigned long long card_free_bytes, unsigned long long card_total_bytes,
+                          int ctx) {
+    static const unsigned long long kCard16GiB = 17179869184ull;
+    const unsigned long long est =
+        on_disk_bytes + 33024ull * (unsigned long long)ctx + 154927104ull;
+    char b[256];
+    std::snprintf(b, sizeof(b),
+                  "[tp-audit] rank %d (device %d): on-disk %llu B, card free %llu/%llu B, "
+                  "per-card est at ctx %d = %llu B -> %s 16 GiB (17,179,869,184 B)",
+                  rank, device, on_disk_bytes, card_free_bytes, card_total_bytes, ctx, est,
+                  est <= kCard16GiB ? "fits" : "exceeds");
+    return b;
+}
+
+const Qwen35Weights& Qwen35Model::weights() const { return p_->w; }
+
+void Qwen35Model::print_tp_audit(int ctx) const {
+    const tp::Table& t = tp::get_process_table();
+    if (!t.set() || t.n_ranks() < 2) return;   // table unset or tp=1: silent by design
+    const Impl& s = *p_;
+    cudaSetDevice(s.device);   // the ctor's one-time bind, re-asserted: the probe is per-card
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        free_b = total_b = 17179869184;   // nominal 16 GiB card when the probe itself fails
+    }
+    std::printf("%s\n",
+                tp_audit_line(s.rank, s.device, t.rank_on_disk_bytes(s.rank), free_b, total_b, ctx)
+                    .c_str());
+}
+
 // ----- HuggingFace "compressed-tensors" mixed FP8/NVFP4 checkpoint load -----
 // (e.g. unsloth/Qwen3.8-27B-NVFP4). Scheme, confirmed by direct tensor inspection of the actual
 // checkpoint (not assumed from the format spec alone):
@@ -8222,15 +8681,335 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         return requant_q4k(dequant_any(prefix, rows, cols), (long)rows * cols, qtype);
     };
 
+    // ---------------------------------------------------------------------
+    // (A) The tensor-parallel slice path (dual-GPU Wave 3). The process-wide
+    // placement table -- built and published by ModelEngine::load before any
+    // loader runs, and DEGENERATE (every name whole on device 0) at the tp=1
+    // default -- decides per named tensor whether this rank skips it, owns it
+    // whole, or owns a sub-block. tp_pick() below calls the whole path (the
+    // lambdas above, byte-identical) or the matching slice lambda; a whole
+    // decision never executes a slice lambda, so a degenerate table makes
+    // every call site below the pre-TP read.
+    // ---------------------------------------------------------------------
+    const int tp_rank = s.rank;
+
+    auto tp_pick = [&](const std::string& name, auto&& whole_fn, auto&& slice_fn) {
+        using T = decltype(whole_fn());
+        TpSlice sl;
+        switch (tp_decide(name, tp_rank, &sl)) {
+            case TpDec::Skip: {
+                T v{};
+                return v;
+            }
+            case TpDec::Whole:
+                return whole_fn();
+            default:
+                return slice_fn(sl);
+        }
+    };
+
+    // The owned element count of the split axis (1 range for a plain split, up
+    // to three for the GDN qkv/conv channel axis) and the reduced [rows',cols']
+    // extents of a sliced 2-D tensor.
+    auto tp_owned_count = [&](const TpSlice& sl) {
+        long o = 0;
+        for (const tp::Range& r : sl.ranges) o += (long)r.len;
+        return o;
+    };
+    auto tp_owned_rc = [&](int rows, int cols, const TpSlice& sl) -> long {
+        const long o = tp_owned_count(sl);
+        if (sl.axis == tp::Axis::Cols) return (long)rows * o;
+        return o * (long)cols;   // Rows or OneD: the split dim is the first
+    };
+
+    // The two whole-path bf16 element transforms, as staging transforms for the
+    // slice path (A_log -> -exp(A_log); norm weight -> 1 + weight).
+    std::function<void(uint16_t*)> xform_a_log = [](uint16_t* p) {
+        uint32_t bits = (uint32_t)*p << 16;
+        float f;
+        memcpy(&f, &bits, sizeof(f));
+        f = -expf(f);
+        memcpy(&bits, &f, sizeof(bits));
+        *p = (uint16_t)(bits >> 16);
+    };
+    std::function<void(uint16_t*)> xform_norm_plus1 = [](uint16_t* p) {
+        uint32_t bits = (uint32_t)*p << 16;
+        float f;
+        memcpy(&f, &bits, sizeof(f));
+        f = 1.0f + f;
+        memcpy(&bits, &f, sizeof(bits));
+        *p = (uint16_t)(bits >> 16);
+    };
+
+    // bf16 source (embeddings, norms, dt/A_log, conv1d, in_proj_a/b): gather the
+    // owned sub-block and upload it as a reduced [rows', cols'] (or 1-D) bf16
+    // buffer in the source's own layout. d0 = the Rows-axis extent, d1 = the
+    // Cols-axis extent (1 for a 1-D tensor); rows_fast is false for this HF
+    // loader (d1 is the fast axis).
+    auto ct_bf16_slice = [&](const std::string& name, long d0, long d1, bool rows_fast,
+                             const TpSlice& sl,
+                             const std::function<void(uint16_t*)>* xform) -> const void* {
+        const STTensor* t = st.tensor(name);
+        if (!t || t->dtype != STDType::BF16 || t->n_values != d0 * d1) {
+            fprintf(stderr, "[compressed-tensors] %s: missing/malformed bf16 source (slice)\n",
+                    name.c_str());
+            return nullptr;
+        }
+        return tpl_read2d(static_cast<const char*>(t->data), d0, d1, 2, rows_fast, sl.axis,
+                          sl.ranges, s.owned, xform);
+    };
+
+    // The owned sub-blocks of an on-disk NVFP4 weight's two stream tensors,
+    // rescaled to whole stream units. The packed nibbles are a [rows, cols/2]
+    // u8 matrix and the 16-group scale a [rows, cols/16] u8 matrix in the same
+    // HF row-major layout, so a /2- or /16-rescaled range set gathers exactly
+    // the owned sub-blocks (the 27B split extents are 16-aligned, so both land
+    // on whole units; the result is a valid reduced [rows', cols'] tensor in
+    // the source layout).
+    auto nvfp4_units = [&](const TpSlice& sl, long div) {
+        std::vector<tp::Range> u;
+        for (const tp::Range& r : sl.ranges) u.push_back({r.begin / div, r.len / div});
+        return u;
+    };
+
+    // NVFP4 source: gather the owned sub-blocks of the packed and scale streams
+    // and rebuild the SAME [hdr | scale | packed] payload the whole path uploads
+    // (plus the SFB copy when the prefill GEMM can take the shape). Ownership
+    // mirrors the whole path: always_own (the GDN-native payload is a decode
+    // weight and is always kept) or the keep_prefill_fp4/kDecodeNvfp4 policy
+    // (the FFN payload, freed by the caller when no SFB was built).
+    auto ct_nvfp4_slice = [&](const std::string& prefix, int rows, int cols,
+                              const TpSlice& sl, bool always_own, bool sfb_on,
+                              const void** fp4, const void** fp4_sf, float* fp4_alpha)
+        -> const void* {
+        static const bool keep_prefill_fp4 = [] {
+            const char* e = getenv("SPARKINFER_QWEN38_PREFILL_NVFP4");
+            return !(e && e[0] == '0');
+        }();
+        NvFp4Src full{};
+        if (!nvfp4_src(prefix, rows, cols, full)) {
+            fprintf(stderr, "[compressed-tensors] %s: missing/malformed NVFP4 (slice)\n",
+                    prefix.c_str());
+            return nullptr;
+        }
+        const long o = tp_owned_count(sl);
+        const long rows2 = (sl.axis == tp::Axis::Cols) ? rows : o;
+        const long cols2 = (sl.axis == tp::Axis::Cols) ? o : cols;
+        std::vector<char> packed_s, scale_s;
+        tpl_gather2d(static_cast<const char*>(full.packed), rows, cols / 2, 1, false, sl.axis,
+                     nvfp4_units(sl, 2), nullptr, packed_s);
+        tpl_gather2d(static_cast<const char*>(full.group), rows, cols / 16, 1, false, sl.axis,
+                     nvfp4_units(sl, 16), nullptr, scale_s);
+        if (packed_s.empty() || scale_s.empty()) return nullptr;
+        const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+        void* payload = nullptr;
+        if (cudaMalloc(&payload, hdr + packed_s.size() + scale_s.size()) != cudaSuccess)
+            return nullptr;
+        cudaMemset(payload, 0, hdr);
+        cudaMemcpy(payload, &full.global, 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(payload) + hdr, scale_s.data(), scale_s.size(),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_s.size(), packed_s.data(),
+                   packed_s.size(), cudaMemcpyHostToDevice);
+        if (always_own || keep_prefill_fp4 || kDecodeNvfp4) s.owned.push_back(payload);
+        if (sfb_on && fp4 && kernels::prefill_nvfp4_supported(128, (int)rows2, (int)cols2)) {
+            void* sf = nullptr;
+            const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b((int)rows2, (int)cols2);
+            if (sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess &&
+                kernels::launch_ct_nvfp4_pack_sfb(static_cast<char*>(payload) + hdr, sf,
+                                                  (int)rows2, (int)cols2, s.stream) &&
+                cudaStreamSynchronize(s.stream) == cudaSuccess) {
+                s.owned.push_back(sf);
+                *fp4 = static_cast<char*>(payload) + hdr + scale_s.size();
+                *fp4_sf = sf;
+                if (fp4_alpha) *fp4_alpha = (full.global != 0.f) ? (1.f / full.global) : 1.f;
+            } else if (sf) {
+                cudaFree(sf);
+            }
+        }
+        return payload;
+    };
+
+    // FP8 source: the [bf16 scale[rows] | e4m3 weight[rows*cols]] payload with
+    // the owned sub-blocks gathered per stream. The per-row scale is 1-D over
+    // rows, so a Cols split keeps every scale row (each row keeps its scalar)
+    // while a Rows split keeps the same row window as the weight.
+    auto ct_fp8_slice = [&](const std::string& prefix, int rows, int cols,
+                            const TpSlice& sl, int& qtype) -> const void* {
+        const STTensor* w = st.tensor(prefix + ".weight");
+        const STTensor* sc = st.tensor(prefix + ".weight_scale");
+        if (!w || !sc || w->dtype != STDType::F8_E4M3 || sc->dtype != STDType::BF16 ||
+            w->n_values != (long)rows * cols || sc->n_values != rows) {
+            fprintf(stderr, "[compressed-tensors] %s: missing/malformed FP8 (slice)\n",
+                    prefix.c_str());
+            return nullptr;
+        }
+        const std::vector<tp::Range> su =
+            (sl.axis == tp::Axis::Cols) ? std::vector<tp::Range>{{0, (size_t)rows}} : sl.ranges;
+        std::vector<char> ws, scs;
+        tpl_gather2d(static_cast<const char*>(w->data), rows, cols, 1, false, sl.axis, sl.ranges,
+                     nullptr, ws);
+        tpl_gather2d(static_cast<const char*>(sc->data), rows, 1, 2, false, tp::Axis::OneD, su,
+                     nullptr, scs);
+        if (ws.empty()) return nullptr;
+        void* packed = nullptr;
+        if (cudaMalloc(&packed, scs.size() + ws.size()) != cudaSuccess) return nullptr;
+        cudaMemcpy(packed, scs.data(), scs.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(packed) + scs.size(), ws.data(), ws.size(),
+                   cudaMemcpyHostToDevice);
+        s.owned.push_back(packed);
+        qtype = kernels::SI_QTYPE_FP8;
+        return packed;
+    };
+
+    // dequant_any's slice twin: whichever of the three storage formats this
+    // Linear uses -> a reduced bf16 [rows', cols'] device buffer, the exact
+    // requant source the whole path produces (the Q4_K 256-blocks run along
+    // the in-dim within each owned row, as in the whole path).
+    auto ct_dequant_slice = [&](const std::string& prefix, int rows, int cols,
+                                const TpSlice& sl) -> void* {
+        NvFp4Src probe{};
+        if (nvfp4_src(prefix, rows, cols, probe)) {
+            const long o = tp_owned_count(sl);
+            const long rows2 = (sl.axis == tp::Axis::Cols) ? rows : o;
+            const long cols2 = (sl.axis == tp::Axis::Cols) ? o : cols;
+            std::vector<char> ps, gs;
+            tpl_gather2d(static_cast<const char*>(probe.packed), rows, cols / 2, 1, false,
+                          sl.axis, nvfp4_units(sl, 2), nullptr, ps);
+            tpl_gather2d(static_cast<const char*>(probe.group), rows, cols / 16, 1, false,
+                          sl.axis, nvfp4_units(sl, 16), nullptr, gs);
+            if (ps.empty() || gs.empty()) return nullptr;
+            void *pd = nullptr, *gd = nullptr, *out = nullptr;
+            if (cudaMalloc(&pd, ps.size()) != cudaSuccess) return nullptr;
+            if (cudaMalloc(&gd, gs.size()) != cudaSuccess) { cudaFree(pd); return nullptr; }
+            if (cudaMalloc(&out, (size_t)rows2 * (size_t)cols2 * 2) != cudaSuccess) {
+                cudaFree(pd); cudaFree(gd); return nullptr;
+            }
+            cudaMemcpy(pd, ps.data(), ps.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(gd, gs.data(), gs.size(), cudaMemcpyHostToDevice);
+            kernels::launch_ct_dequant_nvfp4(pd, gd, probe.global, out, (int)rows2, (int)cols2,
+                                             s.stream);
+            cudaError_t de = cudaGetLastError();
+            if (de == cudaSuccess) de = cudaStreamSynchronize(s.stream);
+            cudaFree(pd); cudaFree(gd);
+            if (de != cudaSuccess) {
+                fprintf(stderr,
+                        "[compressed-tensors] %s: NVFP4 dequant failed (slice) (%s) for [%ld,%ld]\n",
+                        prefix.c_str(), cudaGetErrorString(de), rows2, cols2);
+                cudaFree(out);
+                return nullptr;
+            }
+            return out;
+        }
+        const STTensor* w = st.tensor(prefix + ".weight");
+        if (!w) {
+            fprintf(stderr, "[compressed-tensors] missing %s.weight (slice)\n", prefix.c_str());
+            return nullptr;
+        }
+        if (w->dtype == STDType::F8_E4M3) {
+            const STTensor* sc = st.tensor(prefix + ".weight_scale");
+            if (!sc || w->n_values != (long)rows * cols || sc->n_values != rows) {
+                fprintf(stderr, "[compressed-tensors] %s: missing/malformed FP8 (slice)\n",
+                        prefix.c_str());
+                return nullptr;
+            }
+            const std::vector<tp::Range> su =
+                (sl.axis == tp::Axis::Cols) ? std::vector<tp::Range>{{0, (size_t)rows}} : sl.ranges;
+            std::vector<char> ws, scs;
+            tpl_gather2d(static_cast<const char*>(w->data), rows, cols, 1, false, sl.axis,
+                          sl.ranges, nullptr, ws);
+            tpl_gather2d(static_cast<const char*>(sc->data), rows, 1, 2, false, tp::Axis::OneD,
+                         su, nullptr, scs);
+            if (ws.empty()) return nullptr;
+            const long o = tp_owned_count(sl);
+            const long rows2 = (sl.axis == tp::Axis::Cols) ? rows : o;
+            const long cols2 = (sl.axis == tp::Axis::Cols) ? o : cols;
+            void *wd = nullptr, *scd = nullptr, *out = nullptr;
+            if (cudaMalloc(&wd, ws.size()) != cudaSuccess) return nullptr;
+            if (cudaMalloc(&scd, scs.size()) != cudaSuccess) { cudaFree(wd); return nullptr; }
+            if (cudaMalloc(&out, (size_t)rows2 * (size_t)cols2 * 2) != cudaSuccess) {
+                cudaFree(wd); cudaFree(scd); return nullptr;
+            }
+            cudaMemcpy(wd, ws.data(), ws.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(scd, scs.data(), scs.size(), cudaMemcpyHostToDevice);
+            kernels::launch_ct_dequant_fp8(wd, scd, out, (int)rows2, (int)cols2, s.stream);
+            cudaStreamSynchronize(s.stream);
+            cudaFree(wd); cudaFree(scd);
+            return out;
+        }
+        if (w->dtype != STDType::BF16 || w->n_values != (long)rows * cols) {
+            fprintf(stderr, "[compressed-tensors] %s.weight: unexpected form (slice)\n",
+                    prefix.c_str());
+            return nullptr;
+        }
+        std::vector<char> stage;
+        tpl_gather2d(static_cast<const char*>(w->data), rows, cols, 2, false, sl.axis, sl.ranges,
+                     nullptr, stage);
+        if (stage.empty()) return nullptr;
+        void* d = nullptr;
+        if (cudaMalloc(&d, stage.size()) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, stage.data(), stage.size(), cudaMemcpyHostToDevice);
+        return d;
+    };
+
+    // keep_native's slice twin: the same three-way routing (NVFP4 native
+    // payload / FP8 native payload / Q4_K requant of the reduced dequant), the
+    // owned bytes only. gdn_keep_nvfp4 is honored exactly as the whole path's
+    // keep_nvfp4_native does.
+    auto ct_keep_native_slice = [&](const std::string& prefix, int rows, int cols,
+                                    const TpSlice& sl, int& qtype,
+                                    const void** fp4, const void** fp4_sf, float* fp4_alpha)
+        -> const void* {
+        NvFp4Src probe{};
+        if (nvfp4_src(prefix, rows, cols, probe)) {
+            if (!gdn_keep_nvfp4) {
+                void* bf = ct_dequant_slice(prefix, rows, cols, sl);
+                return requant_q4k(bf, tp_owned_rc(rows, cols, sl), qtype);
+            }
+            return ct_nvfp4_slice(prefix, rows, cols, sl, /*always_own=*/true,
+                                   gdn_prefill_fp4, fp4, fp4_sf, fp4_alpha);
+        }
+        const STTensor* w = st.tensor(prefix + ".weight");
+        if (w && w->dtype == STDType::F8_E4M3) return ct_fp8_slice(prefix, rows, cols, sl, qtype);
+        void* bf = ct_dequant_slice(prefix, rows, cols, sl);
+        return requant_q4k(bf, tp_owned_rc(rows, cols, sl), qtype);
+    };
+
     // embed_tokens: HF embedding tables are already [vocab,hidden] (not a Linear layer), no
     // transpose needed -- matches load_gguf()'s own dense("token_embd.weight", false).
-    s.w.embed_tokens = plain_bf16("model.language_model.embed_tokens.weight", (long)c.vocab * H);
-    s.w.final_norm = load_norm_plus1("model.language_model.norm.weight", H);
+    // The rank's owned window is a failure only when this rank owns the name (a Skip is
+    // expected to stay null); at tp=1 tp_decide is Whole for everything, so this is the
+    // plain "missing" check the loader always had.
+    auto tp_missing = [&](const std::string& nm, const void* p) {
+        return !p && tp_decide(nm, tp_rank, nullptr) != TpDec::Skip;
+    };
+
+    s.w.embed_tokens = tp_pick("model.language_model.embed_tokens.weight",
+        [&]{ return plain_bf16("model.language_model.embed_tokens.weight", (long)c.vocab * H); },
+        [&](const TpSlice& sl) {
+            return ct_bf16_slice("model.language_model.embed_tokens.weight", c.vocab, H, false,
+                                 sl, nullptr);
+        });
+    s.w.final_norm = tp_pick("model.language_model.norm.weight",
+        [&]{ return load_norm_plus1("model.language_model.norm.weight", H); },
+        [&](const TpSlice& sl) {
+            return ct_bf16_slice("model.language_model.norm.weight", H, 1, false, sl,
+                                  &xform_norm_plus1);
+        });
     // lm_head: FP8 in the compressed-tensors checkpoint, plain bf16 in the ModelOpt one (which
     // lists it under quantization_config.ignore). Either way it ends up Q4_K, as in load_gguf().
-    s.w.lm_head = requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
-                              s.w.lm_head_type);
-    if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
+    // Split on the vocab (row) axis: the Q4_K requant runs over this rank's [vocab', H] window.
+    s.w.lm_head = tp_pick("lm_head",
+        [&]{ return requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
+                                  s.w.lm_head_type); },
+        [&](const TpSlice& sl) {
+            void* bf = ct_dequant_slice("lm_head", c.vocab, H, sl);
+            return requant_q4k(bf, tp_owned_rc(c.vocab, H, sl), s.w.lm_head_type);
+        });
+    if (tp_missing("model.language_model.embed_tokens.weight", s.w.embed_tokens) ||
+        tp_missing("model.language_model.norm.weight", s.w.final_norm) ||
+        tp_missing("lm_head", s.w.lm_head))
+        return false;
     // ...and, when the checkpoint ships the head as NVFP4, keep its own bytes as well, in the
     // block-scaled GEMM's operand layout. Every other big tensor already went this way (the FFN
     // and, since the attention block above, q/k/v/o); the head was the last one still served only
@@ -8254,10 +9033,18 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         return !(e && e[0] == '0');
     }();
     if (head_fp4_on) {
-        NvFp4Src head_probe{};
-        if (nvfp4_src("lm_head", c.vocab, H, head_probe)) {
-            const size_t need = (size_t)c.vocab * H * 5 / 8 +                    // payload
-                                kernels::prefill_nvfp4_scale_bytes_b(c.vocab, H); // SFB copy
+        TpSlice head_sl{};
+        const TpDec head_dec = tp_decide("lm_head", tp_rank, &head_sl);
+        // The rank's owned vocab window (the full vocab at tp=1 / whole). A Skip is not
+        // expected (the head splits on every rank that owns any of it) but is tolerated.
+        const long head_rows =
+            (head_dec == TpDec::Slice && head_sl.axis == tp::Axis::Rows)
+                ? tp_owned_count(head_sl) : c.vocab;
+        if (head_dec != TpDec::Skip) {
+            NvFp4Src head_probe{};
+            if (nvfp4_src("lm_head", c.vocab, H, head_probe)) {
+            const size_t need = (size_t)head_rows * H * 5 / 8 +                   // payload
+                                kernels::prefill_nvfp4_scale_bytes_b((int)head_rows, H); // SFB copy
             static const size_t reserve_mb = [] {
                 const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_RESERVE_MB");
                 const long v = e ? atol(e) : 3072;
@@ -8267,8 +9054,13 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             cudaMemGetInfo(&hfree, &htotal);
             if (hfree > need + reserve_mb * 1024ull * 1024ull) {
                 const size_t owned_before = s.owned.size();
-                keep_nvfp4("lm_head", c.vocab, H, &s.w.lm_head_fp4, &s.w.lm_head_fp4_sf,
-                           s.w.lm_head_fp4_alpha);
+                if (head_dec == TpDec::Slice)
+                    ct_nvfp4_slice("lm_head", c.vocab, H, head_sl, /*always_own=*/false, true,
+                                   &s.w.lm_head_fp4, &s.w.lm_head_fp4_sf,
+                                   &s.w.lm_head_fp4_alpha);
+                else
+                    keep_nvfp4("lm_head", c.vocab, H, &s.w.lm_head_fp4, &s.w.lm_head_fp4_sf,
+                               s.w.lm_head_fp4_alpha);
                 // Take the two buffers OUT of s.owned and hold them here instead. They are the
                 // only weights in this model that can be given back at runtime (see
                 // release_lm_head_fp4), and s.owned is freed wholesale at teardown -- an entry
@@ -8286,6 +9078,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                 fprintf(stderr, "[compressed-tensors] NVFP4 lm_head kept for wide packed decode "
                         "(%.2f GB)\n", need / 1073741824.0);
         }
+        }
     }
 
     s.w.layers.resize(c.n_layers);
@@ -8301,13 +9094,35 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             const std::string lb = b + "linear_attn.";
             // Native checkpoint format, whichever it is (FP8 or NVFP4) -- not a second Q4_K/Q8_0
             // fit: same bf16 rounding as keep_bf16, half the GDN traffic. See keep_native above.
-            w.wqkv = keep_native(lb + "in_proj_qkv", s.linear_qkvdim, H, w.wqkv_type,
-                                 &w.gdn_qkv_fp4, &w.gdn_qkv_fp4_sf, &w.gdn_qkv_fp4_alpha);
-            w.wqkv_gate = keep_native(lb + "in_proj_z", c.linear_v_heads * c.linear_head_dim, H,
-                                      w.wqkv_gate_type,
-                                      &w.gdn_z_fp4, &w.gdn_z_fp4_sf, &w.gdn_z_fp4_alpha);
-            w.ssm_out = keep_native(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type,
-                                    &w.gdn_out_fp4, &w.gdn_out_fp4_sf, &w.gdn_out_fp4_alpha);
+            w.wqkv = tp_pick(lb + "in_proj_qkv",
+                [&]{ return keep_native(lb + "in_proj_qkv", s.linear_qkvdim, H, w.wqkv_type,
+                                        &w.gdn_qkv_fp4, &w.gdn_qkv_fp4_sf,
+                                        &w.gdn_qkv_fp4_alpha); },
+                [&](const TpSlice& sl) {
+                    return ct_keep_native_slice(lb + "in_proj_qkv", s.linear_qkvdim, H, sl,
+                                                w.wqkv_type, &w.gdn_qkv_fp4, &w.gdn_qkv_fp4_sf,
+                                                &w.gdn_qkv_fp4_alpha);
+                });
+            w.wqkv_gate = tp_pick(lb + "in_proj_z",
+                [&]{ return keep_native(lb + "in_proj_z",
+                                          c.linear_v_heads * c.linear_head_dim, H,
+                                          w.wqkv_gate_type,
+                                          &w.gdn_z_fp4, &w.gdn_z_fp4_sf, &w.gdn_z_fp4_alpha); },
+                [&](const TpSlice& sl) {
+                    return ct_keep_native_slice(lb + "in_proj_z",
+                                                c.linear_v_heads * c.linear_head_dim, H, sl,
+                                                w.wqkv_gate_type, &w.gdn_z_fp4, &w.gdn_z_fp4_sf,
+                                                &w.gdn_z_fp4_alpha);
+                });
+            w.ssm_out = tp_pick(lb + "out_proj",
+                [&]{ return keep_native(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type,
+                                         &w.gdn_out_fp4, &w.gdn_out_fp4_sf,
+                                         &w.gdn_out_fp4_alpha); },
+                [&](const TpSlice& sl) {
+                    return ct_keep_native_slice(lb + "out_proj", H, s.linear_vdim, sl,
+                                                w.ssm_out_type, &w.gdn_out_fp4, &w.gdn_out_fp4_sf,
+                                                &w.gdn_out_fp4_alpha);
+                });
             // Small, checkpoint-unquantized tensors -- plain bf16, NO transpose. conv1d's raw HF
             // layout [qkvdim,1,conv_kernel] (=[qkvdim,conv_kernel] squeezed) already matches
             // conv_split_kernel's own indexing (conv_w[d*conv_kernel+t], d=channel, t=tap) --
@@ -8320,14 +9135,53 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             // 10.8/3.2 in this runtime vs. 108.6/79.7 in the reference trace, and neither tensor
             // goes through conv at all, ruling out the conv1d weight as their cause and pointing
             // straight at their own [out,in]-vs-[in,out] mismatch.
-            w.ssm_dt = plain_bf16(lb + "dt_bias", c.linear_v_heads);
-            w.ssm_a = load_a_log_transformed(lb + "A_log", c.linear_v_heads);
-            w.ssm_norm = plain_bf16(lb + "norm.weight", c.linear_head_dim);
-            w.ssm_conv = plain_bf16(lb + "conv1d.weight", (long)s.linear_qkvdim * c.linear_conv_kernel);
-            w.ssm_alpha = plain_bf16(lb + "in_proj_a.weight", (long)c.linear_v_heads * H);
-            w.ssm_beta = plain_bf16(lb + "in_proj_b.weight", (long)c.linear_v_heads * H);
-            if (!w.wqkv || !w.wqkv_gate || !w.ssm_out || !w.ssm_dt || !w.ssm_a || !w.ssm_norm ||
-                !w.ssm_conv || !w.ssm_alpha || !w.ssm_beta) {
+            w.ssm_dt = tp_pick(lb + "dt_bias",
+                [&]{ return plain_bf16(lb + "dt_bias", c.linear_v_heads); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(lb + "dt_bias", c.linear_v_heads, 1, false, sl,
+                                         nullptr);
+                });
+            w.ssm_a = tp_pick(lb + "A_log",
+                [&]{ return load_a_log_transformed(lb + "A_log", c.linear_v_heads); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(lb + "A_log", c.linear_v_heads, 1, false, sl,
+                                         &xform_a_log);
+                });
+            w.ssm_norm = tp_pick(lb + "norm.weight",
+                [&]{ return plain_bf16(lb + "norm.weight", c.linear_head_dim); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(lb + "norm.weight", c.linear_head_dim, 1, false, sl,
+                                         nullptr);
+                });
+            // conv1d [qkvdim, kernel]: the same three q|k|v channel windows as in_proj_qkv
+            // (both land on the HF slow axis), contiguous per section.
+            w.ssm_conv = tp_pick(lb + "conv1d.weight",
+                [&]{ return plain_bf16(lb + "conv1d.weight",
+                                         (long)s.linear_qkvdim * c.linear_conv_kernel); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(lb + "conv1d.weight", s.linear_qkvdim,
+                                         c.linear_conv_kernel, false, sl, nullptr);
+                });
+            w.ssm_alpha = tp_pick(lb + "in_proj_a.weight",
+                [&]{ return plain_bf16(lb + "in_proj_a.weight", (long)c.linear_v_heads * H); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(lb + "in_proj_a.weight", c.linear_v_heads, H, false, sl,
+                                         nullptr);
+                });
+            w.ssm_beta = tp_pick(lb + "in_proj_b.weight",
+                [&]{ return plain_bf16(lb + "in_proj_b.weight", (long)c.linear_v_heads * H); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(lb + "in_proj_b.weight", c.linear_v_heads, H, false, sl,
+                                         nullptr);
+                });
+            if (tp_missing(lb + "in_proj_qkv", w.wqkv) ||
+                tp_missing(lb + "in_proj_z", w.wqkv_gate) ||
+                tp_missing(lb + "out_proj", w.ssm_out) ||
+                tp_missing(lb + "dt_bias", w.ssm_dt) || tp_missing(lb + "A_log", w.ssm_a) ||
+                tp_missing(lb + "norm.weight", w.ssm_norm) ||
+                tp_missing(lb + "conv1d.weight", w.ssm_conv) ||
+                tp_missing(lb + "in_proj_a.weight", w.ssm_alpha) ||
+                tp_missing(lb + "in_proj_b.weight", w.ssm_beta)) {
                 fprintf(stderr, "[compressed-tensors] layer %d: linear-attn weights missing\n", i);
                 return false;
             }
@@ -8363,13 +9217,58 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                     return keep_native(ab + nm, rows, cols, qt, fp4, fp4_sf, alpha);
                 return requant_q4k(dequant_any(ab + nm, rows, cols), (long)rows * cols, qt);
             };
-            w.wq = attn_w("q_proj", q_out,   H,       w.wq_type, &w.wq_fp4, &w.wq_fp4_sf, &w.wq_fp4_alpha);
-            w.wk = attn_w("k_proj", s.kvdim, H,       w.wk_type, &w.wk_fp4, &w.wk_fp4_sf, &w.wk_fp4_alpha);
-            w.wv = attn_w("v_proj", s.kvdim, H,       w.wv_type, &w.wv_fp4, &w.wv_fp4_sf, &w.wv_fp4_alpha);
-            w.wo = attn_w("o_proj", H,       s.qdim,  w.wo_type, &w.wo_fp4, &w.wo_fp4_sf, &w.wo_fp4_alpha);
-            w.q_norm = load_norm_plus1(ab + "q_norm.weight", c.head_dim);
-            w.k_norm = load_norm_plus1(ab + "k_norm.weight", c.head_dim);
-            if (!w.wq || !w.wk || !w.wv || !w.wo || !w.q_norm || !w.k_norm) {
+            // attn_w's slice twin: same three-way routing (native when the
+            // checkpoint ships NVFP4 AND the knob allows it, Q4_K requant of the
+            // reduced dequant otherwise), owned sub-blocks only.
+            auto attn_w_slice = [&](const std::string& nm, int rows, int cols, int& qt,
+                                    const void** fp4, const void** fp4_sf, float* alpha,
+                                    const TpSlice& sl) -> const void* {
+                NvFp4Src probe{};
+                if (attn_native_fp4 && nvfp4_src(ab + nm, rows, cols, probe))
+                    return ct_keep_native_slice(ab + nm, rows, cols, sl, qt, fp4, fp4_sf, alpha);
+                void* bf = ct_dequant_slice(ab + nm, rows, cols, sl);
+                return requant_q4k(bf, tp_owned_rc(rows, cols, sl), qt);
+            };
+            w.wq = tp_pick(ab + "q_proj",
+                [&]{ return attn_w("q_proj", q_out, H, w.wq_type,
+                                    &w.wq_fp4, &w.wq_fp4_sf, &w.wq_fp4_alpha); },
+                [&](const TpSlice& sl) { return attn_w_slice("q_proj", q_out, H, w.wq_type,
+                                                               &w.wq_fp4, &w.wq_fp4_sf,
+                                                               &w.wq_fp4_alpha, sl); });
+            w.wk = tp_pick(ab + "k_proj",
+                [&]{ return attn_w("k_proj", s.kvdim, H, w.wk_type,
+                                    &w.wk_fp4, &w.wk_fp4_sf, &w.wk_fp4_alpha); },
+                [&](const TpSlice& sl) { return attn_w_slice("k_proj", s.kvdim, H, w.wk_type,
+                                                               &w.wk_fp4, &w.wk_fp4_sf,
+                                                               &w.wk_fp4_alpha, sl); });
+            w.wv = tp_pick(ab + "v_proj",
+                [&]{ return attn_w("v_proj", s.kvdim, H, w.wv_type,
+                                    &w.wv_fp4, &w.wv_fp4_sf, &w.wv_fp4_alpha); },
+                [&](const TpSlice& sl) { return attn_w_slice("v_proj", s.kvdim, H, w.wv_type,
+                                                               &w.wv_fp4, &w.wv_fp4_sf,
+                                                               &w.wv_fp4_alpha, sl); });
+            w.wo = tp_pick(ab + "o_proj",
+                [&]{ return attn_w("o_proj", H, s.qdim, w.wo_type,
+                                    &w.wo_fp4, &w.wo_fp4_sf, &w.wo_fp4_alpha); },
+                [&](const TpSlice& sl) { return attn_w_slice("o_proj", H, s.qdim, w.wo_type,
+                                                               &w.wo_fp4, &w.wo_fp4_sf,
+                                                               &w.wo_fp4_alpha, sl); });
+            w.q_norm = tp_pick(ab + "q_norm.weight",
+                [&]{ return load_norm_plus1(ab + "q_norm.weight", c.head_dim); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(ab + "q_norm.weight", c.head_dim, 1, false, sl,
+                                         &xform_norm_plus1);
+                });
+            w.k_norm = tp_pick(ab + "k_norm.weight",
+                [&]{ return load_norm_plus1(ab + "k_norm.weight", c.head_dim); },
+                [&](const TpSlice& sl) {
+                    return ct_bf16_slice(ab + "k_norm.weight", c.head_dim, 1, false, sl,
+                                         &xform_norm_plus1);
+                });
+            if (tp_missing(ab + "q_proj", w.wq) || tp_missing(ab + "k_proj", w.wk) ||
+                tp_missing(ab + "v_proj", w.wv) || tp_missing(ab + "o_proj", w.wo) ||
+                tp_missing(ab + "q_norm.weight", w.q_norm) ||
+                tp_missing(ab + "k_norm.weight", w.k_norm)) {
                 fprintf(stderr, "[compressed-tensors] layer %d: attention weights missing\n", i);
                 return false;
             }
@@ -8377,19 +9276,64 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
 
         const std::string mb = b + "mlp.";
         if (!ffn_is_nvfp4(mb)) {
-            w.gate_q = requant_q4k(dequant_any(mb + "gate_proj", c.moe_ffn, H),
-                                   (long)c.moe_ffn * H, w.gate_qtype);
-            w.up_q = requant_q4k(dequant_any(mb + "up_proj", c.moe_ffn, H),
-                                 (long)c.moe_ffn * H, w.up_qtype);
-            w.down_q = requant_q4k(dequant_any(mb + "down_proj", H, c.moe_ffn),
-                                   (long)H * c.moe_ffn, w.down_qtype);
+            w.gate_q = tp_pick(mb + "gate_proj",
+                [&]{ return requant_q4k(dequant_any(mb + "gate_proj", c.moe_ffn, H),
+                                         (long)c.moe_ffn * H, w.gate_qtype); },
+                [&](const TpSlice& sl) {
+                    void* bf = ct_dequant_slice(mb + "gate_proj", c.moe_ffn, H, sl);
+                    return requant_q4k(bf, tp_owned_rc(c.moe_ffn, H, sl), w.gate_qtype);
+                });
+            w.up_q = tp_pick(mb + "up_proj",
+                [&]{ return requant_q4k(dequant_any(mb + "up_proj", c.moe_ffn, H),
+                                         (long)c.moe_ffn * H, w.up_qtype); },
+                [&](const TpSlice& sl) {
+                    void* bf = ct_dequant_slice(mb + "up_proj", c.moe_ffn, H, sl);
+                    return requant_q4k(bf, tp_owned_rc(c.moe_ffn, H, sl), w.up_qtype);
+                });
+            w.down_q = tp_pick(mb + "down_proj",
+                [&]{ return requant_q4k(dequant_any(mb + "down_proj", H, c.moe_ffn),
+                                         (long)H * c.moe_ffn, w.down_qtype); },
+                [&](const TpSlice& sl) {
+                    void* bf = ct_dequant_slice(mb + "down_proj", H, c.moe_ffn, sl);
+                    return requant_q4k(bf, tp_owned_rc(H, c.moe_ffn, sl), w.down_qtype);
+                });
         } else {
-            const void* g_pay = keep_nvfp4(mb + "gate_proj", c.moe_ffn, H,
-                                           &w.gate_fp4, &w.gate_fp4_sf, w.gate_fp4_alpha);
-            const void* u_pay = keep_nvfp4(mb + "up_proj", c.moe_ffn, H,
-                                           &w.up_fp4, &w.up_fp4_sf, w.up_fp4_alpha);
-            const void* d_pay = keep_nvfp4(mb + "down_proj", H, c.moe_ffn,
-                                           &w.down_fp4, &w.down_fp4_sf, w.down_fp4_alpha);
+            // NVFP4 FFN: the whole path keeps the checkpoint payload; the slice path
+            // gathers this rank's sub-block of each stream and rebuilds the same
+            // payload shape (same ownership policy -- the caller below frees it
+            // when no SFB was built, exactly as in the whole path).
+            auto keep_ffn = [&](const std::string& nm, int rows, int cols,
+                                const void** fp4, const void** fp4_sf, float* alpha) {
+                TpSlice sl;
+                switch (tp_decide(nm, tp_rank, &sl)) {
+                    case TpDec::Skip:
+                        return (const void*)nullptr;
+                    case TpDec::Whole:
+                        return keep_nvfp4(nm, rows, cols, fp4, fp4_sf, *alpha);
+                    default:
+                        return ct_nvfp4_slice(nm, rows, cols, sl, /*always_own=*/false, true,
+                                               fp4, fp4_sf, alpha);
+                }
+            };
+            auto q4k_from = [&](const std::string& nm, const void* pay, int rows, int cols,
+                                 int& qt) {
+                TpSlice sl;
+                if (tp_decide(nm, tp_rank, &sl) == TpDec::Slice) {
+                    const long o = tp_owned_count(sl);
+                    if (sl.axis == tp::Axis::Cols) return q4k_from_nvfp4(pay, rows, (int)o, qt);
+                    return q4k_from_nvfp4(pay, (int)o, cols, qt);
+                }
+                return q4k_from_nvfp4(pay, rows, cols, qt);
+            };
+            const void* g_pay =
+                keep_ffn(mb + "gate_proj", c.moe_ffn, H, &w.gate_fp4, &w.gate_fp4_sf,
+                         &w.gate_fp4_alpha);
+            const void* u_pay =
+                keep_ffn(mb + "up_proj", c.moe_ffn, H, &w.up_fp4, &w.up_fp4_sf,
+                         &w.up_fp4_alpha);
+            const void* d_pay =
+                keep_ffn(mb + "down_proj", H, c.moe_ffn, &w.down_fp4, &w.down_fp4_sf,
+                         &w.down_fp4_alpha);
             // The default path keeps the checkpoint's own payloads for DECODE, so
             // the FFN runs the numerics the checkpoint actually ships instead of a Q4_K
             // requantization of them (8.25% mean relative weight error -- see qwen35.h).
@@ -8401,9 +9345,9 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             if (kDecodeNvfp4) {
                 w.gate_nv = g_pay; w.up_nv = u_pay; w.down_nv = d_pay;
             } else {
-                w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
-                w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
-                w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
+                w.gate_q = q4k_from(mb + "gate_proj", g_pay, c.moe_ffn, H, w.gate_qtype);
+                w.up_q = q4k_from(mb + "up_proj", u_pay, c.moe_ffn, H, w.up_qtype);
+                w.down_q = q4k_from(mb + "down_proj", d_pay, H, c.moe_ffn, w.down_qtype);
             }
             if (!kDecodeNvfp4 && !w.gate_fp4) {
                 // Prefill copies disabled: the payloads were deliberately not registered in
@@ -8440,7 +9384,14 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         const int q_out = c.hybrid ? qd * 2 : qd;
         const int kd = c.n_kv_heads * c.head_dim;
         const int ff = c.moe_ffn;
-        const size_t per_layer = (size_t)q_out + (size_t)kd * 2 + (size_t)H + (size_t)ff * 2 + (size_t)H;
+        // This rank's owned extents per layer (the table's windows are rank-level, so every
+        // layer reserves the same reduced sizes; the FULL extents at tp=1, where the table is
+        // degenerate and the total is the pre-TP one to the float).
+        long qo = q_out, kvo = kd, ffo = ff, hdims;
+        tp_owned_dims("model.language_model.layers.0.self_attn.q_proj", tp_rank, q_out, H, qo, hdims);
+        tp_owned_dims("model.language_model.layers.0.self_attn.k_proj", tp_rank, kd, H, kvo, hdims);
+        tp_owned_dims("model.language_model.layers.0.mlp.gate_proj", tp_rank, ff, H, ffo, hdims);
+        const size_t per_layer = (size_t)qo + (size_t)kvo * 2 + (size_t)H + (size_t)ffo * 2 + (size_t)H;
         const size_t total = per_layer * (size_t)c.n_layers;
         const size_t tmp_bytes = 64u << 20;
         signed char* tmp = nullptr;

@@ -190,3 +190,17 @@ add_test(NAME kv_split_cpu_test COMMAND kv_split_cpu_test)
 add_executable(gdn_split_cpu_test gdn_split_cpu_test.cpp)
 target_link_libraries(gdn_split_cpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME gdn_split_cpu_test COMMAND gdn_split_cpu_test)
+
+# WP-6 (CHG-0011, subagent H): the weight loaders consuming the process tp table -- the 27B
+# Gguf per-tensor-class placements (3-range GDN qkv/conv, Cols/Rows/OneD, per-rank whole norms,
+# visual/unknown fallbacks), the per-rank on-disk budget with the D5 per-card audit lines
+# (131k fits, 262k exceeds, vs a 16 GiB card), the tp=1 degenerate invariance (pure C++, always
+# run), plus ONE skip-guarded 2-device one-shot: a tiny hybrid Flat model loaded by two
+# Qwen35Model instances on two cards -- per-rank allocated bytes vs the table's gather
+# arithmetic, values spot-checked against the file bytes the ranges select, print_tp_audit on
+# both, and a tp=1 FNV-1a byte-identity read-back (skips by design on boxes that cannot hold
+# two contexts, e.g. with an LLM resident).
+add_executable(tp_weights_cpu_test tp_weights_cpu_test.cpp)
+set_target_properties(tp_weights_cpu_test PROPERTIES CXX_STANDARD 17)
+target_link_libraries(tp_weights_cpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME tp_weights_cpu_test COMMAND tp_weights_cpu_test)
