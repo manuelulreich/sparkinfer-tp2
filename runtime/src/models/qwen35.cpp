@@ -864,13 +864,31 @@ struct Qwen35Model::Impl {
     bf16* dflash_context = nullptr;   // [ctx_cap, n_cap * H]
     float* spec_lin_snap = nullptr;
     bf16* spec_conv_snap = nullptr;
+    // GDN v-head state window (dual-GPU state split, see GdnStateWindow): (0,0) = all heads =
+    // the unsplit, byte-identical tp=1 model.
+    GdnStateWindow gdn_window{};
+    // Full-layout GDN state round-trip arena [slots][v_full][HD][HD] for the prefill scan and the
+    // dflash verify/commit paths, which only have full-v kernels: they inject the windowed
+    // per-slot region into it, run, and extract it back. Allocated only when a window is set;
+    // the degenerate window uses the dense arenas directly, the way the code did before.
+    float* gdn_scratch = nullptr;
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
 
-Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine)
+Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine,
+                         GdnStateWindow gdn_window)
     : p_(new Impl()) {
     p_->cfg = cfg; p_->kv = kv; p_->engine = engine;
+    // Normalize this instance's GDN v-head state window (dual-GPU state split). A degenerate
+    // request (or tp=1) stays degenerate: every allocation below then sizes the full state,
+    // byte-identical to the unsplit model.
+    bool gdn_warned = false;
+    p_->gdn_window = gdn_window_normalize(cfg, gdn_window, &gdn_warned);
+    if (gdn_warned)
+        fprintf(stderr, "[gdn-split] requested state window (v_start=%d, v_count=%d) is not "
+                        "expressible by this model's GDN qh mapping; using all %d heads\n",
+                gdn_window.v_start, gdn_window.v_count, cfg.linear_v_heads);
     // Flash-decode KV-split count is occupancy tuning only (math is identical for any
     // value — empty splits contribute zero), and it's baked into the decode CUDA graph
     // at construction. 16 over-subscribes the GPU for short context (32 q_heads * 16 =
@@ -928,7 +946,22 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->lin_gdn=p_->alloc<bf16>(p_->linear_vdim);
         p_->lin_norm=p_->alloc<bf16>(p_->linear_vdim);
         p_->lin_conv_state=p_->alloc<bf16>((size_t)cfg.n_layers * (cfg.linear_conv_kernel - 1) * p_->linear_qkvdim);
-        p_->lin_state=p_->alloc<float>((size_t)gdn_state_slots(cfg) * cfg.linear_v_heads * cfg.linear_head_dim * cfg.linear_head_dim);
+        // Dense per-v-head arena: a split instance keeps only its own v_count heads per slot.
+        // Conv state stays FULL on every device -- its rows are shared q/k/v channels, not
+        // v-head blocks -- so the split saves the lin_state bytes (72.0 of the 147.75 MiB/seq
+        // on the 27B) and not the conv bytes.
+        const int gdn_vloc = p_->gdn_window.v_count > 0 ? p_->gdn_window.v_count : cfg.linear_v_heads;
+        p_->lin_state=p_->alloc<float>((size_t)gdn_state_slots(cfg) * gdn_vloc * cfg.linear_head_dim * cfg.linear_head_dim);
+        if (p_->gdn_window.v_count > 0) {
+            // One shared full-layout round-trip arena for the GDN paths that only have full-v
+            // kernels (prefill scan, dflash verify/commit). Zeroed once here at allocation; the
+            // v-head blocks OUTSIDE the window may then keep whatever deterministic garbage the
+            // kernels leave in them, because the GDN recurrence is block-diagonal in v-head --
+            // no windowed head's [HD][HD] block is ever touched by a non-windowed head.
+            const size_t scratch_n = (size_t)gdn_state_slots(cfg) * cfg.linear_v_heads * cfg.linear_head_dim * cfg.linear_head_dim;
+            p_->gdn_scratch=p_->alloc<float>(scratch_n);
+            cu(cudaMemsetAsync(p_->gdn_scratch, 0, scratch_n * sizeof(float), p_->stream), "gdn_scratch zero");
+        }
         p_->shared_gate_tmp=p_->alloc<bf16>(1);
     }
     p_->logits=p_->alloc<float>(cfg.vocab);
@@ -1186,6 +1219,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->lin_qkv); cudaFree(p_->lin_q); cudaFree(p_->lin_k); cudaFree(p_->lin_v);
     cudaFree(p_->lin_z); cudaFree(p_->lin_alpha); cudaFree(p_->lin_beta);
     cudaFree(p_->lin_gdn); cudaFree(p_->lin_norm); cudaFree(p_->lin_conv_state); cudaFree(p_->lin_state);
+    cudaFree(p_->gdn_scratch);
     cudaFree(p_->shared_gate_tmp);
     cudaFree(p_->nvfp4_g); cudaFree(p_->nvfp4_u); cudaFree(p_->nvfp4_h);
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
@@ -1235,6 +1269,10 @@ Qwen35Model::~Qwen35Model() {
 
 void Qwen35Model::set_weights(const Qwen35Weights& w) { p_->w = w; }
 const Qwen35Config& Qwen35Model::config() const { return p_->cfg; }
+const GdnStateWindow& Qwen35Model::gdn_state_window() const { return p_->gdn_window; }
+int Qwen35Model::gdn_v_local() const {
+    return p_->gdn_window.v_count > 0 ? p_->gdn_window.v_count : p_->cfg.linear_v_heads;
+}
 
 void Qwen35Model::copy_logits(float* host_logits) const {
     // p_->logits holds the last step's lm-head output; forward_token() syncs the
@@ -1691,7 +1729,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // the pointers for the same reason; match it, so this is also safe if the alloc ever fails.
     if (c.hybrid && position == 0 && s.lin_state && s.lin_conv_state) {
         cu(cudaMemsetAsync(s.lin_state, 0,
-                           (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim * sizeof(float), st),
+                           (size_t)gdn_state_slots(c) * gdn_v_local() * c.linear_head_dim * c.linear_head_dim * sizeof(float), st),
            "linear state reset");
         cu(cudaMemsetAsync(s.lin_conv_state, 0,
                            (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim * sizeof(bf16), st),
@@ -2065,15 +2103,34 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // compacted state it counts bf16 elements, and only the kernel knows that. Folding it
             // in here is what made every GDN layer past the first read its slot at twice the right
             // byte offset the moment a session had been through decode_packed.
-            const size_t state_off = (size_t)gdn_state_slot(c, L) * c.linear_v_heads *
-                                     c.linear_head_dim * c.linear_head_dim;
+            //
+            // GDN v-head window (dual-GPU state split): this instance owns v-heads
+            // [gdn_v0, gdn_v0 + gdn_vloc), so the state slot is vloc*HD^2 and every per-v-head
+            // operand is read at its GLOBAL offset. The fast AR kernel is block-diagonal in the
+            // v-head, so this is a pure call-site windowing: shift the q/k/v/alpha/beta/dt/a/out
+            // bases, pass the local counts, launch. (0,0) window: zero shifts, full counts, the
+            // exact launch arguments of the unsplit model.
+            const int gdn_vloc = gdn_v_local();
+            const int gdn_v0 = p_->gdn_window.v_count > 0 ? p_->gdn_window.v_start : 0;
+            const int gdn_g = c.linear_v_heads / c.linear_q_heads;  // v-heads per q-head group
+            // q/k are read through the shared q-head: block mode maps global v-head h to q-head
+            // h/g, so the bases move by (v0/g) groups; cyclic mode only admits a leading window
+            // (v0 == 0), where the bases do not move at all.
+            const int gdn_qshift = c.gdn_qh_block ? (gdn_v0 / gdn_g) * c.linear_head_dim : 0;
+            const size_t state_off = (size_t)gdn_state_slot(c, L) * gdn_vloc *
+                                      c.linear_head_dim * c.linear_head_dim;
             // The compacted-state flag belongs to the ACTIVE session: a packed batch that declines
             // (a tail chunk of one row) falls back to this path for rows whose state has already
             // been converted, so the two must agree on the representation.
-            kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v,
-                                          s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
-                                          s.lin_state, state_off, s.lin_gdn,
-                                          c.linear_q_heads, c.linear_v_heads,
+            kernels::launch_qwen36_gdn_ar(s.lin_q + gdn_qshift, s.lin_k + gdn_qshift,
+                                          s.lin_v + gdn_v0 * c.linear_head_dim,
+                                          s.lin_alpha + gdn_v0, s.lin_beta + gdn_v0,
+                                          w.ssm_dt + gdn_v0, w.ssm_a + gdn_v0,
+                                          s.lin_state, state_off, s.lin_gdn + gdn_v0 * c.linear_head_dim,
+                                          p_->gdn_window.v_count > 0
+                                              ? (c.gdn_qh_block ? gdn_vloc / gdn_g : gdn_vloc)
+                                              : c.linear_q_heads,
+                                          gdn_vloc,
                                           c.linear_head_dim, c.gdn_qh_block, st,
                                           s.active_lin_state_b16);
             if (gdn_pipelined && !gdn_fused_proj) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
@@ -3463,7 +3520,7 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
     // replays this; without it the hybrid layers would resume from whatever the last request
     // left behind, which is wrong output rather than a crash.
     if (s.cfg.hybrid && s.lin_state && s.lin_conv_state) {
-        const size_t st_n = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+        const size_t st_n = (size_t)gdn_state_slots(s.cfg) * gdn_v_local() *
                             s.cfg.linear_head_dim * s.cfg.linear_head_dim;
         const size_t cv_n = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
                             s.linear_qkvdim;
@@ -3493,7 +3550,7 @@ bool Qwen35Model::restore_prefix_state() {
     if (!s.cfg.hybrid) return true;            // nothing recurrent to restore
     if (!s.prefix_lin_state || !s.prefix_lin_conv_state) return false;
     if (!s.lin_state || !s.lin_conv_state) return false;
-    const size_t st_n = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+    const size_t st_n = (size_t)gdn_state_slots(s.cfg) * gdn_v_local() *
                         s.cfg.linear_head_dim * s.cfg.linear_head_dim;
     const size_t cv_n = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
     cu(cudaMemcpyAsync(s.lin_state, s.prefix_lin_state, st_n * sizeof(float),
@@ -3701,6 +3758,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.d_vision_emb, s.d_vision_pos, s.vision_n,
                           // MRoPE rotary positions, null unless set_pending_mrope ran for this prompt.
                           s.d_mrope_pos };
+    ctx.gdn_window = s.gdn_window;
+    ctx.gdn_scratch = s.gdn_scratch;
     // The Bonsai decode shadow's VRAM is decode-only -- this pass reads the folded Q4_K weights
     // either way -- so on a scratch-alloc failure it is pure margin to give back and retry once.
     // #1154 was rejected for exactly the failure this skips: at a long --ctx the KV pool leaves
@@ -3817,6 +3876,8 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
+    ctx.gdn_window = s.gdn_window;
+    ctx.gdn_scratch = s.gdn_scratch;
     ctx.multi_n = n_prompts;
     ctx.multi_off = off.data();
     ctx.multi_len = lens;
@@ -3924,7 +3985,7 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // few hundred MB of headroom. Ask whether the stack has the layers, not whether it has the
         // flag.
         if (needs_linear_state(s.cfg)) {
-            buf.lin_state = s.alloc<float>((size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+            buf.lin_state = s.alloc<float>((size_t)gdn_state_slots(s.cfg) * gdn_v_local() *
                                            s.cfg.linear_head_dim * s.cfg.linear_head_dim);
             buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
                                                (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim);
@@ -4022,7 +4083,7 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
     if (seq_id == 0 || it == s.sessions.end()) return false;
     const SessionBuffers& b = it->second;
     if (!b.lin_state || !b.lin_conv_state || b.lin_state_b16) return false;
-    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * gdn_v_local() * s.cfg.linear_head_dim *
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
                             s.linear_qkvdim * sizeof(bf16);
@@ -4051,7 +4112,7 @@ bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateS
     auto it = s.sessions.find(seq_id);
     if (seq_id == 0 || it == s.sessions.end()) return false;
     SessionBuffers& b = it->second;
-    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * gdn_v_local() * s.cfg.linear_head_dim *
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
                             s.linear_qkvdim * sizeof(bf16);
@@ -4228,7 +4289,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     }();
     bool packed_state_b16 = false;
     if (kGdnStateB16 && needs_linear_state(s.cfg)) {
-        const size_t st_n = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+        const size_t st_n = (size_t)gdn_state_slots(s.cfg) * gdn_v_local() *
                             s.cfg.linear_head_dim * s.cfg.linear_head_dim;
         bool all_b16 = true;
         for (int i = 0; i < n; i++) {
@@ -4277,6 +4338,8 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
+    ctx.gdn_window = s.gdn_window;
+    ctx.gdn_scratch = s.gdn_scratch;
     ctx.packed_pos       = positions;
     ctx.packed_rows      = reinterpret_cast<const int* const*>(s.packed_dev_tables);
     ctx.packed_rows_win  = reinterpret_cast<const int* const*>(s.packed_dev_tables_win);
@@ -4578,7 +4641,7 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
         fprintf(stderr, "[dflash] capture context (%d positions): out of device memory\n", s.dflash_ctx_cap);
     }
     if (s.cfg.hybrid && !s.spec_lin_snap) {
-        const size_t ls = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+        const size_t ls = (size_t)gdn_state_slots(s.cfg) * gdn_v_local() *
                           s.cfg.linear_head_dim * s.cfg.linear_head_dim;
         const size_t cs = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
         s.spec_lin_snap = s.alloc<float>(ls);
@@ -4615,7 +4678,7 @@ void Qwen35Model::save_spec_snapshot() {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     if (!s.spec_lin_snap || !c.hybrid) return;
-    const size_t ls = (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t ls = (size_t)gdn_state_slots(c) * gdn_v_local() * c.linear_head_dim * c.linear_head_dim;
     const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
     cu(cudaMemcpyAsync(s.spec_lin_snap, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
        "spec snap lin");
@@ -4628,7 +4691,7 @@ void Qwen35Model::restore_spec_snapshot() {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     if (!s.spec_lin_snap || !c.hybrid) return;
-    const size_t ls = (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
+    const size_t ls = (size_t)gdn_state_slots(c) * gdn_v_local() * c.linear_head_dim * c.linear_head_dim;
     const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
     cu(cudaMemcpyAsync(s.lin_state, s.spec_lin_snap, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
        "spec restore lin");
@@ -4665,6 +4728,8 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
+    ctx.gdn_window = s.gdn_window;
+    ctx.gdn_scratch = s.gdn_scratch;
     // The recorded token ids and positions are irrelevant: the graph copies them from pinned host
     // buffers at replay, so only the shapes (n, and the pointer keys) have to match the real steps.
     std::vector<int> ids(n, 0);
@@ -4691,6 +4756,8 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
+    ctx.gdn_window = s.gdn_window;
+    ctx.gdn_scratch = s.gdn_scratch;
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
                                                   const_cast<void*>(dflash_capture_dst), out_argmax);

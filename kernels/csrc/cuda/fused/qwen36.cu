@@ -370,14 +370,18 @@ __global__ void gdn_ar_fast_batched_kernel(const __nv_bfloat16* __restrict__ q,
                                            size_t state_off,
                                            __nv_bfloat16* __restrict__ out,
                                            int q_heads, int v_heads, bool qh_block,
-                                           bool state_bf16) {
+                                           bool state_bf16, int v0, int vloc) {
     constexpr int NROW = HEAD_DIM / 32;
     const int vh   = blockIdx.x;
     const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);
     const int b    = blockIdx.z;
     const int lane = threadIdx.x & 31;
-    if (vh >= v_heads || j >= HEAD_DIM) return;
-    const int qh   = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
+    // Windowed state: vh indexes the dense per-device slot, vhg = vh + v0 is the global
+    // v-head used for activations/out only; state-arena indexing below stays local.
+    const int vhl  = vloc > 0 ? vloc : v_heads;
+    if (vh >= vhl || j >= HEAD_DIM) return;
+    const int vhg  = vh + v0;
+    const int qh   = qh_block ? (vhg / (v_heads / q_heads)) : (vhg % q_heads);
     const float scale = rsqrtf((float)HEAD_DIM);
     // Per-row activation strides. dt/a are WEIGHTS (one value per v-head, shared by every row)
     // and are deliberately not strided; alpha/beta are per-token projections and are.
@@ -387,11 +391,12 @@ __global__ void gdn_ar_fast_batched_kernel(const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* vrow = v + (size_t)b * vdim;
     const __nv_bfloat16* arow = alpha + (size_t)b * v_heads;
     const __nv_bfloat16* brow = beta  + (size_t)b * v_heads;
-    const float bb = q36_sigmoid(q36_to_f(brow[vh]));
-    const float g  = __expf(q36_softplus(q36_to_f(arow[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
+    const float bb = q36_sigmoid(q36_to_f(brow[vhg]));
+    const float g  = __expf(q36_softplus(q36_to_f(arow[vhg]) + q36_to_f(dt[vhg])) * q36_to_f(a[vhg]));
     const __nv_bfloat16* qhptr = qrow + (size_t)qh * HEAD_DIM;
     const __nv_bfloat16* khptr = krow + (size_t)qh * HEAD_DIM;
-    const __nv_bfloat16* vhptr = vrow + (size_t)vh * HEAD_DIM;
+    const __nv_bfloat16* vhptr = vrow + (size_t)vhg * HEAD_DIM;
+    // Deliberately local vh: each states[b] points into this device's windowed arena.
     const size_t col_off = state_off + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
     float* col = states[b] + col_off;
     __nv_bfloat16* colb = reinterpret_cast<__nv_bfloat16*>(states[b]) + col_off;
@@ -417,7 +422,7 @@ __global__ void gdn_ar_fast_batched_kernel(const __nv_bfloat16* __restrict__ q,
         part_y += s_new * q36_to_f(qhptr[i]) * scale;
     }
     const float y = q36_wsum(part_y);
-    if (lane == 0) out[(size_t)b * vdim + (size_t)vh * HEAD_DIM + j] = __float2bfloat16(y);
+    if (lane == 0) out[(size_t)b * vdim + (size_t)vhg * HEAD_DIM + j] = __float2bfloat16(y);
 }
 
 // Default GDN path: warp-per-state-column with native [vh][row][col] layout (no transposed
@@ -701,22 +706,24 @@ bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const 
                                   const void* dt_bf16, const void* a_bf16,
                                   float* const* states, size_t state_off, void* out_bf16,
                                   int batch, int q_heads, int v_heads, int head_dim,
-                                  bool qh_block, cudaStream_t stream, bool state_compact_b16) {
+                                  bool qh_block, cudaStream_t stream, bool state_compact_b16,
+                                  int v0, int vloc) {
     if (batch < 1 || head_dim != 128) return false;
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
     }();
-    static int cols = -1;
-    if (cols < 0) {
+    static const int cols_env = [] {
         const char* e = getenv("SPARKINFER_GDN_FAST_COLS");
-        if (e) cols = atoi(e);
-        else cols = (v_heads >= 32) ? 4 : 8;
-        if (!(cols == 4 || cols == 8 || cols == 16)) cols = 8;
-    }
+        if (!e) return 0;
+        const int v = atoi(e);
+        return (v == 4 || v == 8 || v == 16) ? v : 0;
+    }();
     constexpr int HD = 128;
-    const int c = cols;
-    dim3 grid(v_heads, (HD + c - 1) / c, batch);
+    // Windowed launch: vloc v-heads per device starting at global v0; vloc == 0 means unsplit.
+    const int veff = vloc > 0 ? vloc : v_heads;
+    const int c = cols_env > 0 ? cols_env : (veff >= 32 ? 4 : 8);
+    dim3 grid(veff, (HD + c - 1) / c, batch);
 #define SI_GDN_AR_B(C_, B_)                                                                \
     gdn_ar_fast_batched_kernel<C_, HD, B_><<<grid, (C_) * 32, 0, stream>>>(                    \
         reinterpret_cast<const __nv_bfloat16*>(q_bf16),                                    \
@@ -727,7 +734,7 @@ bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const 
         reinterpret_cast<const __nv_bfloat16*>(dt_bf16),                                   \
         reinterpret_cast<const __nv_bfloat16*>(a_bf16),                                    \
         states, state_off, reinterpret_cast<__nv_bfloat16*>(out_bf16),                     \
-        q_heads, v_heads, qh_block, state_bf16)
+        q_heads, v_heads, qh_block, state_bf16, v0, vloc)
 #define SI_GDN_AR_B_SEL(C_)  do { if (state_compact_b16) SI_GDN_AR_B(C_, true); \
                                   else                   SI_GDN_AR_B(C_, false); } while (0)
     if (c == 4)       SI_GDN_AR_B_SEL(4);

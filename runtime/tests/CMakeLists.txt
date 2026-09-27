@@ -179,3 +179,14 @@ add_test(NAME tp_layout_cpu_test COMMAND tp_layout_cpu_test)
 add_executable(kv_split_cpu_test kv_split_cpu_test.cpp)
 target_link_libraries(kv_split_cpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME kv_split_cpu_test COMMAND kv_split_cpu_test)
+
+# WP-8: the GDN `lin_state` per-device window (24/24 v-heads on 27B) -- exact 27B byte figures
+# (144.0 + 3.75 MiB per seq, 72.0 + 3.75 MiB per card, conv FULL per card), the window-normalizer
+# clamp table (27B block + cyclic), the tp=1 invariance, and cross-window restore rejection
+# (pure C++), plus ONE explicit ~16 MiB GPU run: sequential windowed single-AR vs the 8-step full
+# reference (bit-identical), the new batched v0/vloc path incl. the unsplit invariance, and the
+# compacted-bf16 batched path at bf16 tolerance (16v/8q, 1 slot, 8 tokens; skip-guarded, never
+# auto-sized).
+add_executable(gdn_split_cpu_test gdn_split_cpu_test.cpp)
+target_link_libraries(gdn_split_cpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME gdn_split_cpu_test COMMAND gdn_split_cpu_test)

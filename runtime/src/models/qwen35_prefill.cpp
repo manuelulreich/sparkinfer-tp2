@@ -61,6 +61,39 @@ inline void pf_cu(cudaError_t e, const char* what) {
     fprintf(stderr, "[prefill] %s: %s%s\n", what, cudaGetErrorString(e),
             fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
 }
+// GDN v-head window (dual-GPU WP-8): a split model instance keeps only its own v_count of
+// every lin_state slot, so each slot is vloc*HD^2 floats, not v_full*HD^2. v_count == 0 is
+// the degenerate (unsplit) window and every use site below degrades to the historical layout
+// byte-for-byte.
+inline int gdn_vloc(const Qwen35PrefillCtx& s) {
+    return s.gdn_window.v_count > 0 ? s.gdn_window.v_count : s.cfg.linear_v_heads;
+}
+// The prefill scan, the dflash compact-scan and the dflash commit paths only have full-v
+// kernels. A windowed model stages its slot through the model's full-layout gdn_scratch
+// ([slots][v_full][HD][HD], zeroed once at allocation): inject the window, run the kernel on
+// the scratch slot, extract it back. Each direction is ONE contiguous D2D: a slot's vloc
+// v-head blocks are contiguous in both the windowed and the full layout. Non-window v-head
+// blocks in the scratch may hold deterministic garbage (the GDN recurrence is block-diagonal
+// in v-head, so no windowed head's [HD][HD] block is ever read through one) and the full
+// out-of-window attention rows they feed are Wave-3's forward-split problem, not this one's.
+inline bool gdn_via_scratch(const Qwen35PrefillCtx& s) {
+    return s.gdn_window.v_count > 0 && s.gdn_scratch != nullptr;
+}
+inline void gdn_inject(const Qwen35PrefillCtx& s, int slot, const float* arena) {
+    const int HD = s.cfg.linear_head_dim, vloc = gdn_vloc(s);
+    const size_t n = (size_t)vloc * HD * HD;
+    (void)cudaMemcpyAsync(
+        s.gdn_scratch + (size_t)slot * s.cfg.linear_v_heads * HD * HD,
+        arena + (size_t)slot * n, n * sizeof(float), cudaMemcpyDeviceToDevice, s.stream);
+}
+inline void gdn_extract(const Qwen35PrefillCtx& s, int slot, float* arena) {
+    const int HD = s.cfg.linear_head_dim, vloc = gdn_vloc(s);
+    const size_t n = (size_t)vloc * HD * HD;
+    (void)cudaMemcpyAsync(
+        arena + (size_t)slot * n,
+        s.gdn_scratch + (size_t)slot * s.cfg.linear_v_heads * HD * HD, n * sizeof(float),
+        cudaMemcpyDeviceToDevice, s.stream);
+}
 // A model the packed path cannot drive declines on EVERY step, forever -- a ternary Bonsai-2
 // server at concurrency 4 wrote two of these lines per decode token. Each decline site still
 // reports itself in full the first time; only its repeats are dropped. Keyed on the format
@@ -374,7 +407,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         for (int i = 0; i < nseg; ++i) {
             pf_cu(cudaMemsetAsync(
                       s.multi_lin_state[i], 0,
-                      (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim *
+                      // gdn_vloc (not c.linear_v_heads): a windowed arena slot holds only the
+                      // instance's own v_count v-heads; the conv memset below stays full-width.
+                      (size_t)gdn_state_slots(c) * gdn_vloc(s) * c.linear_head_dim *
                           c.linear_head_dim * sizeof(float),
                       st),
                   "packed linear state reset");
@@ -388,7 +423,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     } else if (pos0 == 0 && s.lin_state && s.lin_conv_state) {
         pf_cu(cudaMemsetAsync(
                   s.lin_state, 0,
-                  (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim *
+                  (size_t)gdn_state_slots(c) * gdn_vloc(s) * c.linear_head_dim *
                       c.linear_head_dim * sizeof(float),
                   st),
               "linear state reset");
@@ -2119,7 +2154,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // length makes, so the scan takes the same arm it would have taken alone.
                 const size_t conv_at = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
                 const size_t state_at =
-                    (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+                    (size_t)gdn_state_slot(c, L) * gdn_vloc(s) * c.linear_head_dim *
+                        c.linear_head_dim;
+                const bool gdn_scr = gdn_via_scratch(s);
                 const int lq = s.linear_qdim;
                 for (int i = 0; i < nseg; ++i) {
                     const size_t o = (size_t)s.multi_off[i];
@@ -2128,10 +2165,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at,
                         gq + o * lq, gk + o * lq, gv + o * lvdim, len, c.linear_q_heads, vh,
                         c.linear_head_dim, c.linear_conv_kernel, eps, st, nullptr);
+                    // A windowed arena has no prefill-scan kernel in the windowed layout, so the
+                    // segment's slot is staged through the full-layout scratch around the scan.
+                    if (gdn_scr) gdn_inject(s, gdn_state_slot(c, L), s.multi_lin_state[i]);
                     kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
                         la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
-                        s.multi_lin_state[i] + state_at, att + o * lvdim, len, c.linear_q_heads,
+                        gdn_scr
+                            ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
+                                  c.linear_head_dim
+                            : s.multi_lin_state[i] + state_at,
+                        att + o * lvdim, len, c.linear_q_heads,
                         vh, c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/false);
+                    if (gdn_scr) gdn_extract(s, gdn_state_slot(c, L), s.multi_lin_state[i]);
                 }
             } else {
                 bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
@@ -2141,12 +2186,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                           cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
                 kernels::launch_prefill_gdn_conv(b8, w.ssm_conv, conv_state, gq, gk, gv,
                     N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
-                float* layer_state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+                float* layer_state = s.lin_state +
+                    (size_t)gdn_state_slot(c, L) * gdn_vloc(s) * c.linear_head_dim * c.linear_head_dim;
                 // A pass that does not start at position 0 continues the recurrence already in `state`
                 // (the state reset above runs only for pos0 == 0); the scan must load it, not zero it.
+                // A windowed arena has no full-layout scan kernel to run on it, so the slot is staged
+                // through the model's full-layout scratch (injected before, extracted after); an
+                // unsplit model takes exactly today's path (gdn_scr false, layer_state as before).
+                if (gdn_via_scratch(s)) gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
                 kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
-                    layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
+                    gdn_via_scratch(s)
+                        ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
+                              c.linear_head_dim
+                        : layer_state,
+                    att, N, c.linear_q_heads, vh, c.linear_head_dim,
                     c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
+                if (gdn_via_scratch(s)) gdn_extract(s, gdn_state_slot(c, L), s.lin_state);
             }
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
             // out_proj off the same NVFP4 bytes, with the residual folded into the block-scaled
@@ -5165,7 +5220,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (!supported) break;
             const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-            const size_t state_off = (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+            // gdn_vloc (not vh): a windowed arena's slot is vloc v-head blocks wide, so the
+            // slot offset within each sequence's own arena scales with the window; unsplit,
+            // gdn_vloc == vh and this is today's expression.
+            const size_t state_off =
+                (size_t)gdn_state_slot(c, L) * gdn_vloc(s) * c.linear_head_dim * c.linear_head_dim;
             if (packed) {
                 // Rows are independent sequences, so this is the ordinary AR decode step done B
                 // ways -- each row against its OWN conv window and recurrent state, mutating them
@@ -5177,11 +5236,16 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel,
                     c.rms_eps, st);
                 if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "packed gdn ab wait");
+                // v0/vloc: the batched kernel runs the window's vloc local v-heads and offsets
+                // every activation index by v0; with vloc == 0 (unsplit) both are zero and the
+                // kernel is bit-for-bit today's. The state index stays local to each sequence's
+                // arena, which state_off (vloc-scaled above) already places in the right slot.
                 if (!kernels::launch_qwen36_gdn_ar_batched(
                         gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
                         s.packed_lin_state, state_off, att,
                         N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st,
-                        s.packed_state_b16)) {
+                        s.packed_state_b16,
+                        s.gdn_window.v_count > 0 ? s.gdn_window.v_start : 0, gdn_vloc(s))) {
                     supported = false;
                     vfail_L = L;
                     break;
@@ -5190,11 +5254,19 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;
             kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
-            const float* state = s.lin_state + state_off;
+            // The compact scan has no windowed kernel: a windowed model stages the slot through
+            // the full-layout scratch (inject, scan, extract); an unsplit model reads the arena
+            // exactly as before.
+            if (gdn_via_scratch(s)) gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
+            const float* state = gdn_via_scratch(s)
+                ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
+                      c.linear_head_dim
+                : s.lin_state + state_off;
             // ra/rb are the scan's only side-branch inputs.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "verify gdn ab wait");
             kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
                 state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
+            if (gdn_via_scratch(s)) gdn_extract(s, gdn_state_slot(c, L), s.lin_state);
             }
             // ...and lz is gated_norm's.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn z wait");
@@ -6072,11 +6144,21 @@ verify_forward_done:
             rec_qkv, (size_t)N * lqkv, s.lin_conv_state,
             (size_t)(c.linear_conv_kernel - 1) * lqkv, d_gdn_layers, n_gdn, keep,
             c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, st);
+        // A windowed arena is vloc-wide per slot, but the batched commit kernel is full-v only:
+        // stage every slot's window through the full-layout scratch (inject all, commit, extract
+        // all). The stride then stays v_full*HD^2 in both the scratch case and the unsplit case
+        // (where gdn_vloc == vh and the arena itself is the base, as before).
+        const bool gdn_scr = gdn_via_scratch(s);
+        if (gdn_scr)
+            for (int j = 0; j < gdn_state_slots(c); ++j) gdn_inject(s, j, s.lin_state);
         dflash_kernels::launch_gdn_scan_commit_layers(
             rec_k, (size_t)N * s.linear_qdim, rec_v, (size_t)N * lvdim,
             rec_a, (size_t)N * vh, rec_b, d_gdn_w,
-            s.lin_state, (size_t)vh * c.linear_head_dim * c.linear_head_dim,
+            gdn_scr ? s.gdn_scratch : s.lin_state,
+            (size_t)(gdn_scr ? vh : gdn_vloc(s)) * c.linear_head_dim * c.linear_head_dim,
             n_gdn, keep, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
+        if (gdn_scr)
+            for (int j = 0; j < gdn_state_slots(c); ++j) gdn_extract(s, j, s.lin_state);
     } else {
         for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
             bf16* rq = rec_qkv + (size_t)L * N * lqkv;
@@ -6086,12 +6168,20 @@ verify_forward_done:
             bf16* rb = rec_b + (size_t)L * N * vh;
             bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
                 (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-            float* state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+            const bool gdn_scr = gdn_via_scratch(s);
+            if (gdn_scr) gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
+            float* state =
+                gdn_scr
+                    ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
+                          c.linear_head_dim
+                    : s.lin_state + (size_t)gdn_state_slot(c, L) * gdn_vloc(s) * c.linear_head_dim *
+                          c.linear_head_dim;
             kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
                 c.linear_head_dim, c.linear_conv_kernel, st);
             kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
                 s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim,
                 c.gdn_qh_block, st);
+            if (gdn_scr) gdn_extract(s, gdn_state_slot(c, L), s.lin_state);
         }
     }
     // The next draft block consumes only the captured target hidden rows and the draft model's

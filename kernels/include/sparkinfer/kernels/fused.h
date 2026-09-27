@@ -368,7 +368,7 @@ bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const 
                                   float* const* states, size_t state_off, void* out_bf16,
                                   int batch, int q_heads, int v_heads, int head_dim,
                                   bool qh_block, cudaStream_t stream = nullptr,
-                                  bool state_compact_b16 = false);
+                                  bool state_compact_b16 = false, int v0 = 0, int vloc = 0);
 
 // Batched twin of launch_qwen36_conv_split_l2norm_fused; `conv_states` is a device array of B
 // per-session conv-state pointers, same contract as above.

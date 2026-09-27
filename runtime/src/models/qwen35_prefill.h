@@ -146,6 +146,16 @@ struct Qwen35PrefillCtx {
     // it otherwise, so a caller that can free something (the Bonsai decode shadow, see #1154's
     // rejection) can tell "worth retrying" from "give up now". Null is fine; nothing is recorded.
     bool*                scratch_oom_out  = nullptr;
+
+    // GDN v-head state window (dual-GPU state split; see GdnStateWindow in qwen35.h). When set,
+    // this pass's `lin_state` / `packed_lin_state` / `multi_lin_state` arenas are the DENSE
+    // windowed layout [slots][v_local][HD][HD] with v_local = gdn_window.v_count, and the GDN
+    // round-trip below runs on `gdn_scratch`, the model's FULL-layout [slots][v_full][HD][HD]
+    // arena: inject the windowed slot, run the full-v kernel, extract the window back. nullptr
+    // gdn_window (the tp=1 default) or a null gdn_scratch (degenerate window, no linear layers)
+    // means the pass touches the arenas directly, exactly as before. Conv state is never split.
+    GdnStateWindow       gdn_window   = {};
+    float*               gdn_scratch  = nullptr;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

@@ -195,12 +195,63 @@ struct Qwen35Weights {
     std::vector<Qwen35LayerWeights> layers;
 };
 
+// Window over the GDN value-head state, for the per-device state split (dual-GPU). The
+// recurrent lin_state ([slots][v_heads][HD][HD], dense) is split so each device keeps
+// only its own [v_start, v_start + v_count) slice of the v-heads; conv state stays FULL on
+// every device (it is not split per v-head at a cost/benefit worth paying -- activations are
+// full-width per device, so splitting the conv rows buys nothing until the forward path is split).
+// (0,0) = "all heads" = the tp=1 default: every derived size, pointer, and launch argument
+// must evaluate byte-identical to the unsplit model under it.
+struct GdnStateWindow {
+    int v_start = 0;   // first local v-head index, in [0, linear_v_heads]
+    int v_count = 0;   // local v-head count; 0 = all heads
+};
+
+// Validates a GdnStateWindow against the model config, returning the effective window.
+// Degenerate cases (non-hybrid config, v_count <= 0) pass through as the all-heads window.
+// Otherwise the window must be exactly expressible by the GDN kernels' qh mapping, else it is
+// clamped to the all-heads window and *warned (out-param, may be null) is set so the caller
+// prints the diagnostic once:
+//   - OOB: v_start < 0 or v_start + v_count > linear_v_heads;
+//   - block mode (gdn_qh_block): with g = v/q (v % q must be 0), g must divide BOTH
+//     v_start and v_count (the kernel maps local v-head vh to q-head vh/(v/q));
+//   - cyclic mode: only a LEADING window is expressible -- v_start == 0,
+//     v_count <= linear_q_heads, and v_count % linear_q_heads == 0 (the kernel maps
+//     vh to q-head vh % q, so a mid-range window would alias q-heads across the split).
+inline GdnStateWindow gdn_window_normalize(const Qwen35Config& cfg, const GdnStateWindow& in, bool* warned)
+{
+    if (warned) *warned = false;
+    GdnStateWindow w = in;
+    const int v = cfg.linear_v_heads, q = cfg.linear_q_heads;
+    if (!cfg.hybrid || v <= 0 || q <= 0 || w.v_count <= 0) return GdnStateWindow{};
+    bool bad = w.v_start < 0 || w.v_start + w.v_count > v;
+    if (!bad) {
+        if (cfg.gdn_qh_block) {
+            if (v % q == 0) {
+                const int g = v / q;
+                if (w.v_start % g != 0 || w.v_count % g != 0) bad = true;
+            } else bad = true;
+        } else {
+            if (w.v_start != 0 || w.v_count > q || w.v_count % q != 0) bad = true;
+        }
+    }
+    if (bad) {
+        if (warned) *warned = true;
+        return GdnStateWindow{};  // clamp to all heads
+    }
+    return w;
+}
+
 // Single-sequence (batch=1) greedy decoder for the Qwen family -- routed-MoE (Qwen3.6) and
 // dense-FFN (Qwen3.8, Qwen3.5) alike, plus Muse Glimmer. Owns scratch buffers and
 // drives embed -> N layers -> final norm -> LM head -> argmax per token.
 class Qwen35Model {
 public:
-    Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine);
+    // gdn_window: which slice of the GDN v-head recurrent state this model instance owns
+    // (dual-GPU state split). Default (0,0) = all heads = the unsplit, byte-identical tp=1
+    // behavior; see GdnStateWindow and gdn_window_normalize for the validity rules.
+    Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine,
+               GdnStateWindow gdn_window = {});
     ~Qwen35Model();
 
     void set_weights(const Qwen35Weights& w);
@@ -448,6 +499,13 @@ public:
     BenchDecodeResult bench_decode(int warmup, int n_tokens, int context_tokens = 0);
 
     const Qwen35Config& config() const;
+
+    // The GDN v-head state window this instance owns, as normalized by gdn_window_normalize at
+    // construction time (all heads when the model was constructed unsplit).
+    const GdnStateWindow& gdn_state_window() const;
+    // Number of v-heads this instance keeps per state slot: v_count when a window is set,
+    // linear_v_heads otherwise. Every per-slot state size derives from this.
+    int gdn_v_local() const;
 
     // Batched prompt prefill: process all `n` prompt tokens in one
     // pass, filling the paged KV cache and Gated-DeltaNet recurrent/conv state for positions
