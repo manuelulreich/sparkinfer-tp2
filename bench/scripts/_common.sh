@@ -424,20 +424,32 @@ si_run() {   # si_run <tool> <args...>  — run a sparkinfer binary with the res
 # pinned value is reported in the verdict + log so a verifier reproduces at the same clock.
 # Best-effort: needs root (eval boxes are root); if the box forbids -lgc, fall back to warmup-only.
 GPU_CLOCKS_PINNED=0; PINNED_GCLK=""
-_supported_gclks() { nvidia-smi -q -d SUPPORTED_CLOCKS 2>/dev/null | sed -n 's/.*Graphics *: *\([0-9][0-9]*\) MHz.*/\1/p'; }
+# Per card: a dual-GPU (tp=2) box pins EVERY card, each to its own highest supported clock <= cap
+# (one card's ladder is not the other's when the pair is mixed). PINNED_GCLK lists them in index
+# order; a single-card box behaves exactly as before.
+_supported_gclks() { nvidia-smi ${1:+-i "$1"} -q -d SUPPORTED_CLOCKS 2>/dev/null | sed -n 's/.*Graphics *: *\([0-9][0-9]*\) MHz.*/\1/p'; }
 pin_clocks() {
   command -v nvidia-smi >/dev/null || return 0
   nvidia-smi -pm 1 >/dev/null 2>&1 || true                      # persistence mode (best-effort)
-  local tgt="${SPARKINFER_PIN_GCLK:-}" cap="${SPARKINFER_PIN_GCLK_CAP:-2550}"
-  if [ -z "$tgt" ]; then                                        # highest supported clock <= cap
-    tgt=$(_supported_gclks | sort -n | awk -v c="$cap" '$1<=c{v=$1} END{print v}')
-  fi
-  [ -z "$tgt" ] && { echo ">> WARN: no supported graphics clocks found — clocks NOT pinned" >&2; return 0; }
-  if nvidia-smi -lgc "$tgt,$tgt" >/dev/null 2>&1; then
-    GPU_CLOCKS_PINNED=1; PINNED_GCLK="$tgt"
-    echo ">> GPU graphics clock pinned to ${tgt} MHz (reproducible tok/s)" >&2
-  else
-    echo ">> WARN: could not lock GPU clocks (no permission?) — falling back to warmup-only" >&2
+  local cap="${SPARKINFER_PIN_GCLK_CAP:-2550}" idx tgt pinned=() ok=1
+  for idx in $(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null); do
+    tgt="${SPARKINFER_PIN_GCLK:-}"
+    [ -z "$tgt" ] && tgt=$(_supported_gclks "$idx" | sort -n | awk -v c="$cap" '$1<=c{v=$1} END{print v}')
+    if [ -z "$tgt" ]; then
+      echo ">> WARN: GPU $idx: no supported graphics clocks found — clocks NOT pinned" >&2; ok=0; break
+    fi
+    if nvidia-smi -i "$idx" -lgc "$tgt,$tgt" >/dev/null 2>&1; then
+      pinned+=("$tgt")
+    else
+      echo ">> WARN: could not lock GPU $idx clocks (no permission?) — falling back to warmup-only" >&2
+      ok=0; break
+    fi
+  done
+  if [ "$ok" = 1 ] && [ "${#pinned[@]}" -gt 0 ]; then
+    GPU_CLOCKS_PINNED=1; PINNED_GCLK="$(IFS=,; echo "${pinned[*]}")"
+    echo ">> GPU graphics clock(s) pinned to ${PINNED_GCLK} MHz (reproducible tok/s)" >&2
+  elif [ "${#pinned[@]}" -gt 0 ]; then
+    nvidia-smi -rgc >/dev/null 2>&1 || true                     # all-or-nothing: undo a partial pin
   fi
 }
 unpin_clocks() {
