@@ -239,7 +239,8 @@ public:
     // to outlive the engine (ModelEngine owns them). Never set => a request with images is
     // rejected rather than silently answered from its text alone, which would produce a fluent
     // description of an image the model never saw.
-    void set_vision(const QwenVisionWeights* weights, const QwenVisionConfig* cfg);
+    // device: the card the tower's weights live on (-1 = the worker's current device).
+    void set_vision(const QwenVisionWeights* weights, const QwenVisionConfig* cfg, int device = -1);
     int num_free_kv_blocks() const;
     // Admission-time queue depth cap (SPARKINFER_MAX_QUEUE_DEPTH, 0 = unlimited). Requests
     // beyond this are rejected as overloaded before any KV allocation is attempted.
@@ -315,6 +316,7 @@ private:
     SchedulePolicy policy_ = SchedulePolicy::CONTINUOUS_BATCHING;
     const QwenVisionWeights* vision_weights_ = nullptr;
     const QwenVisionConfig* vision_cfg_ = nullptr;
+    int vision_device_ = -1;
     std::thread worker_;
     std::atomic<bool> running_{false};
     mutable std::mutex mu_;

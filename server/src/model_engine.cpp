@@ -195,10 +195,14 @@ struct ModelEngine::Impl {
     sparkinfer::QwenVisionConfig vcfg{};
     sparkinfer::QwenVisionWeights vweights{};
     bool vision_ready = false;
+    int vision_device = -1;   // the card the tower lives on (-1 = the loading thread's current one)
 
     void reset_vision() {
         if (!vision_ready) return;
+        int prev = -1;
+        if (vision_device >= 0) { cudaGetDevice(&prev); cudaSetDevice(vision_device); }
         free_qwen_vision_weights(vweights);
+        if (prev >= 0) cudaSetDevice(prev);
         vweights = sparkinfer::QwenVisionWeights{};
         vision_ready = false;
     }
@@ -262,6 +266,17 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             fprintf(stderr, "%s", v.error.c_str());
             return false;
         }
+    }
+    // (dual-GPU WP-13) The LMCache sidecar stores and reloads one device's whole KV pool; at
+    // tp>1 each rank holds only its share of the KV heads in its own pool, so a sidecar would
+    // cache half the heads and splice them into both ranks. The dual-GPU KV tier is deferred
+    // (v2): refuse the combination at load rather than serve wrong attention.
+    if (plan.tp > 1 && lmcache_enabled()) {
+        fprintf(stderr, "[sparkinfer-server] SPARKINFER_LMCACHE_ENABLE=1 is not supported with --tp %d: "
+                        "the LMCache sidecar caches a single device's KV pool, and at tp>1 each card "
+                        "holds only its share of the KV heads. Unset SPARKINFER_LMCACHE_ENABLE or run "
+                        "with --tp 1.\n", plan.tp);
+        return false;
     }
     if (plan.tp > 1 || !plan.devices.empty()) {
         // The resolved plan, so the log shows what the operator asked for (the default
@@ -753,13 +768,32 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             sparkinfer::SafeTensorsModel vst;
             if (!vst.open(gguf_path)) {
                 fprintf(stderr, "[sparkinfer-server] vision: cannot open safetensors\n");
-            } else if (!load_qwen_vision_weights(vst, impl_->vcfg, impl_->vweights, verr)) {
+            } else if (![&] {
+                           // (dual-GPU WP-13) At tp>1 the tower goes on the LAST card: card 0 also
+                           // carries the DSpark draft, and the ranks' weights are otherwise
+                           // balanced, so card 0 is the one that runs out of room first. Its
+                           // output is host floats, so nothing crosses devices.
+                           // SPARKINFER_VISION_DEVICE=n picks a card explicitly.
+                           const char* vd = getenv("SPARKINFER_VISION_DEVICE");
+                           impl_->vision_device = vd ? atoi(vd)
+                                                     : (plan.tp > 1 && eff.size() > 1 ? eff.back() : -1);
+                           int prev = -1;
+                           if (impl_->vision_device >= 0) {
+                               cudaGetDevice(&prev);
+                               cudaSetDevice(impl_->vision_device);
+                           }
+                           const bool ok = load_qwen_vision_weights(vst, impl_->vcfg, impl_->vweights, verr);
+                           if (prev >= 0) cudaSetDevice(prev);
+                           return ok;
+                       }()) {
                 fprintf(stderr, "[sparkinfer-server] vision tower load failed: %s\n", verr.c_str());
             } else {
                 impl_->vision_ready = true;
-                impl_->batch_engine->set_vision(&impl_->vweights, &impl_->vcfg);
-                fprintf(stderr, "[sparkinfer-server] vision tower ready: %d blocks, out_hidden=%d\n",
-                        impl_->vcfg.depth, impl_->vcfg.out_hidden);
+                impl_->batch_engine->set_vision(&impl_->vweights, &impl_->vcfg, impl_->vision_device);
+                fprintf(stderr, "[sparkinfer-server] vision tower ready: %d blocks, out_hidden=%d%s\n",
+                        impl_->vcfg.depth, impl_->vcfg.out_hidden,
+                        impl_->vision_device >= 0
+                            ? (" (device " + std::to_string(impl_->vision_device) + ")").c_str() : "");
             }
         }
     }

@@ -234,10 +234,11 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
 }
 
 void ContinuousBatchEngine::set_vision(const QwenVisionWeights* weights,
-                                      const QwenVisionConfig* cfg) {
+                                      const QwenVisionConfig* cfg, int device) {
     std::lock_guard<std::mutex> lock(mu_);
     vision_weights_ = weights;
     vision_cfg_ = cfg;
+    vision_device_ = device;
 }
 
 int ContinuousBatchEngine::num_active() const {
@@ -1083,6 +1084,12 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         if (has_vision) {
             std::vector<float> emb;
             std::string verr;
+            // The tower runs on its own card (dual-GPU: the last one); the scope below puts the
+            // worker back on its device before set_pending_vision allocates on the model's card.
+            {
+            int prev_dev = -1;
+            if (vision_device_ >= 0) { cudaGetDevice(&prev_dev); cudaSetDevice(vision_device_); }
+            struct RestoreDev { int d; ~RestoreDev() { if (d >= 0) cudaSetDevice(d); } } restore_dev{prev_dev};
             for (const auto& img : job.req.vision_images) {
                 const int nblk = (img.grid_h / vision_cfg_->spatial_merge) *
                                  (img.grid_w / vision_cfg_->spatial_merge);
@@ -1095,6 +1102,7 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
                     finish_job(job);
                     return true;
                 }
+            }
             }
             if (emb.size() != job.req.vision_pos.size() * (size_t)vision_cfg_->out_hidden ||
                 !model_->set_pending_vision(emb.data(), job.req.vision_pos.data(),
