@@ -5,6 +5,7 @@
 #include <mutex>
 #include <vector>
 #include <string>
+#include <cuda_runtime.h>
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/models/qwen_config.h"
 #include "sparkinfer/moe/engine.h"
@@ -17,6 +18,7 @@ inline constexpr int kQwen35MaxPackedRows = 32;
 
 class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
 class BridgeClient;      // optional external KV cache tier (lmcache_bridge_client.h)
+class GpuLink;          // 2-rank tensor-parallel comm (gpu_link.h); tp_attach takes it non-owning
 
 // Device (bf16) weight pointers for one layer.
 struct Qwen35LayerWeights {
@@ -279,6 +281,32 @@ public:
     // The loaded weight set (pointers into this instance's owned device buffers). Exposed for
     // the tp=1 byte-identity checksum in runtime/tests/tp_weights_cpu_test.cpp.
     const Qwen35Weights& weights() const;
+
+    // (dual-GPU WP-9) Tensor-parallel attach for a tp=2 load. Called on the group-leader
+    // instance (the rank-0 model held by the engine) with the process-wide GpuLink (non-owning;
+    // the engine creates and destroys it) and the non-owning peer model pointers in rank order
+    // (peers[r] is the model on rank r, so peers[tp_rank] is this instance). Every public op on
+    // the leader is then mirrored onto every peer on a per-op worker thread; the peers run the
+    // same code with their local (sliced) weights and contribute their column/row windows, and
+    // one fused GpuLink all-reduce per transformer layer combines the per-rank partials.
+    // No-op guard for the tp=1 case: tp_attach is never called there and every TP site below
+    // is degenerate, keeping tp=1 byte-identical.
+    void tp_attach(GpuLink* link, int my_rank, const std::vector<Qwen35Model*>& peers);
+    bool tp_active() const;   // tp world > 1 and link attached
+    int tp_rank() const;      // this instance's rank (0 when not attached)
+
+    // Per-rank view of the tp=2 scratch, so the group leader can name the PEER's device,
+    // stream and staging rows when it builds a GpuLink::RankRef pair for the all-reduce. Set
+    // once by tp_attach (the values never change after that); all other fields are -1/null.
+    struct TpRankView {
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        uint16_t* xrow = nullptr;   // bf16[hidden] op-entry embedding-exchange row
+        uint16_t* ar   = nullptr;   // bf16[32][2*hidden] per-layer AR-A/B staging (row 0 in use)
+        float* exch    = nullptr;   // f32[16] (m,t) pack, S4c-2 epilogue 16B maxreduce
+        float* exch2   = nullptr;   // f32[1024] 2x256 survivor lists, S4c-2 epilogue maxreduce
+    };
+    TpRankView tp_rank_view() const;
 
     void set_weights(const Qwen35Weights& w);
 
@@ -751,8 +779,60 @@ private:
     // dflash_generate()'s one-time pre-capture initialization (see qwen35.cpp).
     int adaptive_nsplits_for(int seqlen) const;
 
+    // (dual-GPU WP-9, tp>1 only; the tp=1 path never enters either of these.)
+    // Tensor-parallel twin of forward_token: the group leader (rank 0) drives its own copy and
+    // mirrors the call onto the other rank's model on a one-shot worker thread; every rank runs
+    // the same code against its own (sliced) weights on its own device/stream and combines the
+    // per-rank partials through the GpuLink. Eager-only -- no CUDA-graph capture here. The
+    // per-rank scratch (tp_xrow/tp_drow/tp_ar/tp_logits/tp_exch, see the Impl in qwen35.cpp) is
+    // allocated by tp_attach on each rank's own device.
+    int forward_token_tp(int token_id, int position, bool sample, float temperature,
+                         unsigned long long seed, unsigned long long sample_step,
+                         int top_k, float top_p,
+                         float presence_penalty, float frequency_penalty);
+    // Tensor-parallel twin of the packed continuous-batch decode entry: a per-row loop that runs
+    // the single-row windowed path (forward_token_tp) once per row (design item 9). The rows-
+    // kernels bit-identity invariant makes this correctness-preserving; the packed-kernel
+    // throughput a split tp>1 rank cannot use is the accepted perf regression (M2 gate is
+    // code-complete + in-regime unit test). The leader activates each row's session before its
+    // call (the single-row path keys its per-rank state off the model's active session); the
+    // peer rank's active session is mirrored by the engine (S8), so a direct caller must keep
+    // it in step. Plain greedy only, exactly like decode_packed: out_sampled holds the argmax.
+    bool decode_packed_tp(const int* tokens, const int* positions, const uint64_t* seq_ids,
+                          int n, int* out_sampled);
+
+    // (dual-GPU WP-9) tp>1 per-layer helpers: the real per-rank partial bodies (see the locked
+    // design in wp-i2-brief.md). Each one computes this rank's partial into the tp_ar row --
+    // GDN: windowed qkv GEMV + rank-local conv/recurrence/norm + K-windowed ssm_out; attn:
+    // N-windowed q/k/v GEMVs + rank-local QK-norm/RoPE/KV-append/flash-decode + K-windowed
+    // o_proj; FFN: N-windowed gate/up + K-windowed down -- which the layer loop's AR-A/AR-B
+    // all-reduces combine across ranks. forward_token_tp calls them for every layer.
+    void tp_attn_layer_tp(int l, uint16_t* x, const uint16_t* xn);
+    void tp_gdn_layer_tp(int l, uint16_t* x, const uint16_t* xn);
+    void tp_ffn_layer_tp(int l, const uint16_t* xn, uint16_t* out);
+    // One 2-rank all-reduce (sum) of a bf16 row. Issued only by the group leader (rank 0):
+    // a single GpuLink::allreduce posts the reduce on BOTH ranks' streams, so the peer must
+    // not issue a second one (this helper is a no-op on the peer). `is_xrow` selects which
+    // peer row to name (xrow for the op-entry exchange, ar for the per-layer AR-A/AR-B).
+    void tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow);
+    // (dual-GPU S4c-2) one 2-rank elementwise f32 MAX for the epilogue's (m,t) exchange. Issued
+    // only by the group leader (rank 0); the peer's call is a deliberate no-op, exactly like
+    // tp_allreduce_row, because a single GpuLink::maxreduce posts the reduce on BOTH ranks'
+    // streams. kind 0: the 16-slot (m,t) pack (in==out==tp_exch on both ranks -- the disjoint
+    // pack keeps [m0,t0,m1,t1] intact through the elementwise max). kind 1: the 256-slot
+    // survivor list (in tp_exch2[0..256) -> out tp_exch2[256..512) on both ranks).
+    void tp_maxreduce_f32(int kind, size_t elems);
+
     struct Impl;
     Impl* p_;
 };
+
+// (dual-GPU S7a-1) Prefill-side tensor-parallel helper, process-scope (not a method: the caller
+// is the prefill translation unit, which hands over its per-pass partial buffer). After the
+// K-compact o_proj GEMM each rank's prefill pass calls this with its [N][H] bf16 partial; the
+// rank on the link's device_a end (the leader) waits for the peer's registration, then posts the
+// single GpuLink::allreduce that sums in place (in==out) on both ranks' streams. No attached link
+// (a tp=1 process) makes this a no-op, exactly like tp_allreduce_row for a peer rank.
+void tp_prefill_allreduce_bf16(void* in_out, size_t elems);
 
 } // namespace sparkinfer

@@ -56,6 +56,14 @@ void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
                           const void* weight_bf16, void* out_bf16,
                           int rows, int cols, float eps, cudaStream_t stream = nullptr);
 
+// 2D row gather/copy (bf16 elements): for r in [0, rows):
+//   dst[r*dst_pitch .. +width) = src[r*src_pitch .. +width)
+// Pitches and width in elements; dst/src pointers already carry the caller's column offsets.
+// tp=2 GDN window-fill: rank-dense [rows][w] -> full-width [rows][P] column windows (and the
+// reverse gather for the GDN-out A operand).
+void launch_gather_rows(void* dst_bf16, size_t dst_pitch, const void* src_bf16, size_t src_pitch,
+                        size_t width, size_t rows, cudaStream_t stream = nullptr);
+
 // Muse Glimmer's sandwich-norm tail in one launch instead of two:
 //   out_x  = residual + RMSNorm(branch, post_w, post_eps)   (what launch_norm_then_add does)
 //   out_xn = RMSNorm(out_x, next_w, eps)                    (what the following launch_rmsnorm does)
@@ -342,10 +350,17 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
 // Fused conv_split + per-head l2_norm: one block per head, head_dim threads.
 // Eliminates the two standalone l2_norm_heads kernel launches per GDN layer.
 // SPARKINFER_GDN_FUSE=0 restores the split path for A/B.
+// Trailing tp window (all 0 = full sections, the tp=1 default): this rank owns q heads
+// [q0, q0+ql), k heads [k0, k0+kl), v heads [v0, v0+vl). qkv / conv_state / q / k / v stay
+// FULL-width (global head indices); only the conv_w rows are remapped to the rank's reduced
+// buffer, laid out in global row order as [ql q rows | kl k rows | vl v rows] x head_dim
+// x conv_kernel.
 void launch_qwen36_conv_split_l2norm_fused(const void* qkv_bf16, const void* conv_w_bf16,
                                  void* conv_state_bf16, void* q_bf16, void* k_bf16,
                                  void* v_bf16, int q_heads, int v_heads, int head_dim,
-                                 int conv_kernel, float eps, cudaStream_t stream = nullptr);
+                                 int conv_kernel, float eps, cudaStream_t stream = nullptr,
+                                 int q0 = 0, int ql = 0, int k0 = 0, int kl = 0,
+                                 int v0 = 0, int vl = 0);
 
 // qh_block: v-head -> q/k-head broadcast convention. false = cyclic (vh % q_heads), the
 // original/validated convention for Qwythos and Qwen3.6-35B-A3B's checkpoints (v_heads/q_heads

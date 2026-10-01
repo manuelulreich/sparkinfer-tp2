@@ -4,6 +4,7 @@
 #include "sparkinfer/device_health.h"
 
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/gpu_link.h"
 #include "sparkinfer/inference_engine.h"
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/lmcache_bridge_client.h"
@@ -149,6 +150,12 @@ void terminate_lmcache_sidecar(pid_t pid) {
 }  // namespace
 
 struct ModelEngine::Impl {
+    // (tp=2, i2 item 11) The process-wide 2-rank GpuLink: created in load() when R==2 and
+    // handed to both rank models non-owning via tp_attach. Declared FIRST so reverse member
+    // destruction order makes it outlive every model that points into it -- belt and braces on
+    // top of the explicit shutdown in ~Impl (a post-shutdown GpuLink dtor is a documented
+    // no-op: the not-ready branch only re-runs the null-guarded best-effort release).
+    std::unique_ptr<sparkinfer::GpuLink> tp_link;
     std::string path;
     sparkinfer::Qwen35Config cfg{};
     std::unique_ptr<sparkinfer::Runtime> rt;
@@ -204,6 +211,18 @@ struct ModelEngine::Impl {
         reset_vision();
         lmcache_bridge.reset();
         terminate_lmcache_sidecar(lmcache_sidecar_pid);
+        // (tp=2, i2 item 11) Teardown. Pin the original relative member order: batch_engine's
+        // dtor can still call into model_/kv_ for unfinished jobs (inference_engine.cpp:120),
+        // so it must run while every model is alive — exactly as declaration order guaranteed
+        // pre-tp=2. The rank models are gone before the process-wide GpuLink is torn down;
+        // the KV pools (tp_kvs) outlive the models that point into them, as before. tp=1 never
+        // sets tp_link, so the shutdown is a null no-op and the tp=1 teardown is byte-identical.
+        batch_engine.reset();
+        draft.reset();
+        tp_models.clear();
+        tp_kvs.clear();
+        model.reset();
+        if (tp_link) tp_link->shutdown();
     }
 };
 
@@ -609,10 +628,38 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         // Restore the default device so any post-load host-side work (lmcache, vision) runs as
         // before; the per-instance binds already happened in each ctor.
         cudaSetDevice(eff[0]);
-        fprintf(stderr,
-                "[sparkinfer-server] tp>1: %d of %d instances loaded; split-weight forward is "
-                "incomplete until WP-9/10 (Wave 4 I)\n",
-                (int)impl_->tp_models.size() + 1, R);
+        if (R == 2) {
+            // (i2 item 11) Wire the 27B tp=2 split-weight forward: one process-wide GpuLink.
+            // Rank 0 (impl_->model, the batch engine's serving instance) is the leader: it
+            // gets rank 1's model and mirrors every op onto it (one fused all-reduce per
+            // layer). Rank 1 (impl_->tp_models[0]) is handed nothing -- it only runs on the
+            // leader's threads and never issues a link op itself.
+            impl_->tp_link = std::make_unique<sparkinfer::GpuLink>();
+            // max_bytes 512 MiB: the 1 MiB default sits below the ~168 MB prefill
+            // all-reduce at m=16k, so every large op would be refused by the byte budget.
+            if (!impl_->tp_link->init(eff[0], eff[1], sparkinfer::GpuLink::Transport::Auto,
+                512 * 1024 * 1024)) {
+                fprintf(stderr,
+                        "[sparkinfer-server] tp=2: GpuLink init failed (dev %d/%d)\n",
+                        eff[0], eff[1]);
+                return false;
+            }
+            impl_->model->tp_attach(impl_->tp_link.get(), 0, { impl_->tp_models[0].get() });
+            impl_->tp_models[0]->tp_attach(impl_->tp_link.get(), 1, {});
+            fprintf(stderr,
+                    "[sparkinfer-server] tp=2: GpuLink attached (rank0 dev %d, rank1 dev %d); "
+                    "split-weight forward active\n",
+                    eff[0], eff[1]);
+        } else {
+            // R>2: an explicit --devices list is not tied to tp and not capped at 2, so a
+            // >=3-rank load is reachable in principle on a >=3-device box. tp is capped at 2
+            // by the model layer, so no >2 semantics are invented here -- a non-2-rank load
+            // keeps the pending behavior (no link, no attach) instead of half-attaching.
+            fprintf(stderr,
+                    "[sparkinfer-server] tp>1: %d of %d instances loaded; split-weight forward is "
+                    "incomplete until WP-9/10 (Wave 4 I)\n",
+                    (int)impl_->tp_models.size() + 1, R);
+        }
     }
 
     if (lmcache_enabled()) {

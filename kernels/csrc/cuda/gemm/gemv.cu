@@ -1426,6 +1426,7 @@ __global__ void gemv_nvfp4_kernel(const __nv_bfloat16* __restrict__ x,
 #ifndef _MSC_VER
 template __global__ void gemv_nvfp4_kernel<__nv_bfloat16>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 #endif
+
 // ---- faithful llama.cpp int8 MMVQ for a dense Q4_K [N,K] GEMV --------------------
 // Quantizes the activation to Q8_1 (int8 + per-32 scale + sum) once per token, then
 // dp4a's the Q4_K weight nibbles against it — the same vec_dot_q4_K_q8_1 math llama.cpp
@@ -3964,6 +3965,7 @@ void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cuda
     else if (K == 5120) si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 20><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
     else                si_mmvq_q4k_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(q, w, out, N, K);
 }
+
 void launch_mmvq_gdn_qkv_z_pack2(const void* q81, const void* qkv_w, const void* z_w,
                                  void* qkv_out, void* z_out, int n_qkv, int n_z, int K,
                                  cudaStream_t stream) {

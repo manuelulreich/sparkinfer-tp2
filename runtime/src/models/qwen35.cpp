@@ -52,6 +52,7 @@
 #include "sparkinfer/lmcache_bridge_client.h"
 #include "sparkinfer/lmcache_staging.h"
 #include "sparkinfer/tp_layout.hpp"
+#include "sparkinfer/gpu_link.h"
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -881,6 +882,53 @@ struct Qwen35Model::Impl {
     // the degenerate window uses the dense arenas directly, the way the code did before.
     float* gdn_scratch = nullptr;
 
+    // (dual-GPU WP-9) tp=2 scratch, allocated per-model by tp_attach on this model's OWN
+    // device (never shared across ranks). tp_xrow is the op-entry embedding-exchange row;
+    // tp_ar is the per-layer AR-A/AR-B staging (both all-reduces reuse row 0); tp_logits
+    // and tp_exch are the (later-session) lm_head/sampling exchange arena. All null until
+    // tp_attach, so the tp=1 path never allocates or touches any of them.
+    GpuLink* tp_link = nullptr;
+    int tp_rank = 0;
+    std::vector<Qwen35Model*> tp_peers;   // rank-ordered 2-slot world ([my_rank]=this)
+    bf16* tp_xrow = nullptr;   // [hidden]
+    bf16* tp_ar   = nullptr;   // [32][2*hidden]
+    float* tp_logits = nullptr; // [vocab]
+    float* tp_exch   = nullptr; // [16]
+    // GDN tp staging: one N-windowed qkv GEMV (rows [ql q | ql k | vloc v] of the rank's
+    // compact weight blob) lands here, then three D2D copies scatter the q/k/v windows into
+    // the full-width lin_q/lin_k/lin_v. Null unless tp_attach allocated it (hybrid models).
+    bf16* tp_qkv = nullptr;
+    // Dense-FFN tp staging (dense_ffn models): one N-windowed gate GEMV and one N-windowed up
+    // GEMV (each fl = moe_ffn/2 rows on 27B) land in the first two quarters, the swiglu over
+    // the rank's gate/up window in the last; the down K-windowed GEMV reads exactly that h
+    // window and lands in the first H of tp_ar. Null unless tp_attach allocated it.
+    bf16* tp_ffn = nullptr;      // [3 * moe_ffn/2] bf16
+    char* tp_fq81 = nullptr;      // llama q8_1 scratch for the down's K-window activation quant
+    signed char* tp_fq8 = nullptr; // q8_1 quant (non-llama path) of the same window
+    float *tp_fq8_d = nullptr, *tp_fq8_s = nullptr;
+    // Full-attn tp staging (hybrid models, 27B): tp_qraw is the rank's fused Q+gate N-window
+    // GEMV output (2*qdim/2 bf16 == qdim: the raw [q|gate] per-head interleave before the split);
+    // tp_pos/h_tp_pos carry this rank's own (rotary) position and seq_len for the windowed
+    // append/decode, because the tp path never writes d_scalars[1]/[3].
+    bf16* tp_qraw = nullptr;
+    int* tp_pos = nullptr;
+    int* h_tp_pos = nullptr;
+    // (dual-GPU S4c-2) lm_head/sampling epilogue scratch, all on this rank's own device:
+    //   tp_exch2 : 2x256-f32 survivor-list arena for the sampling-only maxreduce (each rank H2D's
+    //              its own 256-slot canonical list into [0..256); the maxreduce lands the merged
+    //              -- byte-identical-on-both-ranks -- list in [256..512); [512..1024) unused
+    //   tp_gumb  : full-vocab f32 row for launch_temperature_sample; the owned half is a per-step
+    //              D2D of the post-masked arena half, the peer half keeps the one-time-filled -inf
+    //              (never 0xFF-byte NaN) so the curand index 0*V+token maps to the GLOBAL token
+    //              identically on both ranks
+    //   h_half   : host VR/2 staging for the per-step blocking readback of the owned logits half
+    //   h_exch   : host 16-f32 (m,t) pack staging; h_exch2: host 256-f32 survivor-list staging
+    float* tp_exch2 = nullptr; // [1024]
+    float* tp_gumb  = nullptr; // [vocab]
+    float* h_half   = nullptr; // [vocab/2]
+    float* h_exch   = nullptr; // [16]
+    float* h_exch2  = nullptr; // [256]
+
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
 
@@ -1198,6 +1246,16 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     }
 }
 
+// (dual-GPU S7a-1) Process-scope state for the prefill o_proj all-reduce: tp_attach publishes the
+// shared GpuLink plus the rank's (device, stream) into the slot of the link end it sits on (slot
+// 0 = device_a, the all-reduce leader); each prefill pass then registers its per-pass partial
+// buffer in its slot, and tp_prefill_allreduce_bf16 posts the one link-wide reduce.
+static GpuLink* g_tp_prefill_link = nullptr;
+static int g_tp_prefill_dev[2] = {-1, -1};
+static cudaStream_t g_tp_prefill_stream[2] = {nullptr, nullptr};
+static void* g_tp_prefill_buf[2] = {nullptr, nullptr};
+static std::atomic<unsigned long long> g_tp_prefill_calls[2] = {0, 0};
+
 Qwen35Model::~Qwen35Model() {
     // Mirror the ctor's one-time bind: cudaFree is device-bound, so a split instance must free
     // on the card it allocated from -- a cross-device free is the classic silent-corruption trap.
@@ -1239,6 +1297,17 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->lin_z); cudaFree(p_->lin_alpha); cudaFree(p_->lin_beta);
     cudaFree(p_->lin_gdn); cudaFree(p_->lin_norm); cudaFree(p_->lin_conv_state); cudaFree(p_->lin_state);
     cudaFree(p_->gdn_scratch);
+    cudaFree(p_->tp_xrow); cudaFree(p_->tp_ar); cudaFree(p_->tp_logits); cudaFree(p_->tp_exch);
+    cudaFree(p_->tp_qkv); cudaFree(p_->tp_qraw); cudaFree(p_->tp_pos); free(p_->h_tp_pos);
+    cudaFree(p_->tp_ffn); cudaFree(p_->tp_fq81);
+    cudaFree(p_->tp_fq8); cudaFree(p_->tp_fq8_d); cudaFree(p_->tp_fq8_s);
+    cudaFree(p_->tp_exch2); cudaFree(p_->tp_gumb);
+    // (S7a-1) Unpublish this instance from the process-scope prefill AR slots.
+    g_tp_prefill_link = nullptr;
+    g_tp_prefill_dev[0] = -1; g_tp_prefill_dev[1] = -1;
+    g_tp_prefill_stream[0] = nullptr; g_tp_prefill_stream[1] = nullptr;
+    g_tp_prefill_buf[0] = nullptr; g_tp_prefill_buf[1] = nullptr;
+    free(p_->h_half); free(p_->h_exch); free(p_->h_exch2);
     cudaFree(p_->shared_gate_tmp);
     cudaFree(p_->nvfp4_g); cudaFree(p_->nvfp4_u); cudaFree(p_->nvfp4_h);
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
@@ -1499,6 +1568,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                unsigned long long seed, unsigned long long sample_step,
                                int top_k, float top_p,
                                float presence_penalty, float frequency_penalty) {
+    // (dual-GPU WP-9) tp=2: the weights are split across the GpuLink pair, so the step runs
+    // on the per-rank twin instead; this guard is the ONLY tp>1 delta on the tp=1 path.
+    if (tp_active())
+        return forward_token_tp(token_id, position, sample, temperature, seed, sample_step,
+                                 top_k, top_p, presence_penalty, frequency_penalty);
     // Held for the whole call, not just the capture window. The window has four exits
     // (three EndCapture sites plus the replay-instead-of-capture early path), and a lock that
     // has to be released on every one of them is a lock that will eventually be leaked by an
@@ -3024,6 +3098,1016 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     return *s.h_out_id;
 }
 
+// ---------------------------------------------------------------------------
+// (dual-GPU WP-9) tensor-parallel=2 decode twin. The ~1,500-line tp=1 body above is
+// byte-identical; every tp>1 site below is degenerate (tp_attach is never called there).
+// ---------------------------------------------------------------------------
+
+bool Qwen35Model::tp_active() const {
+    return p_->tp_link != nullptr && p_->tp_peers.size() == 2;
+}
+
+int Qwen35Model::tp_rank() const { return p_->tp_rank; }
+
+Qwen35Model::TpRankView Qwen35Model::tp_rank_view() const {
+    const Impl& s = *p_;
+    TpRankView v;
+    v.device = s.device;
+    v.stream = s.stream;
+    v.xrow   = s.tp_xrow;
+    v.ar     = s.tp_ar;
+    v.exch   = s.tp_exch;
+    v.exch2  = s.tp_exch2;
+    return v;
+}
+
+void Qwen35Model::tp_attach(GpuLink* link, int my_rank, const std::vector<Qwen35Model*>& peers) {
+    if (!link) {
+        fprintf(stderr, "[tp] tp_attach: null GpuLink, staying tp=1\n");
+        return;
+    }
+    if (my_rank < 0 || my_rank > 1) {
+        fprintf(stderr, "[tp] tp_attach: rank %d unsupported (tp is capped at 2), staying tp=1\n",
+                my_rank);
+        return;
+    }
+    // Normalize both accepted attach forms into a rank-ordered 2-slot world: world[my_rank]=this
+    // and the other rank's model in world[1-my_rank]. The engine may pass (a) the item-11
+    // shorthand -- the leader the single OTHER rank, the peer nothing -- or (b) the full
+    // rank-ordered list whose slot r is rank r's model (so peers[my_rank]==this). Any other
+    // shape is rejected and the model stays tp=1.
+    std::vector<Qwen35Model*> world(2, nullptr);
+    world[my_rank] = this;
+    if (peers.size() == 2) {
+        for (int r = 0; r < 2; r++)
+            if (peers[r] && peers[r] != this) world[r] = peers[r];
+    } else if (peers.size() == 1) {
+        if (peers[0] != this) world[1 - my_rank] = peers[0];
+        // peers[0]==this: handed only our own slot; the other slot stays null. That is fine for
+        // the peer (rank 1), which never issues the all-reduce; the leader (rank 0) is always
+        // handed the peer by item 11, so it never ends up with an empty peer slot.
+    } else if (peers.size() != 0) {
+        fprintf(stderr, "[tp] tp_attach: unexpected peers size %zu, staying tp=1\n", peers.size());
+        return;
+    }
+    p_->tp_peers = world;
+    p_->tp_rank = my_rank;
+    // Per-rank scratch on THIS model's own device (never shared across ranks). The ctor bound the
+    // main thread to it only when (rank,device)!=(0,0); tp_attach runs later on the engine thread,
+    // which may sit on another context, so save/restore the device around the allocs. The op
+    // path never setDevice -- GpuLink is (device,stream)-pure.
+    Impl& s = *p_;
+    int prev = -1;
+    cu(cudaGetDevice(&prev), "tp_attach getDevice");
+    cu(cudaSetDevice(s.device), "tp_attach setDevice");
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden;
+    s.tp_xrow   = s.alloc<bf16>((size_t)H);
+    s.tp_ar     = s.alloc<bf16>((size_t)32 * 2 * H);
+    s.tp_logits = s.alloc<float>((size_t)c.vocab);
+    s.tp_exch   = s.alloc<float>(16);
+    s.tp_exch2  = s.alloc<float>(2 * 512);
+    s.tp_gumb   = s.alloc<float>((size_t)c.vocab);
+    s.h_half    = (float*)malloc((size_t)(c.vocab / 2) * sizeof(float));
+    s.h_exch    = (float*)malloc(16 * sizeof(float));
+    s.h_exch2   = (float*)malloc(256 * sizeof(float));
+    // tp_gumb's peer half must be REAL -inf (a 0xFF-byte memset would be NaN, not -inf): a
+    // one-time H2D fill of the whole row from a throwaway host buffer; each step then only
+    // overwrites the owned half with the post-masked arena half.
+    {
+        std::vector<float> neg_inf_row((size_t)c.vocab, -INFINITY);
+        cu(cudaMemcpyAsync(s.tp_gumb, neg_inf_row.data(), (size_t)c.vocab * sizeof(float),
+                           cudaMemcpyHostToDevice, s.stream), "tp_gumb -inf fill");
+        cu(cudaStreamSynchronize(s.stream), "tp_gumb -inf fill sync");
+    }
+    // GDN qkv staging, sized from this model's own GDN window (the ctor already normalized it):
+    // rank r owns q/k heads [ql*r, ql*(r+1)) and v heads [vloc*r, vloc*(r+1)) with ql =
+    // vloc/g in block mode, so the one qkv GEMV writes 2*ql*HD + vloc*HD rows.
+    if (c.hybrid) {
+        const int HD = c.linear_head_dim;
+        const int gl = c.linear_v_heads / c.linear_q_heads;
+        const int vl = p_->gdn_window.v_count > 0 ? p_->gdn_window.v_count : c.linear_v_heads;
+        const int ql = c.gdn_qh_block ? vl / gl : vl;
+        s.tp_qkv = s.alloc<bf16>((size_t)(2 * ql + vl) * HD);
+        // Full-attn staging: the fused Q+gate window (qdim bf16) and the pos/seqlen scalars.
+        s.tp_qraw  = s.alloc<bf16>((size_t)c.n_q_heads * c.head_dim);
+        s.tp_pos   = s.alloc<int>(2);
+        s.h_tp_pos = (int*)malloc(2 * sizeof(int));
+    }
+    // Dense-FFN staging: gate/up each own a fl = moe_ffn/2 N window and down owns the matching
+    // K window of the swiglu output, so one 3*fl bf16 block covers all three. The K-window
+    // activation quants need their own scratch (aq81/aq8 are kmax-sized, which on 27B is 6144
+    // -- smaller than fl = 8704); the NVFP4 variant reuses nv_xq/nv_xs (moe_ffn-sized), as tp=1.
+    if (c.dense_ffn && c.moe_ffn / 2 > 0) {
+        const int fl = c.moe_ffn / 2;
+        s.tp_ffn   = s.alloc<bf16>((size_t)3 * fl);
+        s.tp_fq81  = s.alloc<char>(kernels::llama_q8_1_bytes(fl));
+        s.tp_fq8   = s.alloc<signed char>(fl);
+        s.tp_fq8_d  = s.alloc<float>(fl / 32);
+        s.tp_fq8_s  = s.alloc<float>(fl / 32);
+    }
+    // Zero the exchange rows up front so the (leader-only) all-reduce can never read
+    // uninitialized memory in this session.
+    cu(cudaMemsetAsync(s.tp_xrow, 0, (size_t)H * sizeof(bf16), s.stream), "tp xrow init");
+    cu(cudaMemsetAsync(s.tp_ar, 0, (size_t)32 * 2 * H * sizeof(bf16), s.stream), "tp ar init");
+    cu(cudaSetDevice(prev), "tp_attach restore");
+    p_->tp_link = link;
+    // (S7a-1) Publish for the prefill o_proj all-reduce. Slot by link end, not by my_rank, so the
+    // leader is always the rank on the device_a side whatever its logical rank is.
+    {
+        const int slot = (s.device == link->device_a()) ? 0 : 1;
+        g_tp_prefill_link = link;
+        g_tp_prefill_dev[slot] = s.device;
+        g_tp_prefill_stream[slot] = s.stream;
+    }
+    fprintf(stderr, "[tp] rank %d attached (device %d; H=%d V=%d %d layers; peer slot %s)\n",
+            my_rank, s.device, H, c.vocab, c.n_layers,
+            world[1 - my_rank] ? "present" : "EMPTY");
+}
+
+int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float temperature,
+                                  unsigned long long seed, unsigned long long sample_step,
+                                  int top_k, float top_p,
+                                  float presence_penalty, float frequency_penalty) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden;
+    cudaStream_t st = s.stream;
+
+    // tp>1 decode is EAGER-only: a cross-device P2P op is not stream-capturable, so the graph
+    // machinery the tp=1 body relies on is deliberately bypassed (one-shot note).
+    {
+        static bool eager_noted = false;
+        if (!eager_noted) {
+            eager_noted = true;
+            fprintf(stderr, "[tp] tp=2 decode is EAGER-only (no CUDA-graph capture; P2P is "
+                            "not stream-capturable)\n");
+        }
+    }
+
+    // The group leader (rank 0) mirrors this call onto the peer rank on a one-shot worker thread;
+    // the peer runs this same body on its own device and never spawns (it is not rank 0), so there
+    // is exactly one mirror per op. The leader joins the worker before returning.
+    std::thread peer_worker;
+    if (s.tp_rank == 0 && s.tp_peers.size() == 2 && s.tp_peers[1]) {
+        Qwen35Model* peer = s.tp_peers[1];
+        peer_worker = std::thread([peer, token_id, position, sample, temperature, seed, sample_step,
+                                    top_k, top_p, presence_penalty, frequency_penalty]() {
+            // One-time device bind for this worker (lifecycle only): the peer model was built on
+            // its own card, but this thread has never touched it. No setDevice on the op path.
+            const int dev = peer->tp_rank_view().device;
+            if (dev >= 0) cu(cudaSetDevice(dev), "tp worker setDevice");
+            peer->forward_token_tp(token_id, position, sample, temperature, seed, sample_step,
+                                    top_k, top_p, presence_penalty, frequency_penalty);
+        });
+    }
+
+    // -- op entry: exchange the embedding row (design item 3) --
+    // The embedding table is row-split on the vocab axis, each rank holding V/2 CONSECUTIVE rows
+    // (rank r: rows [r*V/2, (r+1)*V/2)), so the input row lives on exactly one rank. The owner
+    // GEMVs its local copy of the row into tp_xrow -- indexed by the LOCAL row (global id minus
+    // its slice base, since its table holds only its half), the other rank zeroes its copy, and
+    // one all-reduce gives both ranks the full row. It then seeds x and primes layer 0's input
+    // norm, exactly as the tp=1 body's op entry does.
+    const int rows_per_rank = c.vocab / 2;
+    const int owning_rank = rows_per_rank > 0 ? token_id / rows_per_rank : 0;
+    if ((int)s.tp_rank == owning_rank) {
+        s.h_scalars[0] = token_id - owning_rank * rows_per_rank;
+        cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, sizeof(int), cudaMemcpyHostToDevice, st),
+           "tp entry token");
+        kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.tp_xrow, 1, H, st);
+    } else {
+        cu(cudaMemsetAsync(s.tp_xrow, 0, (size_t)H * sizeof(bf16), st), "tp xrow zero");
+    }
+    tp_allreduce_row(s.tp_xrow, (size_t)H, /*is_xrow=*/true);
+    cu(cudaMemcpyAsync(s.x, s.tp_xrow, (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+       "tp xrow -> x");
+    kernels::launch_rmsnorm(s.x, s.w.layers[0].input_norm, s.xn, 1, H, c.rms_eps, st);
+
+    // -- 64-layer loop: per-layer partials + one all-reduce per block; layer tails unchanged --
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        // The two attention flavors share the same tp shape: each helper computes this rank's
+        // partial into the tp_ar row (GDN: windowed qkv GEMV + rank-local conv/recurrence/norm +
+        // K-windowed ssm_out; attn: N-windowed q/k/v GEMVs + rank-local QK-norm/RoPE/KV-append/
+        // flash-decode + K-windowed o_proj), which the AR-A/AR-B all-reduces below combine.
+        if (is_linear_layer(c, L)) tp_gdn_layer_tp(L, s.x, s.xn);
+        else                        tp_attn_layer_tp(L, s.x, s.xn);
+        // AR-A: combine the attention-block partial (o_proj/s.ao once the body lands) across ranks.
+        tp_allreduce_row(s.tp_ar, (size_t)2 * H, /*is_xrow=*/false);
+        // tail1 (unchanged vs tp=1): h = x + attn_out ; hn = RMSNorm(h, post_attn_norm)
+        kernels::launch_add_rmsnorm2(s.x, s.tp_ar, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
+        // FFN partial (tp_ar row 0: this rank's ffn partial; AR-B below combines the ranks).
+        tp_ffn_layer_tp(L, s.xn, s.tp_ar);
+        // AR-B: combine the ffn_down partial across ranks.
+        tp_allreduce_row(s.tp_ar, (size_t)2 * H, /*is_xrow=*/false);
+        // tail2 (unchanged vs tp=1): x = h + ffn_out ; xn = RMSNorm(x, nextnorm)
+        const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+        kernels::launch_add_rmsnorm2(s.h, s.tp_ar, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+    }
+
+    // -- epilogue (design item 4, S4c-2): vocab-split lm_head GEMV + (m,t) combine --
+    // Each rank GEMVs the final normed row against its own consecutive half of the compact lm_head
+    // blob (N window: global rows [rank*Vr, (rank+1)*Vr)) into its half of the f32[V] tp_logits
+    // arena. bias/penalty run over the FULL arena (both arrays are full-vocab replicated, so both
+    // ranks apply the identical full-vocab transform), and top_k/top_p mask the OWNED half only
+    // (the V-sized CUB scratch is still valid; d_vocab_iota's prefix is exactly the local index
+    // set). The two halves then combine through GpuLink maxreduces: the 16-f32 (m,t) pack carries
+    // each half's max value + its GLOBAL token in a disjoint pack (rank r owns slots 2r,2r+1;
+    // all other slots -inf on BOTH ranks), so the elementwise max leaves [m0,t0,m1,t1] intact in
+    // tp_exch on both ranks and the winner (max m, rank-0 tie-break) plus the exact token come
+    // back to both. Sampling (temperature>0) additionally runs a 2x256-f32 maxreduce of
+    // -inf-padded survivor lists (the "identical union" carrier; per-vocab-half-normalized
+    // nucleus is a documented approximation). The 27B decode lm_head is Q4_K in BOTH variants
+    // (the ModelOpt loader requants it; the native NVFP4 payload is prefill-GEMM-only), so the
+    // arm chain mirrors the tp=1 one exactly with N=Vr and no FP8/NVFP4 arm (tp=1 has none);
+    // the bonsai/ptq1 arms are 27B-unreachable and skipped.
+    const int Vr  = c.vocab / 2;              // rows this rank owns (27B: 124160)
+    const int off = (int)s.tp_rank * Vr;      // global base of this rank's window
+    float* logits_h = s.tp_logits + off;     // this rank's half of the arena
+
+    // !sample: the tp=1 body never runs lm_head on this path either -- sync, join, return the
+    // input token (no logits needed).
+    if (!sample) {
+        cu(cudaStreamSynchronize(st), "tp noprobs sync");
+        if (peer_worker.joinable()) peer_worker.join();
+        return token_id;
+    }
+
+    // Sampling params, refreshed on THIS stream (the tp op entry does not run the tp=1 refresh
+    // block) so the mask/sampling kernels see this step's values.
+    *s.h_sample_temp = temperature;
+    *s.h_sample_seed = seed;
+    *s.h_sample_step = sample_step;
+    cu(cudaMemcpyAsync(s.d_sample_temp, s.h_sample_temp, sizeof(float), cudaMemcpyHostToDevice, st), "tp sample temp");
+    cu(cudaMemcpyAsync(s.d_sample_seed, s.h_sample_seed, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "tp sample seed");
+    cu(cudaMemcpyAsync(s.d_sample_step, s.h_sample_step, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "tp sample step");
+    *s.h_sample_top_k = top_k;
+    *s.h_sample_top_p = top_p;
+    cu(cudaMemcpyAsync(s.d_sample_top_k, s.h_sample_top_k, sizeof(int), cudaMemcpyHostToDevice, st), "tp sample top_k");
+    cu(cudaMemcpyAsync(s.d_sample_top_p, s.h_sample_top_p, sizeof(float), cudaMemcpyHostToDevice, st), "tp sample top_p");
+    *s.h_sample_presence_penalty = presence_penalty;
+    *s.h_sample_frequency_penalty = frequency_penalty;
+    cu(cudaMemcpyAsync(s.d_sample_presence_penalty, s.h_sample_presence_penalty, sizeof(float), cudaMemcpyHostToDevice, st), "tp presence");
+    cu(cudaMemcpyAsync(s.d_sample_frequency_penalty, s.h_sample_frequency_penalty, sizeof(float), cudaMemcpyHostToDevice, st), "tp frequency");
+
+    // lm_head N-window GEMV into the arena half (mirror of the tp=1 arm chain, out=arena half).
+    if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
+        kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+        kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, logits_h, Vr, H, st);
+    }
+    else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {
+        kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+        kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, logits_h, Vr, H, st);
+    }
+    else if (s.gguf && s.w.lm_head_type)
+        kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, logits_h, Vr, H, st);
+    else if (s.gguf)
+        kernels::launch_gemv_f32(s.xn, s.w.lm_head, logits_h, Vr, H, st);
+    else
+        kernels::launch_linear_f32(s.xn, s.w.lm_head, logits_h, 1, Vr, H, st);
+
+    // bias + penalty over the FULL arena (the peer half is stale here but never read).
+    kernels::launch_logit_bias(s.tp_logits, s.logit_bias, c.vocab, st);
+    kernels::launch_presence_frequency_penalty(s.tp_logits, s.penalty_counts, c.vocab,
+                                               s.d_sample_presence_penalty, s.d_sample_frequency_penalty, st);
+    // top_k/top_p mask over the OWNED half only (vocab=Vr; the V-sized scratch stays valid).
+    kernels::launch_topk_topp_mask(logits_h, Vr, s.d_vocab_iota, s.d_sorted_logits, s.d_sorted_idx,
+                                   s.d_topk_exp, s.d_topk_cumsum, s.d_sort_temp, s.sort_temp_bytes,
+                                   s.d_scan_temp, s.scan_temp_bytes,
+                                   s.d_sample_top_k, s.d_sample_top_p, s.d_rank_by_id, st);
+
+    // Gumbel row: D2D the post-masked arena half into tp_gumb (the peer half keeps the one-time
+    // -inf); the curand index 0*V+token is GLOBAL, so both ranks draw identical noise per token,
+    // and -inf stays -inf (a -inf slot can never win). The arena itself is left untouched.
+    cu(cudaMemcpyAsync(s.tp_gumb + off, logits_h, (size_t)Vr * sizeof(float), cudaMemcpyDeviceToDevice, st),
+       "tp gumb half");
+    kernels::launch_temperature_sample(s.tp_gumb, 1, c.vocab, s.d_sample_temp, s.d_sample_seed,
+                                       s.d_sample_step, st);
+    kernels::launch_argmax(s.tp_gumb, s.d_out_id, 1, c.vocab, st);
+
+    // Local (m,t): t from the Gumbel row (always in this rank's OWN half -- the peer half is
+    // -inf and never wins); m = that slot's (post-Gumbel) value. The winner's OWNER rank reports
+    // the real value, the other reports -inf, which the 16B maxreduce below filters out.
+    cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "tp t");
+    cu(cudaStreamSynchronize(st), "tp t sync");
+    const int local_tok = *s.h_out_id;
+    cu(cudaMemcpyAsync(s.h_exch, s.tp_gumb + local_tok, sizeof(float), cudaMemcpyDeviceToHost, st), "tp m");
+    cu(cudaStreamSynchronize(st), "tp m sync");
+    const float local_m = s.h_exch[0];
+
+    // 16-f32 (m,t) pack into tp_exch (rank r owns slots 2r,2r+1; the other 12 are -inf on both).
+    for (int i = 0; i < 16; i++) s.h_exch[i] = -INFINITY;
+    s.h_exch[2 * s.tp_rank] = local_m;
+    s.h_exch[2 * s.tp_rank + 1] = (float)local_tok;
+    cu(cudaMemcpyAsync(s.tp_exch, s.h_exch, 16 * sizeof(float), cudaMemcpyHostToDevice, st), "tp exch pack");
+
+    // Read the owned (post-masked, PRE-Gumbel -- the Gumbel only touched tp_gumb) half back:
+    // both for the 2x256 survivor union below (sampling only) and for the chosen token's raw
+    // (post-bias/penalty) logit, which is h_half[token - winner_off] in every sub-case (the
+    // temperature<=0 "greedy" sub-case's Gumbel step is a no-op, so its post- value == pre-).
+    cu(cudaMemcpyAsync(s.h_half, logits_h, (size_t)Vr * sizeof(float), cudaMemcpyDeviceToHost, st), "tp h_half");
+    cu(cudaStreamSynchronize(st), "tp h_half sync");
+
+    if (temperature > 0.f) {
+        // 2x256 survivor union: pack this rank's survivors (finite entries of h_half) into the
+        // canonical 256-slot list in ascending global-token order (-inf pad; if a rank has more
+        // than 256 survivors keep its 256 highest, then re-sort by token). Both ranks' lists
+        // share the slot<->token map, so the 256-f32 maxreduce leaves a byte-identical merged
+        // list in tp_exch2[256..512) on both ranks.
+        for (int i = 0; i < 256; i++) s.h_exch2[i] = -INFINITY;
+        {
+            std::vector<int> idx;
+            std::vector<float> val;
+            for (int i = 0; i < Vr; i++)
+                if (s.h_half[i] > -INFINITY) { idx.push_back(i); val.push_back(s.h_half[i]); }
+            if (idx.size() <= 256) {
+                for (size_t k = 0; k < idx.size(); k++) s.h_exch2[idx[k]] = val[k];
+            } else {
+                // The 256 highest by value: a 256-slot descending top list, linear insert (only
+                // the degenerate >256-survivors case pays this cost).
+                std::vector<float> tv;
+                std::vector<int> ti;
+                for (size_t k = 0; k < val.size(); k++) {
+                    size_t pos = tv.size();
+                    for (size_t j = 0; j < tv.size(); j++)
+                        if (val[k] > tv[j]) { pos = j; break; }
+                    if (pos < 256) {
+                        tv.insert(tv.begin() + pos, val[k]);
+                        ti.insert(ti.begin() + pos, idx[k]);
+                    }
+                    if (tv.size() > 256) { tv.pop_back(); ti.pop_back(); }
+                }
+                // Re-sort the kept 256 by (global) token: plain selection sort over <=256.
+                std::vector<int> ord(ti.size());
+                for (size_t a = 0; a < ord.size(); a++) ord[a] = (int)a;
+                for (size_t a = 0; a < ord.size(); a++)
+                    for (size_t b = a + 1; b < ord.size(); b++)
+                        if (ti[ord[b]] < ti[ord[a]]) { int q = ord[a]; ord[a] = ord[b]; ord[b] = q; }
+                for (size_t a = 0; a < ord.size(); a++) s.h_exch2[ti[ord[a]]] = tv[ord[a]];
+            }
+        }
+        cu(cudaMemcpyAsync(s.tp_exch2, s.h_exch2, 256 * sizeof(float), cudaMemcpyHostToDevice, st), "tp exch2 pack");
+        tp_maxreduce_f32(1, 256);
+    }
+
+    // 16B (m,t) maxreduce (leader-issued; the peer's call is a no-op), then both ranks read
+    // [m0,t0,m1,t1] back from tp_exch (the disjoint pack survives the elementwise max intact).
+    tp_maxreduce_f32(0, 16);
+    cu(cudaMemcpyAsync(s.h_exch, s.tp_exch, 16 * sizeof(float), cudaMemcpyDeviceToHost, st), "tp exch back");
+    cu(cudaStreamSynchronize(st), "tp exch sync");
+    const float m0 = s.h_exch[0], t0 = s.h_exch[1], m1 = s.h_exch[2], t1 = s.h_exch[3];
+    const int winner_rank = (m0 >= m1) ? 0 : 1;
+    const int token = (int)((winner_rank ? t1 : t0));   // t is exact as a float (token < 2^24)
+
+    // Finalize d_out_id on BOTH ranks to the global winner (the replicated penalty_counts are
+    // then incremented identically and stay in lockstep), and stage the chosen token's raw logit.
+    *s.h_out_id = token;
+    cu(cudaMemcpyAsync(s.d_out_id, s.h_out_id, sizeof(int), cudaMemcpyHostToDevice, st), "tp out_id");
+    kernels::launch_increment_penalty_count(s.penalty_counts, s.d_out_id, st);
+    const float chosen_logit = s.h_half[token - winner_rank * Vr];
+    s.h_exch[0] = chosen_logit;
+    cu(cudaMemcpyAsync(s.d_chosen_logit, s.h_exch, sizeof(float), cudaMemcpyHostToDevice, st), "tp chosen logit");
+
+    cu(cudaStreamSynchronize(st), "tp final sync");
+    if (peer_worker.joinable()) peer_worker.join();
+    return token;
+}
+
+bool Qwen35Model::decode_packed_tp(const int* tokens, const int* positions,
+                                   const uint64_t* seq_ids, int n, int* out_sampled) {
+    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
+    if (n < 1 || n > kQwen35MaxPackedRows) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (!s.cfg.hybrid || !s.gguf) return false;
+
+    // (dual-GPU WP-9, design item 9) The tp=2 packed decode is a per-row loop over the SAME
+    // single-row windowed path the single-token op runs (forward_token_tp): N one-row tp ARs
+    // instead of one packed N-row run. The rows-kernels bit-identity invariant (a packed row is
+    // bit-identical to that row's one-step AR) makes this correctness-preserving; the packed-
+    // kernel throughput a tp>1 split of the weights cannot use is the accepted perf regression --
+    // the M2 gate is code-complete + in-regime unit test.
+    //
+    // Per-row bookkeeping: the single-row tp path keys its per-rank state off the model's ACTIVE
+    // session (GDN/conv state pointers, the session's penalty/logit-bias buffers, and the
+    // position read from THIS rank's own KV pool), not on per-row table pointers like the tp=1
+    // packed kernels, so the leader activates each row's session before running it. The PEER
+    // rank's active session is not touched here: it must be mirrored by the engine (S8 wires
+    // model_engine to activate on both ranks) -- a caller driving this directly must keep the
+    // peer's active session in step with the rows.
+    //
+    // Sampling: the engine only packs plain-greedy batches (temperature 0, no truncation, no
+    // penalties, no logit bias -- see step_jobs_packed), and forward_token_tp at temperature 0
+    // returns the exact argmax (its Gumbel step is a no-op at zero temperature), so each
+    // out_sampled[i] is exactly what the tp=1 packed argmax would have emitted for that row.
+    // No GDN b16 compaction happens on the tp path (the tp=1 packed compaction loop is
+    // bypassed), so every session stays in the fp32 representation it was opened in: a mixed-
+    // representation batch, the one hazard the tp=1 packed path declines for, cannot arise.
+    for (int i = 0; i < n; i++)
+        if (s.sessions.find(seq_ids[i]) == s.sessions.end()) return false;
+    for (int i = 0; i < n; i++) {
+        activate_session(seq_ids[i]);
+        out_sampled[i] = forward_token_tp(tokens[i], positions[i],
+                                          /*sample=*/true, /*temperature=*/0.f,
+                                          /*seed=*/0, /*sample_step=*/0,
+                                          /*top_k=*/0, /*top_p=*/1.f,
+                                          /*presence_penalty=*/0.f, /*frequency_penalty=*/0.f);
+    }
+    return true;
+}
+
+void Qwen35Model::tp_attn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
+    (void)x;
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    const Qwen35LayerWeights& w = s.w.layers[l];
+    const int H = c.hidden;
+    const int HD = c.head_dim;
+    cudaStream_t st = s.stream;
+    kernels::GemmConfig gc{};
+
+    // This rank's full-attention window at R=2: rank r owns q heads [n_q/2*r, n_q/2*(r+1)) and
+    // kv heads [n_kv/2*r, n_kv/2*(r+1)) -- the loader sliced the weight blobs along exactly it.
+    // The rank's activations live in the LEADING window of the full-width s.q/s.k/s.v/s.qgate/
+    // s.attn buffers: the kernels below take LOCAL head counts and are head-index-agnostic, so
+    // they read exactly that window (27B: 12 q heads + 12 gate heads, 2 kv heads).
+    const int n_q     = c.n_q_heads / 2;
+    const int n_kv    = c.n_kv_heads / 2;
+    const int qdim_l   = n_q * HD;    // the rank's q (and gate) window; the o_proj K window
+    const int kvdim_l  = n_kv * HD;  // the rank's k/v window
+
+    // Zero the AR-A staging: the o_proj K-windowed partial below lands in the first H of the
+    // 2*H all-reduced row, the second H stays zero through the sum.
+    cu(cudaMemsetAsync(s.tp_ar, 0, (size_t)2 * H * sizeof(bf16), st), "tp attn ar zero");
+
+    // Only the hybrid full-attn shape is implemented here (27B: gated Q + partial rope; the KV
+    // append follows the cache's int8/bf16 kind). Any other combination (a plain-rope hybrid, a
+    // separate gate tensor) would corrupt this rank's pool with a wrong-shape append, so note
+    // once and leave the row zero rather than guess.
+    const bool partial_rope = (c.rope_dim > 0 && c.rope_dim < HD);
+    if (!partial_rope || w.wgate != nullptr) {
+        static bool attn_shape_note = false;
+        if (!attn_shape_note) {
+            attn_shape_note = true;
+            fprintf(stderr, "[tp] tp_attn_layer_tp: unsupported attn shape (partial_rope=%d "
+                            "sep_gate=%d); AR row left zero, layer output not valid\n",
+                    (int)partial_rope, (int)(w.wgate != nullptr));
+        }
+        return;
+    }
+
+    // -- this rank's position/seq_len. The tp path never writes d_scalars[1]/[3] (d_pos/d_seqlen),
+    // and this rank appends into its OWN pool, so the (rotary) position is its own pool's token
+    // allocation and the seq length follows it (tp=1: seqlen = position+1). mrope offset 0 (27B
+    // is text-only). tp_pos[0] feeds the append's positions, tp_pos[1] the flash-decode seq_lens.
+    const int pos    = s.kv->allocated_tokens(s.active_seq_id);
+    const int seqlen = pos + 1;
+    s.h_tp_pos[0] = pos;
+    s.h_tp_pos[1] = seqlen;
+    cu(cudaMemcpyAsync(s.tp_pos, s.h_tp_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, st),
+       "tp attn pos");
+
+    // -- quantize xn once, shared by the q/k/v GEMVs (same dispatch as the tp=1 body and the
+    // GDN tp body; the rank's compact blobs are full-K = H, so the full-K GEMVs read them right) --
+    const bool any_q4k = (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
+    const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
+    const bool any_q80 = (w.wq_type == 8 || w.wk_type == 8 || w.wv_type == 8);
+    const bool any_nv  = (w.wq_type == kernels::SI_QTYPE_NVFP4 ||
+                          w.wk_type == kernels::SI_QTYPE_NVFP4 ||
+                          w.wv_type == kernels::SI_QTYPE_NVFP4);
+    if (s.gguf && s.use_pq) {
+        if (s.use_llama && (any_q4k || any_q80 || (s.use_q6mmvq && any_q6k)))
+            kernels::launch_quantize_q8_1_blocks(xn, s.aq81, H, st);
+        else if (any_q4k)
+            kernels::launch_quantize_q8_1(xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
+    }
+    const bool xn_nv = s.gguf && any_nv && kernels::qwen38_nvfp4_dp4a_proj();
+    if (xn_nv)
+        kernels::launch_gemv_nvfp4_quant_x(xn, s.nv_pq_a, s.nv_ps_a, 1, H, st);
+
+    // -- N-window projections into the rank's compact [N'][K=H] blobs (plain GEMVs) --
+    auto proj = [&](const void* W, int t, void* y, int N) {
+        if (s.gguf) {
+            if (s.use_pq && t == 12) {
+                if (s.use_llama) kernels::launch_mmvq_q4k(s.aq81, W, y, N, H, st);
+                else             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, W, y, N, H, st);
+            }
+            else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14)
+                kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, st);
+            else if (s.use_pq && s.use_llama && t == 8)
+                kernels::launch_mmvq_q80(s.aq81, W, y, N, H, st);
+            else if (t == kernels::SI_QTYPE_FP8)
+                kernels::launch_gemv_fp8(xn, W, y, N, H, st);
+            else if (t == kernels::SI_QTYPE_NVFP4) {
+                if (!(xn_nv && kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_a, s.nv_ps_a, W, y,
+                                                                     1, N, H, st)))
+                    kernels::launch_gemv_nvfp4(xn, W, y, N, H, st);
+            }
+            else if (t) kernels::launch_gemv_q(xn, W, t, y, N, H, st);
+            else         kernels::launch_gemv(xn, W, y, N, H, st);
+        } else {
+            kernels::launch_gemm(xn, W, y, 1, N, H, 1.f, 0.f, gc, st);
+        }
+    };
+
+    // Q: 27B fuses Q and the attn gate into ONE GEMV whose raw output interleaves per head as
+    // [q(HD) | gate(HD)] -- head h owns raw[h*2*HD .. (h+1)*2*HD), q the first half, gate the
+    // second (see split_q_gate). The rank's N window is 2*qdim_l of that 2*qdim tensor, so it
+    // lands whole in tp_qraw and the split scatters the rank's head blocks into the leading
+    // windows of s.q / s.qgate.
+    if (w.q_has_gate) {
+        proj(w.wq, w.wq_type, s.tp_qraw, 2 * qdim_l);
+        kernels::launch_qwen36_split_q_gate(s.tp_qraw, s.q, s.qgate, n_q, HD, st);
+    } else {
+        proj(w.wq, w.wq_type, s.q, qdim_l);
+    }
+    proj(w.wk, w.wk_type, s.k, kvdim_l);
+    proj(w.wv, w.wv_type, s.v, kvdim_l);
+
+    // -- QK-norm: the [HD] weight is one shared vector, replicated over every head, so the local
+    // window needs no shift --
+    if (s.use_qkfuse)
+        kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, n_q, n_kv, HD, c.rms_eps, st);
+    else {
+        kernels::launch_rmsnorm(s.q, w.q_norm, s.q, n_q, HD, c.rms_eps, st);
+        kernels::launch_rmsnorm(s.k, w.k_norm, s.k, n_kv, HD, c.rms_eps, st);
+    }
+
+    // -- RoPE + KV-append into THIS rank's pool, which was built for exactly n_kv heads: pool
+    // head j == model kv head kv_head_start + j, and this rank's local kv head j is that model
+    // head, so the kernel's [(ctok*n_kv + j)*HD] indexing lands the token in this rank's rows.
+    const bool kv8 = s.kv->int8_kv();
+    const int kv_elem = kv8 ? 1 : 2;
+    void* kpool = (char*)s.kv->k_pool() + s.kv->layer_base_elems(l) * kv_elem;
+    void* vpool = (char*)s.kv->v_pool() + s.kv->layer_base_elems(l) * kv_elem;
+    void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(l) * 2 : nullptr;
+    void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(l) * 2 : nullptr;
+    int* ltab = w.swa ? s.kv->block_table_win(s.active_seq_id) : s.kv->block_table(s.active_seq_id);
+    if (kv8)
+        kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
+                                                    ltab, s.tp_pos, 1, n_q, n_kv,
+                                                    HD, c.rope_dim, c.rope_theta,
+                                                    s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+    else
+        kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool,
+                                               ltab, s.tp_pos, 1, n_q, n_kv,
+                                               HD, c.rope_dim, c.rope_theta,
+                                               s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+
+    // -- flash decode over the rank's own pool: local head counts; n_splits stays at the model
+    // value (the rank uses n_q of the 24-head fa_* scratch, inside its 24*MAX_NSPLITS sizing) --
+    static int attn_gq8 = -1;
+    if (attn_gq8 < 0) { const char* e = getenv("SPARKINFER_ATTN_GQ8"); attn_gq8 = (e && e[0] == '0') ? 0 : 1; }
+    const bool attn_gate_q8 = attn_gq8 && w.q_has_gate && s.gguf && s.use_pq && s.use_llama
+                               && (H == 2048 || H == 4096) && (w.wo_type == 12 || w.wo_type == 8)
+                               && (s.qdim % 32 == 0);
+    const bool emit_attn_q8 = !w.q_has_gate && s.use_attnin && s.gguf && s.use_pq && s.use_llama
+                               && w.wo_type == 12;
+    kernels::launch_flash_decode_split(s.q, kpool, vpool, ltab, s.tp_pos + 1, s.attn,
+                                       s.fa_m, s.fa_l, s.fa_acc, 1, n_q, n_kv, HD,
+                                       s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
+                                       1.f / sqrtf((float)HD), st,
+                                       (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, seqlen,
+                                       kscale, vscale, kv8 ? 1 : 0,
+                                       attn_gate_q8 ? s.qgate : nullptr, 0);
+    // Sigmoid gate over the rank's attn window (fused into the combine only for the gated-combine
+    // shapes above, which 27B is not).
+    if (w.q_has_gate && !attn_gate_q8)
+        kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, qdim_l, st);
+
+    // -- o_proj: the K-windowed (row-parallel) partial. The rank's blob is compact [N=H][K=qdim_l]
+    // (the K axis is the in-feature window of the rank's q heads -- the GGUF [in][out] layout
+    // splits along in), and the rank's local attn window IS exactly that K window, so a plain
+    // GEMV at K=qdim_l over the leading window is the partial; it lands in the first H of the AR
+    // row for the loop's AR-A, mirroring the GDN body's ssm_out.
+    if (s.gguf) {
+        if (s.use_pq && w.wo_type == 12) {
+            if (s.use_llama) {
+                kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, qdim_l, st);
+                kernels::launch_mmvq_q4k(s.aq81, w.wo, s.tp_ar, H, qdim_l, st);
+            } else {
+                kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, qdim_l, st);
+                kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, w.wo, s.tp_ar, H, qdim_l, st);
+            }
+        }
+        else if (s.use_pq && s.use_llama && s.use_q6mmvq && w.wo_type == 14) {
+            kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, qdim_l, st);
+            kernels::launch_mmvq_q6k(s.aq81, w.wo, s.tp_ar, H, qdim_l, st);
+        }
+        else if (s.use_pq && s.use_llama && w.wo_type == 8) {
+            kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, qdim_l, st);
+            kernels::launch_mmvq_q80(s.aq81, w.wo, s.tp_ar, H, qdim_l, st);
+        }
+        else if (w.wo_type == kernels::SI_QTYPE_FP8) {
+            kernels::launch_gemv_fp8(s.attn, w.wo, s.tp_ar, H, qdim_l, st);
+        }
+        else if (w.wo_type == kernels::SI_QTYPE_NVFP4) {
+            if (kernels::qwen38_nvfp4_dp4a_proj()) {
+                kernels::launch_gemv_nvfp4_quant_x(s.attn, s.nv_pq_b, s.nv_ps_b, 1, qdim_l, st);
+                if (!kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_b, s.nv_ps_b, w.wo, s.tp_ar,
+                                                           1, H, qdim_l, st))
+                    kernels::launch_gemv_nvfp4(s.attn, w.wo, s.tp_ar, H, qdim_l, st);
+            } else {
+                kernels::launch_gemv_nvfp4(s.attn, w.wo, s.tp_ar, H, qdim_l, st);
+            }
+        }
+        else if (w.wo_type) {
+            kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.tp_ar, H, qdim_l, st);
+        }
+        else {
+            kernels::launch_gemv(s.attn, w.wo, s.tp_ar, H, qdim_l, st);
+        }
+    } else {
+        kernels::launch_gemm(s.attn, w.wo, s.tp_ar, 1, H, qdim_l, 1.f, 0.f, gc, st);
+    }
+}
+
+void Qwen35Model::tp_gdn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
+    (void)x;
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    const Qwen35LayerWeights& w = s.w.layers[l];
+    const int H = c.hidden;
+    const int HD = c.linear_head_dim;
+    cudaStream_t st = s.stream;
+    kernels::GemmConfig gc{};
+
+    // Zero the AR-A staging: the ssm_out K-windowed partial below lands in the first H of the
+    // 2*H all-reduced row, the second H stays zero through the sum.
+    cu(cudaMemsetAsync(s.tp_ar, 0, (size_t)2 * H * sizeof(bf16), st), "tp gdn ar zero");
+
+    // -- this rank's GDN window (the loader already sliced its weights along exactly it) --
+    const int vloc = p_->gdn_window.v_count;                          // 24 per rank on 27B
+    const int v0   = p_->gdn_window.v_count > 0 ? p_->gdn_window.v_start : 0;
+    const int g     = c.linear_v_heads / c.linear_q_heads;           // v-heads per q-head group
+    const int q0    = c.gdn_qh_block ? v0 / g : 0;                   // q/k heads owned by the rank
+    const int ql    = c.gdn_qh_block ? vloc / g : vloc;
+    // Rank-local blobs are indexed by LOCAL head id (no offsets); only the full-width activation
+    // buffers (q/k/v, alpha/beta, gdn/norm, conv state) are shifted to the rank's global window.
+
+    // -- quantize xn once, shared by every full-K GEMV below (same dispatch as the tp=1 body) --
+    const bool any_q4k = (w.wqkv_type == 12 || w.wqkv_gate_type == 12 ||
+                          w.ssm_alpha_type == 12 || w.ssm_beta_type == 12);
+    const bool any_q6k = (w.wqkv_type == 14 || w.wqkv_gate_type == 14 ||
+                          w.ssm_alpha_type == 14 || w.ssm_beta_type == 14);
+    const bool any_q80 = (w.wqkv_type == 8 || w.wqkv_gate_type == 8 ||
+                          w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
+    const bool any_nv  = (w.wqkv_type == kernels::SI_QTYPE_NVFP4 ||
+                          w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 ||
+                          w.ssm_alpha_type == kernels::SI_QTYPE_NVFP4 ||
+                          w.ssm_beta_type == kernels::SI_QTYPE_NVFP4);
+    bool xn_nv = false;
+    if (s.gguf && s.use_pq) {
+        if (s.use_llama && (any_q4k || any_q80 || (s.use_q6mmvq && any_q6k)))
+            kernels::launch_quantize_q8_1_blocks(xn, s.aq81, H, st);
+        else if (any_q4k)
+            kernels::launch_quantize_q8_1(xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
+    }
+    xn_nv = s.gguf && any_nv && kernels::qwen38_nvfp4_dp4a_proj();
+    if (xn_nv)
+        kernels::launch_gemv_nvfp4_quant_x(xn, s.nv_pq_a, s.nv_ps_a, 1, H, st);
+
+    // -- one full-K GEMV over this rank's compact [N'][K=H] weight blob --
+    auto proj = [&](const void* W, int t, void* y, int N) {
+        if (s.gguf) {
+            if (s.use_pq && t == 12) {
+                if (s.use_llama) kernels::launch_mmvq_q4k(s.aq81, W, y, N, H, st);
+                else             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, W, y, N, H, st);
+            }
+            else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14)
+                kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, st);
+            else if (s.use_pq && s.use_llama && t == 8)
+                kernels::launch_mmvq_q80(s.aq81, W, y, N, H, st);
+            else if (t == kernels::SI_QTYPE_FP8)
+                kernels::launch_gemv_fp8(xn, W, y, N, H, st);
+            else if (t == kernels::SI_QTYPE_NVFP4) {
+                if (!(xn_nv && kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_a, s.nv_ps_a, W, y,
+                                                                    1, N, H, st)))
+                    kernels::launch_gemv_nvfp4(xn, W, y, N, H, st);
+            }
+            else if (t) kernels::launch_gemv_q(xn, W, t, y, N, H, st);
+            else         kernels::launch_gemv(xn, W, y, N, H, st);
+        } else {
+            kernels::launch_gemm(xn, W, y, 1, N, H, 1.f, 0.f, gc, st);
+        }
+    };
+
+    // -- qkv: one GEMV into staging (rows [ql q | ql k | vloc v] of the rank's blob), then
+    // three D2D copies scatter the windows into the full-width buffers at global offsets --
+    proj(w.wqkv, w.wqkv_type, s.tp_qkv, 2 * ql * HD + vloc * HD);
+    cu(cudaMemcpyAsync(s.lin_q + q0 * HD, s.tp_qkv, (size_t)ql * HD * sizeof(bf16),
+                       cudaMemcpyDeviceToDevice, st), "tp gdn q");
+    cu(cudaMemcpyAsync(s.lin_k + q0 * HD, s.tp_qkv + ql * HD, (size_t)ql * HD * sizeof(bf16),
+                       cudaMemcpyDeviceToDevice, st), "tp gdn k");
+    cu(cudaMemcpyAsync(s.lin_v + v0 * HD, s.tp_qkv + 2 * ql * HD, (size_t)vloc * HD * sizeof(bf16),
+                       cudaMemcpyDeviceToDevice, st), "tp gdn v");
+    proj(w.wqkv_gate, w.wqkv_gate_type, s.lin_z + v0 * HD, vloc * HD);
+    proj(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha + v0, vloc);
+    proj(w.ssm_beta, w.ssm_beta_type, s.lin_beta + v0, vloc);
+
+    // -- windowed conv: full-width qkv/conv_state operands, rank-local conv_w rows; heads
+    // outside the window return before touching conv_state, so each rank owns the conv-state
+    // rows of the heads it computes (and only those). The windowed fused kernel is the only
+    // window-capable conv here, so it is the tp path even when the tp=1 A/B guard does not
+    // hold for this shape (one-shot note; 27B always holds it).
+    bf16* conv_state = s.lin_conv_state +
+        (size_t)l * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    {
+        static int gdn_fuse = -1;
+        if (gdn_fuse < 0) { const char* e = getenv("SPARKINFER_GDN_FUSE"); gdn_fuse = (e && e[0] == '0') ? 0 : 1; }
+        static bool conv_note = false;
+        if (!conv_note) {
+            conv_note = true;
+            if (!(gdn_fuse && c.linear_head_dim == 128 && c.linear_q_heads == 16 &&
+                  (c.linear_v_heads == 32 || c.linear_v_heads == 48)))
+                fprintf(stderr, "[tp] gdn: tp conv uses the windowed fused kernel (the split "
+                                "kernel takes no rank window; tp=1 A/B guard not met)\n");
+        }
+        kernels::launch_qwen36_conv_split_l2norm_fused(s.lin_qkv, w.ssm_conv, conv_state,
+                                                       s.lin_q, s.lin_k, s.lin_v,
+                                                       c.linear_q_heads, c.linear_v_heads,
+                                                       c.linear_head_dim, c.linear_conv_kernel,
+                                                       c.rms_eps, st, q0, ql, q0, ql, v0, vloc);
+    }
+
+    // -- recurrence: pure base shifts + LOCAL head counts (the tp=1 windowed convention); a/dt
+    // ARE shifted by v0: the blobs are FULL-width (48) on every rank (the CT loader loads them
+    // whole on both ranks), so this rank's v window [v0, v0+vloc) reads its entries via the +v0
+    // shift -- the same convention as the 2221-side GDN body.
+    const size_t state_off = (size_t)gdn_state_slot(c, l) * vloc *
+        c.linear_head_dim * c.linear_head_dim;
+    kernels::launch_qwen36_gdn_ar(s.lin_q + q0 * HD, s.lin_k + q0 * HD,
+                                  s.lin_v + v0 * HD,
+                                  s.lin_alpha + v0, s.lin_beta + v0,
+                                  w.ssm_dt + v0, w.ssm_a + v0,
+                                  s.lin_state, state_off, s.lin_gdn + v0 * HD,
+                                  c.gdn_qh_block ? vloc / g : vloc,
+                                  vloc,
+                                  c.linear_head_dim, c.gdn_qh_block, st,
+                                  s.active_lin_state_b16);
+
+    // -- gated norm: the [HD] weight is a single shared vector (unshifted on every model);
+    // x/z/out carry the v-window shift.
+    kernels::launch_qwen36_gated_norm(s.lin_gdn + v0 * HD, s.lin_z + v0 * HD,
+                                      w.ssm_norm, s.lin_norm + v0 * HD,
+                                      vloc, c.linear_head_dim, c.rms_eps, st);
+
+    // -- ssm_out: the K-windowed (row-parallel) partial. The rank's weight blob is COMPACT
+    // [H][Kw] (N = full hidden, K = this rank's v window); the plain GEMVs at K = Kw are
+    // layout-correct for it in every type. The partial lands in tp_ar for the loop's AR-A.
+    const int K0 = v0 * HD, Kw = vloc * HD;
+    const uint16_t* ln = s.lin_norm + K0;
+    if (s.gguf) {
+        if (s.use_pq && w.ssm_out_type == 12) {
+            if (s.use_llama) {
+                kernels::launch_quantize_q8_1_blocks(ln, s.aq81, Kw, st);
+                kernels::launch_mmvq_q4k(s.aq81, w.ssm_out, s.tp_ar, H, Kw, st);
+            } else {
+                kernels::launch_quantize_q8_1(ln, s.aq8, s.aq8_d, s.aq8_s, Kw, st);
+                kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, w.ssm_out, s.tp_ar, H, Kw, st);
+            }
+        }
+        else if (s.use_pq && s.use_llama && s.use_q6mmvq && w.ssm_out_type == 14) {
+            kernels::launch_quantize_q8_1_blocks(ln, s.aq81, Kw, st);
+            kernels::launch_mmvq_q6k(s.aq81, w.ssm_out, s.tp_ar, H, Kw, st);
+        }
+        else if (s.use_pq && s.use_llama && w.ssm_out_type == 8) {
+            kernels::launch_quantize_q8_1_blocks(ln, s.aq81, Kw, st);
+            kernels::launch_mmvq_q80(s.aq81, w.ssm_out, s.tp_ar, H, Kw, st);
+        }
+        else if (w.ssm_out_type == kernels::SI_QTYPE_FP8) {
+            kernels::launch_gemv_fp8(ln, w.ssm_out, s.tp_ar, H, Kw, st);
+        }
+        else if (w.ssm_out_type == kernels::SI_QTYPE_NVFP4) {
+            if (kernels::qwen38_nvfp4_dp4a_proj()) {
+                kernels::launch_gemv_nvfp4_quant_x(ln, s.nv_pq_b, s.nv_ps_b, 1, Kw, st);
+                if (!kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_pq_b, s.nv_ps_b, w.ssm_out,
+                                                           s.tp_ar, 1, H, Kw, st))
+                    kernels::launch_gemv_nvfp4(ln, w.ssm_out, s.tp_ar, H, Kw, st);
+            } else {
+                kernels::launch_gemv_nvfp4(ln, w.ssm_out, s.tp_ar, H, Kw, st);
+            }
+        }
+        else if (w.ssm_out_type) {
+            kernels::launch_gemv_q(ln, w.ssm_out, w.ssm_out_type, s.tp_ar, H, Kw, st);
+        }
+        else {
+            kernels::launch_gemv(ln, w.ssm_out, s.tp_ar, H, Kw, st);
+        }
+    } else {
+        kernels::launch_gemm(ln, w.ssm_out, s.tp_ar, 1, H, Kw, 1.f, 0.f, gc, st);
+    }
+}
+
+void Qwen35Model::tp_ffn_layer_tp(int l, const uint16_t* xn, uint16_t* out) {
+    (void)xn;
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    const Qwen35LayerWeights& w = s.w.layers[l];
+    const int H = c.hidden;
+    const int fl = c.moe_ffn / 2;   // this rank's gate/up N window and down K window (8704 on 27B)
+    cudaStream_t st = s.stream;
+    kernels::GemmConfig gc{};
+    if (!c.dense_ffn || fl <= 0) {   // non-dense model: no FFN to split; keep the AR row zero
+        cu(cudaMemsetAsync(out, 0, (size_t)2 * H * sizeof(bf16), st), "tp ffn zero");
+        return;
+    }
+
+    // The layer loop passes the layer INPUT norm, but the FFN's input is the POST-ATTENTION
+    // norm: the tp=1 body's gate/up/down all read s.hn, which tail1 above just wrote. Reading it
+    // directly here (instead of the argument) mirrors the tp=1 sites without touching the loop.
+    const bf16* x = s.hn;
+
+    // Zero the AR-B staging: the down K-windowed partial lands in the first H of the 2*H row,
+    // the second H stays zero through the all-reduce sum.
+    cu(cudaMemsetAsync(out, 0, (size_t)2 * H * sizeof(bf16), st), "tp ffn ar zero");
+
+    // -- this rank's windows: gate and up each own fl rows of the F-row matrices, h is the
+    // swiglu over exactly that pair, and down's K window over h is the same fl values,
+    // positionally aligned with this rank's compact down blob (the AR-B sums the partials).
+    bf16* g = s.tp_ffn;
+    bf16* u = s.tp_ffn + fl;
+    bf16* h = s.tp_ffn + 2 * fl;
+
+    // -- NVFP4 ModelOpt 27B: the tp=1 dense-FFN sites (nvfp4 dp4a / bf16 fallback), same
+    // windows. nv_xq/nv_xs are moe_ffn-sized, so they hold both activation quants (K = H for
+    // gate/up, K = fl for down) without any new buffer; nv_pq_a is kmax-sized and is not used.
+    if (w.gate_nv && w.up_nv && w.down_nv) {
+        if (s.gguf && kernels::qwen38_nvfp4_dp4a()) {
+            kernels::launch_gemv_nvfp4_quant_x(x, s.nv_xq, s.nv_xs, 1, H, st);
+            if (!kernels::launch_gemv_nvfp4_rows_dp4a2(s.nv_xq, s.nv_xs, w.gate_nv, w.up_nv,
+                                                        g, u, 1, fl, H, st)) {
+                kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.gate_nv, g, 1, fl, H, st);
+                kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.up_nv, u, 1, fl, H, st);
+            }
+            if (!kernels::launch_prefill_swiglu_nvfp4(g, u, h, s.nv_xq, s.nv_xs, fl, st)) {
+                kernels::launch_prefill_swiglu(g, u, h, fl, st);
+                kernels::launch_gemv_nvfp4_quant_x(h, s.nv_xq, s.nv_xs, 1, fl, st);
+            }
+            if (!kernels::launch_gemv_nvfp4_rows_dp4a(s.nv_xq, s.nv_xs, w.down_nv, out, 1, H, fl, st))
+                kernels::launch_gemv_nvfp4(h, w.down_nv, out, H, fl, st);
+        } else {
+            kernels::launch_gemv_nvfp4(x, w.gate_nv, g, fl, H, st);
+            kernels::launch_gemv_nvfp4(x, w.up_nv, u, fl, H, st);
+            kernels::launch_prefill_swiglu(g, u, h, fl, st);
+            kernels::launch_gemv_nvfp4(h, w.down_nv, out, H, fl, st);
+        }
+        return;
+    }
+
+    // -- Gguf Q4_K 27B (and the other quantized types): quantize the FFN input ONCE, keyed on
+    // the types this FFN actually carries (same dispatch family as tp_gdn_layer_tp's entry).
+    const bool any_q4k = (w.gate_qtype == 12 || w.up_qtype == 12 || w.down_qtype == 12);
+    const bool any_q6k = (w.gate_qtype == 14 || w.up_qtype == 14 || w.down_qtype == 14);
+    const bool any_q80 = (w.gate_qtype == 8  || w.up_qtype == 8  || w.down_qtype == 8);
+    if (s.gguf && s.use_pq) {
+        if (s.use_llama && (any_q4k || any_q80 || (s.use_q6mmvq && any_q6k)))
+            kernels::launch_quantize_q8_1_blocks(x, s.aq81, H, st);
+        else if (any_q4k)
+            kernels::launch_quantize_q8_1(x, s.aq8, s.aq8_d, s.aq8_s, H, st);
+    }
+
+    // -- gate/up: N-window GEMVs over this rank's compact weight blobs (K = H full; the N axis
+    // is the fast one in every layout, so a windowed N is a pure row-range shift, no kernel change).
+    auto proj = [&](const void* W, int t, bf16* y) {
+        if (s.gguf) {
+            if (s.use_pq && t == 12) {
+                if (s.use_llama) kernels::launch_mmvq_q4k(s.aq81, W, y, fl, H, st);
+                else             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, W, y, fl, H, st);
+            }
+            else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14)
+                kernels::launch_mmvq_q6k(s.aq81, W, y, fl, H, st);
+            else if (s.use_pq && s.use_llama && t == 8)
+                kernels::launch_mmvq_q80(s.aq81, W, y, fl, H, st);
+            else if (t == kernels::SI_QTYPE_FP8)
+                kernels::launch_gemv_fp8(x, W, y, fl, H, st);
+            else if (t == kernels::SI_QTYPE_NVFP4)
+                kernels::launch_gemv_nvfp4(x, W, y, fl, H, st);
+            else if (t) kernels::launch_gemv_q(x, W, t, y, fl, H, st);
+            else         kernels::launch_gemv(x, W, y, fl, H, st);
+        } else {
+            kernels::launch_gemm(x, W, y, 1, fl, H, 1.f, 0.f, gc, st);
+        }
+    };
+    proj(w.gate_q, w.gate_qtype, g);
+    proj(w.up_q,   w.up_qtype,   u);
+
+    // -- swiglu over the rank's window (h is the down's K window, positionally aligned).
+    kernels::launch_prefill_swiglu(g, u, h, fl, st);
+
+    // -- down: K-window GEMV over this rank's compact [K = fl][N = H] blob, partial into the
+    // first H of the AR row (the K-windowed quants cannot reuse aq81/aq8: those are kmax-sized
+    // (6144 on 27B), below fl = 8704, so they land in the tp_attach scratch).
+    if (s.gguf) {
+        if (s.use_pq && s.use_llama && w.down_qtype == 12) {
+            kernels::launch_quantize_q8_1_blocks(h, s.tp_fq81, fl, st);
+            kernels::launch_mmvq_q4k(s.tp_fq81, w.down_q, out, H, fl, st);
+        }
+        else if (s.use_pq && s.use_llama && s.use_q6mmvq && w.down_qtype == 14) {
+            kernels::launch_quantize_q8_1_blocks(h, s.tp_fq81, fl, st);
+            kernels::launch_mmvq_q6k(s.tp_fq81, w.down_q, out, H, fl, st);
+        }
+        else if (s.use_pq && s.use_llama && w.down_qtype == 8) {
+            kernels::launch_quantize_q8_1_blocks(h, s.tp_fq81, fl, st);
+            kernels::launch_mmvq_q80(s.tp_fq81, w.down_q, out, H, fl, st);
+        }
+        else if (s.use_pq && !s.use_llama && w.down_qtype == 12) {
+            kernels::launch_quantize_q8_1(h, s.tp_fq8, s.tp_fq8_d, s.tp_fq8_s, fl, st);
+            kernels::launch_gemv_q_dp4a_pq(s.tp_fq8, s.tp_fq8_d, s.tp_fq8_s, w.down_q, out, H, fl, st);
+        }
+        else if (w.down_qtype == kernels::SI_QTYPE_FP8) {
+            kernels::launch_gemv_fp8(h, w.down_q, out, H, fl, st);
+        }
+        else if (w.down_qtype) {
+            kernels::launch_gemv_q(h, w.down_q, w.down_qtype, out, H, fl, st);
+        }
+        else {
+            kernels::launch_gemv(h, w.down_q, out, H, fl, st);
+        }
+    } else {
+        kernels::launch_gemm(h, w.down_q, out, 1, H, fl, 1.f, 0.f, gc, st);
+    }
+}
+
+void Qwen35Model::tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow) {
+    Impl& s = *p_;
+    // Only the group leader (rank 0) issues the all-reduce: a single GpuLink::allreduce posts
+    // the reduce on BOTH ranks' streams (see reduce_impl in gpu_link.cpp), so the peer must not
+    // issue a second one. The peer's call is therefore a deliberate no-op.
+    if (s.tp_rank != 0) return;
+    if (!s.tp_link || s.tp_peers.size() != 2 || !s.tp_peers[1]) return;
+    const TpRankView pv = s.tp_peers[1]->tp_rank_view();
+    uint16_t* p_row = is_xrow ? pv.xrow : pv.ar;
+    GpuLink::RankRef self_ref{s.device, s.stream, row, row};
+    GpuLink::RankRef peer_ref{pv.device, pv.stream, p_row, p_row};
+    // reduce_impl requires ref a on the link's device_a and ref b on device_b; order ours to
+    // match the link's (dev_a, dev_b) regardless of which physical rank this instance is.
+    GpuLink::RankRef a = self_ref, b = peer_ref;
+    if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
+    if (!s.tp_link->allreduce(a, b, elems * sizeof(uint16_t), GpuLink::Dtype::BFloat16))
+        cu(cudaErrorUnknown, "tp allreduce");
+}
+
+void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
+    // Prefill o_proj partial (S7a-1): each rank's pass calls this with its per-pass [N][H] buffer
+    // right after enqueuing its K-compact o_proj GEMM. The call registers the buffer in the
+    // caller's process-static slot; the peer's call is registration-only, because one link call
+    // posts on BOTH ranks' streams, so only the leader may issue the reduce (as in
+    // tp_allreduce_row). The leader spin-waits for the peer's registration before posting, which
+    // at least guarantees both GEMMs are enqueued. The P2P read of the peer buffer carries no
+    // cross-context event wait -- the same pre-existing race profile as the decode AR rows,
+    // recorded here, never fixed.
+    if (!g_tp_prefill_link || !in_out || elems == 0) return;
+    if (g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        (dev != g_tp_prefill_dev[0] && dev != g_tp_prefill_dev[1]))
+        return;
+    const int r = (dev == g_tp_prefill_dev[0]) ? 0 : 1;
+    g_tp_prefill_buf[r] = in_out;
+    g_tp_prefill_calls[r].fetch_add(1, std::memory_order_seq_cst);
+    if (r != 0) return;  // peer: registration only
+    const unsigned long long mine = g_tp_prefill_calls[0].load(std::memory_order_seq_cst);
+    while (g_tp_prefill_calls[1].load(std::memory_order_seq_cst) < mine)
+        std::this_thread::yield();
+    GpuLink::RankRef a{g_tp_prefill_dev[0], g_tp_prefill_stream[0], g_tp_prefill_buf[0],
+                       g_tp_prefill_buf[0]};
+    GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_prefill_stream[1], g_tp_prefill_buf[1],
+                       g_tp_prefill_buf[1]};
+    if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
+        cu(cudaErrorUnknown, "tp prefill allreduce");
+}
+
+void Qwen35Model::tp_maxreduce_f32(int kind, size_t elems) {
+    Impl& s = *p_;
+    // Only the group leader (rank 0) issues the maxreduce: one GpuLink::maxreduce posts the
+    // reduce on BOTH ranks' streams, so the peer's call is a deliberate no-op (same as
+    // tp_allreduce_row). Ranks' f32 buffers: kind 0 in==out==tp_exch on both ranks (the
+    // disjoint pack makes the elementwise max exact); kind 1 in=tp_exch2[0..256) and
+    // out=tp_exch2[256..512) on both ranks. The P2P transport reads the peer's per-step
+    // written buffer with no cross-context event wait (pinned staging does) -- the same
+    // pre-existing profile as the AR-A/AR-B rows, recorded here, never fixed.
+    if (s.tp_rank != 0) return;
+    if (!s.tp_link || s.tp_peers.size() != 2 || !s.tp_peers[1]) return;
+    const TpRankView pv = s.tp_peers[1]->tp_rank_view();
+    GpuLink::RankRef self_ref, peer_ref;
+    if (kind == 0) {
+        self_ref  = GpuLink::RankRef{s.device, s.stream, s.tp_exch, s.tp_exch};
+        peer_ref  = GpuLink::RankRef{pv.device, pv.stream, pv.exch, pv.exch};
+    } else {
+        self_ref  = GpuLink::RankRef{s.device, s.stream, s.tp_exch2, s.tp_exch2 + 256};
+        peer_ref  = GpuLink::RankRef{pv.device, pv.stream, pv.exch2, pv.exch2 + 256};
+    }
+    // reduce_impl requires ref a on the link's device_a and ref b on device_b; order ours to
+    // match the link's (dev_a, dev_b) regardless of which physical rank this instance is.
+    GpuLink::RankRef a = self_ref, b = peer_ref;
+    if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
+    if (!s.tp_link->maxreduce(a, b, elems * sizeof(float), GpuLink::Dtype::Float32))
+        cu(cudaErrorUnknown, "tp maxreduce");
+}
+
 namespace {
 bool prefill_samples_lmhead() {
     static int legacy = -1;
@@ -4220,6 +5304,10 @@ int Qwen35Model::max_packed_rows() {
 
 bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                                 const uint64_t* seq_ids, int n, int* out_sampled) {
+    // (dual-GPU WP-9) tp=2: same split-weights story as forward_token above -- the step runs on
+    // the per-rank twin instead; this guard is the ONLY tp>1 delta on the tp=1 packed path.
+    if (tp_active())
+        return decode_packed_tp(tokens, positions, seq_ids, n, out_sampled);
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled) return false;
     if (n < 1 || n > kQwen35MaxPackedRows) return false;
@@ -9135,18 +10223,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             // 10.8/3.2 in this runtime vs. 108.6/79.7 in the reference trace, and neither tensor
             // goes through conv at all, ruling out the conv1d weight as their cause and pointing
             // straight at their own [out,in]-vs-[in,out] mismatch.
-            w.ssm_dt = tp_pick(lb + "dt_bias",
-                [&]{ return plain_bf16(lb + "dt_bias", c.linear_v_heads); },
-                [&](const TpSlice& sl) {
-                    return ct_bf16_slice(lb + "dt_bias", c.linear_v_heads, 1, false, sl,
-                                         nullptr);
-                });
-            w.ssm_a = tp_pick(lb + "A_log",
-                [&]{ return load_a_log_transformed(lb + "A_log", c.linear_v_heads); },
-                [&](const TpSlice& sl) {
-                    return ct_bf16_slice(lb + "A_log", c.linear_v_heads, 1, false, sl,
-                                         &xform_a_log);
-                });
+            // a/dt are per-v-head scalars consumed at the GLOBAL v offset (+v0 shift at call sites),
+            // so both ranks hold all rows; the degenerate table already routed to these readers -> tp=1 byte-identical.
+            w.ssm_dt = plain_bf16(lb + "dt_bias", c.linear_v_heads);
+            w.ssm_a  = load_a_log_transformed(lb + "A_log", c.linear_v_heads);
             w.ssm_norm = tp_pick(lb + "norm.weight",
                 [&]{ return plain_bf16(lb + "norm.weight", c.linear_head_dim); },
                 [&](const TpSlice& sl) {

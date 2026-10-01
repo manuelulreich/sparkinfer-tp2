@@ -619,8 +619,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // A packed pass carries several sessions' state and block tables and is shaped by its pack, so
     // it never captures; and since it may grow the arena under a graph an earlier single-prompt
     // pass captured, it drops that graph too (below) rather than leave it pointing at freed scratch.
+    // tp>1 prefill is EAGER-only, like the tp decode twin: the cross-device P2P all-reduce in the
+    // o_proj below is not stream-capturable, so a tp pass must neither capture nor replay the
+    // static prefill graph (one-shot note).
+    const bool tp_active = s.gdn_window.v_count > 0;
+    if (tp_active) {
+        static bool tp_prefill_eager_noted = false;
+        if (!tp_prefill_eager_noted) {
+            tp_prefill_eager_noted = true;
+            fprintf(stderr, "[tp] tp=2 prefill is EAGER-only (the o_proj all-reduce is not "
+                            "stream-capturable; graph capture/replay bypassed)\n");
+        }
+    }
     const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash && pos0 == 0 &&
-                          !multi;
+                          !multi && !tp_active;
     const void* const pfb_btable = s.kv->block_table(s.seq_id);
     // A whole-prefill graph embeds every pointer passed to its kernel nodes. The arena addresses
     // are deliberately stable, but recurrent state and the paged-KV block table are session-owned:
@@ -686,6 +698,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bf16* lnrm = a.alloc<bf16>((size_t)N * lvdim);       // lin_norm (4096)
     bf16* la   = a.alloc<bf16>((size_t)N * vh);          // lin_alpha (32)
     bf16* lb   = a.alloc<bf16>((size_t)N * vh);          // lin_beta (32)
+    // tp only (S7a-1): this rank's o_proj input window [N][qdim/tp], staged out of `att` before
+    // the K-compact projection. Allocated lazily on first use and never on a tp=1 pass, so the
+    // arena slot pattern stays stable within each pass class (the cprev invariant above).
+    bf16* tp_att_win = nullptr;
     // The previous window's trailing raw-qkv rows, staged out of the live conv state so the conv
     // kernel can read them while it overwrites conv_state with this window's own. One layer's
     // worth is enough -- the layer loop copies into it immediately before each conv. Allocated
@@ -705,6 +721,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bf16* qg   = lnrm;                                   // full q-gate (4096) <- lin_norm (4096)
     bf16* kf   = gq;                                     // full k      (1024) <- gdn q    (2048)
     bf16* vf   = gk;                                     // full v      (1024) <- gdn k    (2048)
+    // (S7a-2) tp full-attn rank-width staging: the four aliases above share the GDN scratch
+    // (gv/lnrm/gq/gk), which the GDN branch owns, so tp gets its own [N][qdim/ranks] /
+    // [N][kvdim/ranks] buffers ([N][3072] x2 + [N][512] x2 on 27B) instead of reshaping them.
+    // Allocated only when tp_active; never touched on the tp=1 path.
+    bf16* tp_qb = nullptr;
+    bf16* tp_qg = nullptr;
+    bf16* tp_kf = nullptr;
+    bf16* tp_vf = nullptr;
+    // (S7a-3) tp wide-branch staging: the wide [q|gate] operand comes off wq as one
+    // rank-width [N][wide/ranks] buffer (tp_qwide); the split below carves tp_qb/tp_qg out
+    // of it, and tp_att is the rank-width [N][qdim/ranks] gated attention output the rank
+    // o_proj window below stages. tp_wide marks that the wide branch ran on rank widths.
+    bf16* tp_qwide = nullptr;
+    bf16* tp_att = nullptr;
+    bool tp_wide = false;
     const bool attn_vi8 = !c.muse_glimmer && c.hybrid && N >= 32768 &&
         [] { const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8"); return !e || e[0] != '0'; }();
     signed char* vi8 = nullptr;
@@ -1352,7 +1383,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     unsigned char* fp4_a = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
     unsigned char* fp4_as = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
     unsigned char* fp4_ws = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
-    bf16* fp4_qkv = muse_nvfp4_qkv ? a8.alloc<bf16>((size_t)N * qkvg_n) : nullptr;
+    bf16* fp4_qkv = (muse_nvfp4_qkv && !tp_active) ? a8.alloc<bf16>((size_t)N * qkvg_n) : nullptr; // tp: S7a-2b
     // The streamed o operand (see wo_stream above): H rows of FP4, and 2048 rows of bf16 staging
     // when the layer cannot take the direct Q4_K conversion.
     const int wo_st_rows = (H < 2048) ? H : 2048;
@@ -2159,9 +2190,77 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
             const bool restore_i8_gdn = use_i8;
             if (use_i8 && !use_i8_gdn) use_i8 = false;
-            gdn_qkv_z(xn, w, attn_norm_deferred);                    // qkv + z gate (fp8: fused)
-            proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
-            proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+            // S7b-v3: tp=2 window-fill GDN head. Each rank's qkv/z/alpha/beta blobs are
+            // rank-width (head-grouped q|k|v per v-head window), so under tp the GEMMs run
+            // rank-dense into rank-sized scratch and the results are gathered into this rank's
+            // column windows of the full-width arena buffers (b8/lz/la/lb); the other rank's
+            // windows stay zero and the conv weight is repad'd to zero there (below), which is
+            // what keeps the unbranched middle (conv -> chunk/scan -> gated_norm) bit-safe. The
+            // tp=1 arms are the original calls, verbatim.
+            const bool tp_gdn = tp_active;
+            const int gdn_ranks = tp_gdn ? (c.linear_v_heads / s.gdn_window.v_count) : 1;
+            const int gdn_r = (s.gdn_window.v_count > 0) ? (s.gdn_window.v_start / s.gdn_window.v_count) : 0;
+            const int gdn_ql = (lqkv - lvdim) / (2 * gdn_ranks);
+            const int gdn_vl = lvdim / gdn_ranks;
+            const int gdn_vh = vh / gdn_ranks;
+            if (tp_gdn) {
+                // qkv: rank blob [2*gdn_ql + gdn_vl][H] (q window | k window | v window) -> the
+                // b8 row's q/k/v blocks at this rank's in-row window bases; z -> the lz window.
+                const size_t rowqkv = 2 * (size_t)gdn_ql + gdn_vl;
+                bf16* tp_qkv = a.alloc<bf16>((size_t)N * rowqkv);
+                bf16* tp_z   = a.alloc<bf16>((size_t)N * gdn_vl);
+                proj_fused(xn, w.wqkv,      w.wqkv_type,      w.wqkv_rs,      tp_qkv, rowqkv, H, N);
+                proj_fused(xn, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, tp_z,   gdn_vl, H, N);
+                kernels::launch_gather_rows(b8 + gdn_r * gdn_ql, wide, tp_qkv, rowqkv, gdn_ql, N, st);
+                kernels::launch_gather_rows(b8 + (lqkv - lvdim) / 2 + gdn_r * gdn_ql, wide, tp_qkv + gdn_ql, rowqkv, gdn_ql, N, st);
+                kernels::launch_gather_rows(b8 + (lqkv - lvdim) + gdn_r * gdn_vl, wide, tp_qkv + 2 * gdn_ql, rowqkv, gdn_vl, N, st);
+                kernels::launch_gather_rows(lz + gdn_r * gdn_vl, lvdim, tp_z, gdn_vl, gdn_vl, N, st);
+            } else {
+                gdn_qkv_z(xn, w, attn_norm_deferred);                    // qkv + z gate (fp8: fused)
+            }
+            if (tp_gdn) {
+                bf16* tp_a = a.alloc<bf16>((size_t)N * gdn_vh);
+                proj(xn, w.ssm_alpha, w.ssm_alpha_type, tp_a, gdn_vh, H, N);
+                kernels::launch_gather_rows(la + gdn_r * gdn_vh, vh, tp_a, gdn_vh, gdn_vh, N, st);
+            } else {
+                proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
+            }
+            if (tp_gdn) {
+                bf16* tp_b = a.alloc<bf16>((size_t)N * gdn_vh);
+                proj(xn, w.ssm_beta, w.ssm_beta_type, tp_b, gdn_vh, H, N);
+                kernels::launch_gather_rows(lb + gdn_r * gdn_vh, vh, tp_b, gdn_vh, gdn_vh, N, st);
+            } else {
+                proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+            }
+            const void* gdn_conv_w = w.ssm_conv;
+            if (tp_gdn) {
+                // The conv weight is the rank blob [2*gdn_ql + gdn_vl][conv_kernel] (taps inner -- the
+                // layout the conv kernel indexes as conv_w[d * conv_kernel + c]). Repad it to the full
+                // [lqkv][conv_kernel] width: this rank's channel rows verbatim in its window, every
+                // other channel's taps zeroed -- zero weights keep the other rank's conv outputs and
+                // conv_state bit-zero, which is what makes the unbranched middle safe. bf16, unquantized;
+                // the D2H below is synchronous (the weight is read-only), the H2D is stream-ordered
+                // before the conv kernels on st.
+                const int taps = c.linear_conv_kernel;
+                const size_t rankw = 2 * (size_t)gdn_ql + gdn_vl;
+                std::vector<bf16> src(rankw * (size_t)taps);
+                pf_cu(cudaMemcpy(src.data(), w.ssm_conv, rankw * (size_t)taps * sizeof(bf16),
+                              cudaMemcpyDeviceToHost), "gdn tp conv D2H");
+                std::vector<bf16> full((size_t)lqkv * taps, 0);
+                for (int c = 0; c < gdn_ql; c++)
+                    for (int t = 0; t < taps; t++)
+                        full[(gdn_r * gdn_ql + c) * taps + t] = src[c * taps + t];
+                for (int c = 0; c < gdn_ql; c++)
+                    for (int t = 0; t < taps; t++)
+                        full[((lqkv - lvdim) / 2 + gdn_r * gdn_ql + c) * taps + t] = src[(gdn_ql + c) * taps + t];
+                for (int c = 0; c < gdn_vl; c++)
+                    for (int t = 0; t < taps; t++)
+                        full[((lqkv - lvdim) + gdn_r * gdn_vl + c) * taps + t] = src[(2 * gdn_ql + c) * taps + t];
+                bf16* conv_scratch = a.alloc<bf16>((size_t)lqkv * taps);
+                pf_cu(cudaMemcpyAsync(conv_scratch, full.data(), (size_t)lqkv * taps * sizeof(bf16),
+                                  cudaMemcpyHostToDevice, st), "gdn tp conv H2D");
+                gdn_conv_w = conv_scratch;
+            }
             // Dual-GPU CHG-0011 (H): this rank's GDN v window, G's idiom. v_count == 0 (tp=1 /
             // unsplit) makes the windowed calls below degenerate to v0 = 0, vloc = full v count.
             const int gdn_v0 = s.gdn_window.v_count > 0 ? s.gdn_window.v_start : 0;
@@ -2178,7 +2277,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 for (int i = 0; i < nseg; ++i) {
                     const size_t o = (size_t)s.multi_off[i];
                     const int len = s.multi_len[i];
-                    kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv,
+                    kernels::launch_prefill_gdn_conv(b8 + o * lqkv, gdn_conv_w,
                         static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at,
                         gq + o * lq, gk + o * lq, gv + o * lvdim, len, c.linear_q_heads, vh,
                         c.linear_head_dim, c.linear_conv_kernel, eps, st, nullptr);
@@ -2216,7 +2315,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     pf_cu(cudaMemcpyAsync(cprev, conv_state,
                                           (size_t)(c.linear_conv_kernel - 1) * lqkv * sizeof(bf16),
                                           cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
-                kernels::launch_prefill_gdn_conv(b8, w.ssm_conv, conv_state, gq, gk, gv,
+                kernels::launch_prefill_gdn_conv(b8, gdn_conv_w, conv_state, gq, gk, gv,
                     N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
                 float* layer_state = s.lin_state +
                     (size_t)gdn_state_slot(c, L) * gdn_vloc(s) * c.linear_head_dim * c.linear_head_dim;
@@ -2254,35 +2353,47 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // read ao, write x) for one flop per element; the epilogue already holds the
             // accumulator in registers, so folding it in costs one read and removes the pass.
             // The fused form claims the residual itself -- attn_fused suppresses the add below.
+            // S7b-v3 tail: under tp the out-proj is K-split -- each rank projects its lnrm window
+            // (K = gdn_vl) with its ssm_out rank blob [H][gdn_vl] into the full-width ao partial,
+            // and the allreduce sums the ranks' partials (24's tp=2 FFN idiom, GDN form). The
+            // non-bf16 out arms (nvfp4 / fused-residual / row-scale-fused) stay in the tp=1 arm
+            // only; 27B prefill is bf16, so the tp path is the plain proj + AR.
             bool out_fp4 = false;
-            if (gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
-                fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
-                kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st)) {
-                if (nvfp4_resid_fuse &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
-                                                       w.gdn_out_fp4, w.gdn_out_fp4_sf,
-                                                       x, N, H, lvdim, fp4_gdn_ws, st,
-                                                       w.gdn_out_fp4_alpha, x)) {
-                    out_fp4 = true;
-                    attn_fused = true;
-                } else if (kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
-                                                              w.gdn_out_fp4, w.gdn_out_fp4_sf,
-                                                              ao, N, H, lvdim, fp4_gdn_ws, st,
-                                                              w.gdn_out_fp4_alpha)) {
-                    out_fp4 = true;
+            if (tp_gdn) {
+                bf16* tp_lnA = a.alloc<bf16>((size_t)N * gdn_vl);
+                kernels::launch_gather_rows(tp_lnA, gdn_vl, lnrm + gdn_r * gdn_vl, lvdim, gdn_vl, N, st);
+                proj(tp_lnA, w.ssm_out, w.ssm_out_type, ao, H, gdn_vl, N);
+                tp_prefill_allreduce_bf16(ao, (size_t)N * H);
+            } else {
+                if (gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
+                    fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
+                    kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st)) {
+                    if (nvfp4_resid_fuse &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                           w.gdn_out_fp4, w.gdn_out_fp4_sf,
+                                                           x, N, H, lvdim, fp4_gdn_ws, st,
+                                                           w.gdn_out_fp4_alpha, x)) {
+                        out_fp4 = true;
+                        attn_fused = true;
+                    } else if (kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                                  w.gdn_out_fp4, w.gdn_out_fp4_sf,
+                                                                  ao, N, H, lvdim, fp4_gdn_ws, st,
+                                                                  w.gdn_out_fp4_alpha)) {
+                        out_fp4 = true;
+                    }
                 }
-            }
-            if (!out_fp4) {
-                // Same trade the o-projection makes: with row scales, give up proj_resid's fused
-                // residual add (that path materializes W_i8 to get it) for the fused weight decode.
-                // Only where the fused GEMM accepts this M -- past it, it would decline and the
-                // residual add would have been given up for nothing.
-                if (w.ssm_out_rs && qb_fires) {
-                    proj_fused(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, ao, H, lvdim);
-                    attn_fused = false;
-                } else {
-                    attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
-                    if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+                if (!out_fp4) {
+                    // Same trade the o-projection makes: with row scales, give up proj_resid's fused
+                    // residual add (that path materializes W_i8 to get it) for the fused weight decode.
+                    // Only where the fused GEMM accepts this M -- past it, it would decline and the
+                    // residual add would have been given up for nothing.
+                    if (w.ssm_out_rs && qb_fires) {
+                        proj_fused(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, ao, H, lvdim);
+                        attn_fused = false;
+                    } else {
+                        attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+                        if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+                    }
                 }
             }
             use_i8 = restore_i8_gdn;
@@ -2318,7 +2429,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // (they are aliases into the GDN scratch and each wants a tight row stride).
                 // 2.2 MB of copy per layer against ~25 MB less weight traffic.
                 bool qkvg_fp4 = false;
-                if (muse_nvfp4_qkv && w.qkvg_fp4 && w.qkvg_fp4_sf && fp4_a && fp4_as && fp4_qkv &&
+                // (S7a-2b) the fused [N][qkvg_n] fp4 arm stays off under tp: S7a-2's
+                // rank-width q/gate/k/v projections below serve the layer, so the fused
+                // blob is neither GEMMed nor staged there. One note per process.
+                if (tp_active && w.qkvg_fp4 && w.qkvg_fp4_sf) {
+                    static bool tp_qkvg_fused_noted = false;
+                    if (!tp_qkvg_fused_noted) {
+                        tp_qkvg_fused_noted = true;
+                        fprintf(stderr, "[tp] prefill qkvg_fp4: fused fp4 arm is off under tp (S7a-2b); "
+                                        "rank-width q/gate/k/v projections serve the layer, fused blob unused\n");
+                    }
+                }
+                if (!tp_active && muse_nvfp4_qkv && w.qkvg_fp4 && w.qkvg_fp4_sf && fp4_a && fp4_as && fp4_qkv &&
                     (attn_norm_deferred
                      ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
                            x, w.input_norm, fp4_a, fp4_as, N, H, eps, st)
@@ -2383,10 +2505,39 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         nullptr, nullptr, nullptr, apk());
                 }
                 if (!grouped && !qkvg_fp4) { inq = ing = ink = inv = false; }
-                if (!inq) proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
-                if (!ing) proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  H);
-                if (!ink) proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
-                if (!inv) proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
+                if (tp_active) {
+                    // (S7a-2) tp full-attn q/gate/k/v: the tp table N-splits these four blobs
+                    // (out-feature axis; compact per rank: [H][3072] x2 + [H][512] x2 on 27B), so
+                    // each rank GEMMs its own blob over the full H into rank-width staging; the
+                    // rank's columns are already its own head group, so no window copy is needed.
+                    // S7a-3 (qk-norm/rope/flash/KV) consumes these rank-width outputs.
+                    const int tp_ranks = c.linear_v_heads / s.gdn_window.v_count;
+                    const int qr = (qdim % tp_ranks == 0) ? qdim / tp_ranks : 0;
+                    const int kr = (kvdim % tp_ranks == 0) ? kvdim / tp_ranks : 0;
+                    if (qr == 0 || kr == 0) {
+                        static bool tp_qkv_degenerate_noted = false;
+                        if (!tp_qkv_degenerate_noted) {
+                            tp_qkv_degenerate_noted = true;
+                            fprintf(stderr, "[tp] prefill qkv: qdim %d / kvdim %d not divisible by "
+                                            "tp_ranks %d; rank projection skipped (S7a-3)\n",
+                                qdim, kvdim, tp_ranks);
+                        }
+                    } else {
+                        if (!tp_qb) tp_qb = a.alloc<bf16>((size_t)N * qr);
+                        if (!tp_qg) tp_qg = a.alloc<bf16>((size_t)N * qr);
+                        if (!tp_kf) tp_kf = a.alloc<bf16>((size_t)N * kr);
+                        if (!tp_vf) tp_vf = a.alloc<bf16>((size_t)N * kr);
+                        if (!inq) proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    tp_qb, qr, H);
+                        if (!ing) proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, tp_qg, qr, H);
+                        if (!ink) proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    tp_kf, kr, H);
+                        if (!inv) proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    tp_vf, kr, H);
+                    }
+                } else {
+                    if (!inq) proj_fused(xn, w.wq,    w.wq_type,    w.wq_rs,    qb, qdim,  H);
+                    if (!ing) proj_fused(xn, w.wgate, w.wgate_type, w.wgate_rs, qg, qdim,  H);
+                    if (!ink) proj_fused(xn, w.wk,    w.wk_type,    w.wk_rs,    kf, kvdim, H);
+                    if (!inv) proj_fused(xn, w.wv,    w.wv_type,    w.wv_rs,    vf, kvdim, H);
+                }
             } else {
                 // Qwen3.8: [q|gate] is one wide wq, then skinny k/v (8 tiles each). One grouped
                 // launch fills the 5090; four separate ones leave k/v paying a full CTA duration
@@ -2395,6 +2546,69 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // and run three block-scaled GEMMs off the packed nibbles. [q|gate] stays the one
                 // wide operand it already is, so the split below is untouched. A_i8/sx are not
                 // written, so the int8 activation memo stays valid for whatever runs next.
+                // (S7a-3) tp wide mode: the wide [q|gate] projection and the skinny k/v run at
+                // rank width (wide/ranks, kvdim/ranks) into tp's own buffers, and the split
+                // carves rank-width q/gate out of tp_qwide. The grouped-i8 dense path is not
+                // replicated under tp (perf punt, recorded in the parent brief); its fallback is
+                // the three separate proj_fused calls, as the non-tp dispatch does when fp4
+                // declines. The non-tp dispatch below (fp4 / grouped-i8 / proj_fused / split)
+                // is kept byte-identical; a degenerate tp shape notes once on stderr and falls
+                // through to it.
+                const int wide_tp_ranks =
+                    s.gdn_window.v_count ? c.linear_v_heads / s.gdn_window.v_count : 1;
+                if (tp_active && wide_tp_ranks > 1 && wide % wide_tp_ranks == 0 &&
+                    kvdim % wide_tp_ranks == 0) {
+                    const int wide_r = wide / wide_tp_ranks;
+                    const int kv_r   = kvdim / wide_tp_ranks;
+                    const int q_r    = (c.n_q_heads / wide_tp_ranks) * c.head_dim;
+                    if (!tp_qb)    tp_qb    = a.alloc<bf16>((size_t)N * q_r);
+                    if (!tp_qg)    tp_qg    = a.alloc<bf16>((size_t)N * q_r);
+                    if (!tp_kf)    tp_kf    = a.alloc<bf16>((size_t)N * kv_r);
+                    if (!tp_vf)    tp_vf    = a.alloc<bf16>((size_t)N * kv_r);
+                    if (!tp_qwide) tp_qwide = a.alloc<bf16>((size_t)N * wide_r);
+                    if (!tp_att)   tp_att   = a.alloc<bf16>((size_t)N * q_r);
+                    bool qkv_fp4_tp = false;
+                    if (attn_nvfp4 && (attn_fp4_mask & 1) &&
+                        w.wq_fp4 && w.wq_fp4_sf && w.wk_fp4 && w.wk_fp4_sf &&
+                        w.wv_fp4 && w.wv_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
+                        (attn_norm_deferred
+                         ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                               x, w.input_norm, fp4_attn_a, fp4_attn_as, N, H, eps, st)
+                         : kernels::launch_prefill_nvfp4_quant_a(
+                               xn, fp4_attn_a, fp4_attn_as, N, H, st)) &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                           w.wq_fp4, w.wq_fp4_sf,
+                                                           tp_qwide, N, wide_r, H,
+                                                           fp4_attn_ws, st, w.wq_fp4_alpha) &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                           w.wk_fp4, w.wk_fp4_sf,
+                                                           tp_kf, N, kv_r, H,
+                                                           fp4_attn_ws, st, w.wk_fp4_alpha) &&
+                        kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                           w.wv_fp4, w.wv_fp4_sf,
+                                                           tp_vf, N, kv_r, H,
+                                                           fp4_attn_ws, st, w.wv_fp4_alpha))
+                        qkv_fp4_tp = true;
+                    if (!qkv_fp4_tp) {
+                        proj_fused(xn, w.wq, w.wq_type, w.wq_rs, tp_qwide, wide_r, H);  // [q|gate]
+                        proj_fused(xn, w.wk, w.wk_type, w.wk_rs, tp_kf, kv_r, H);
+                        proj_fused(xn, w.wv, w.wv_type, w.wv_rs, tp_vf, kv_r, H);
+                    }
+                    kernels::launch_prefill_split_q_gate(tp_qwide, tp_qb, tp_qg, N,
+                                                         c.n_q_heads / wide_tp_ranks,
+                                                         c.head_dim, st);
+                    tp_wide = true;
+                } else {
+                    if (tp_active && wide_tp_ranks > 1) {
+                        static bool wide_tp_degenerate_noted = false;
+                        if (!wide_tp_degenerate_noted) {
+                            wide_tp_degenerate_noted = true;
+                            fprintf(stderr, "[tp] prefill wide qkv: wide %d / kvdim %d not "
+                                            "divisible by tp_ranks %d; non-tp dispatch runs "
+                                            "(S7a-3)\n",
+                                    wide, kvdim, wide_tp_ranks);
+                        }
+                    }
                 bool qkv_fp4 = false;
                 if (attn_nvfp4 && (attn_fp4_mask & 1) &&
                     w.wq_fp4 && w.wq_fp4_sf && w.wk_fp4 && w.wk_fp4_sf &&
@@ -2437,6 +2651,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     proj_fused(xn, w.wv, w.wv_type, w.wv_rs, vf, kvdim, H);
                 }
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
+                }
             }
             if (c.muse_glimmer) {
                 // QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE on SWA layers /
@@ -2486,6 +2701,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 signed char* vpool = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L) * kv_elem;
                 void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
                 void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
+                // (S7a-3) rank-width views of the q/k/v buffers and the q/kv head counts for the
+                // QK-norm/rope/KV-append and attention kernels below. Under tp wide mode the
+                // operands are the rank-width tp_* buffers with per-rank head counts; every
+                // non-tp expression is kept byte-identical as a ternary else side.
+                const int aw_ranks = tp_wide ? (c.linear_v_heads / s.gdn_window.v_count) : 1;
+                const int aw_qdim  = qdim / aw_ranks;
+                const int aw_kvdim = kvdim / aw_ranks;
                 // bf16 KV: batched prefill used to decline here, which sent Qwen3.8's prefill@128
                 // down the sequential per-token path (88.0 tok/s, barely above its own 84.2 tok/s
                 // decode, because that path re-streams every weight once per position). The bf16
@@ -2507,22 +2729,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     }
                     if (vi8)
                         kernels::launch_prefill_qknorm_rope_kv_bf16_vi8(
-                            qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, vi8, vi8_scale,
-                            ltab, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            tp_wide ? tp_qb : qb, tp_wide ? tp_kf : kf, tp_wide ? tp_vf : vf, w.q_norm, w.k_norm, kpool, vpool, vi8, vi8_scale,
+                            ltab, N, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads, c.head_dim,
                             rope_dim, rope_theta, eps, bs, mbs, st, pos0,
                             mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                     else
                         kernels::launch_prefill_qknorm_rope_kv_bf16(
-                            qb, kf, vf, w.q_norm, w.k_norm, kpool, vpool, ltab, N,
-                            c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            tp_wide ? tp_qb : qb, tp_wide ? tp_kf : kf, tp_wide ? tp_vf : vf, w.q_norm, w.k_norm, kpool, vpool, ltab, N,
+                            tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads, c.head_dim,
                             rope_dim, rope_theta, eps, bs, mbs, st, pos0,
                             mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                     const bool vi8_done = vi8 && kernels::launch_prefill_attn_mma_bf16_vi8(
-                        qb, kf, vi8, vi8_scale, ltab, att, N, c.n_q_heads, c.n_kv_heads,
+                        tp_wide ? tp_qb : qb, tp_wide ? tp_kf : kf, vi8, vi8_scale, ltab, tp_wide ? tp_att : att, N, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads,
                         c.head_dim, bs, mbs, attn_scale, st, pos0);
                     if (!vi8_done)
-                        if (!kernels::launch_prefill_attn_bf16_paged(qb, kpool, vpool, ltab, att,
-                                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
+                        if (!kernels::launch_prefill_attn_bf16_paged(tp_wide ? tp_qb : qb, kpool, vpool, ltab, tp_wide ? tp_att : att,
+                                N, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads, c.head_dim, bs, mbs, attn_scale,
                                 st, pos0)) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
                             fprintf(stderr, "[prefill] windowed pass declined by attention "
@@ -2545,12 +2767,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         const int* bt = multi ? (w.swa ? s.kv->block_table_win(s.multi_seq_ids[i])
                                                        : s.kv->block_table(s.multi_seq_ids[i]))
                                               : ltab;
-                        kernels::launch_prefill_qknorm_rope_kv_int8(qb + o * qdim, kf + o * kvdim,
-                            vf + o * kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
-                            len, c.n_q_heads, c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
+                        kernels::launch_prefill_qknorm_rope_kv_int8((tp_wide ? tp_qb : qb) + o * aw_qdim, (tp_wide ? tp_kf : kf) + o * aw_kvdim,
+                            (tp_wide ? tp_vf : vf) + o * aw_kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
+                            len, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
                             bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
-                        if (!kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
-                                kscale, vscale, bt, att + o * qdim, len, c.n_q_heads, c.n_kv_heads,
+                        if (!kernels::launch_prefill_attn_int8_paged((tp_wide ? tp_qb : qb) + o * aw_qdim, kpool, vpool,
+                                kscale, vscale, bt, (tp_wide ? tp_att : att) + o * aw_qdim, len, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads,
                                 c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0)) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
                             fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
@@ -2562,8 +2784,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             }
             // With q|gate|k|v left packed, the gate is a column slice of that buffer rather than
             // a tight [N, qdim] array; its three consumers take the pitch instead of a copy.
-            const bf16* gate_src = qkv_packed ? (const bf16*)(fp4_qkv + qdim) : (const bf16*)qg;
-            const int gate_ld = qkv_packed ? qkvg_n : 0;
+            // (S7a-2b) under tp the 4-separate arm above is the tp=1 else branch, so qg is
+            // never filled here: the gate side must be the rank-width tp_qg, windowed to the
+            // rank's q width. att itself stays full-width until S7a-3 re-points the flash side.
+            const int tp_gate_ranks =
+                s.gdn_window.v_count ? c.linear_v_heads / s.gdn_window.v_count : 1;
+            const bool tp_gate = tp_active && tp_qg != nullptr && tp_gate_ranks > 0 &&
+                                  qdim % tp_gate_ranks == 0;
+            const bf16* gate_src = qkv_packed ? (const bf16*)(fp4_qkv + qdim)
+                                               : (tp_gate ? (const bf16*)tp_qg : (const bf16*)qg);
+            const int gate_ld = qkv_packed ? qkvg_n : (tp_gate ? qdim / tp_gate_ranks : 0);
             // Muse: the gated attention output feeds exactly one consumer -- the o projection's
             // row-quantize -- so fold the gate into that quantize's load phase. `att` is then never
             // written back as bf16 and never re-read, and one launch per layer goes away.
@@ -2602,7 +2832,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             }
             // If the fused quantize ran but the GEMM declined, `att` is still raw -- gate it here.
             if (!gate_fused && !wo_fp4_done) {
-                kernels::launch_prefill_mul_sigmoid(att, gate_src, N, qdim, st, gate_ld);
+                if (tp_wide)
+                    // tp wide: the gated output is the rank-width tight [N][qdim/ranks] tp_att and
+                    // the gate the rank-width tp_qg; ld 0 means "tight pitch".
+                    kernels::launch_prefill_mul_sigmoid(tp_att, (const bf16*)tp_qg, N,
+                                                         qdim / tp_gate_ranks, st, 0);
+                else
+                    kernels::launch_prefill_mul_sigmoid(att, gate_src, N, qdim, st, gate_ld);
             }
             // o off the same NVFP4 bytes, reading the already-gated `att`, with the residual taken
             // by the epilogue's C operand (same fold as the GDN out_proj above) so no separate
@@ -2610,7 +2846,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // raw projection to `ao` and let the `if (!attn_fused) launch_prefill_add(...)` tail
             // apply it, exactly as the Muse wo_fp4 arm does.
             bool wo_fp4_q38 = false, wo_fp4_resid = false;
-            if (attn_nvfp4 && (attn_fp4_mask & 2) &&
+            if (!tp_active && attn_nvfp4 && (attn_fp4_mask & 2) &&
                 w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
                 kernels::launch_prefill_nvfp4_quant_a(att, fp4_attn_a, fp4_attn_as, N, qdim, st)) {
                 if (nvfp4_resid_fuse && !c.muse_glimmer &&
@@ -2627,7 +2863,59 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     wo_fp4_q38 = true;
                 }
             }
-            if (wo_fp4_q38) {
+            if (tp_active) {
+                // (S7a-1) tp o_proj: this rank owns q-head columns [k0, k0+kw) of the [N][qdim]
+                // attention output (12 q-heads x 256 on 27B) and its W_o blob is the matching
+                // K-compact [kw][H] (row stride H, which the K-parametrized GEMMs read correctly),
+                // so project the staged window into `ao` and all-reduce the [N][H] partial in
+                // place; the !attn_fused add below then consumes the summed buffer into the
+                // residual. Structurally complete; exact numerics land in S7a-3.
+                const int tp_ranks = c.linear_v_heads / s.gdn_window.v_count;
+                const int kw = (qdim % tp_ranks == 0) ? qdim / tp_ranks : 0;
+                const int k0 = (s.gdn_window.v_start / s.gdn_window.v_count) * kw;
+                if (kw == 0) {
+                    static bool tp_oj_degenerate_noted = false;
+                    if (!tp_oj_degenerate_noted) {
+                        tp_oj_degenerate_noted = true;
+                        fprintf(stderr, "[tp] prefill o_proj: qdim %d not divisible by tp_ranks "
+                                        "%d; zeroing the partial (S7a-3 makes it exact)\n",
+                                qdim, tp_ranks);
+                    }
+                    pf_cu(cudaMemsetAsync(ao, 0, (size_t)N * H * 2), "pfb tp o_proj zero");
+                } else {
+                    if (!tp_att_win) tp_att_win = a.alloc<bf16>((size_t)N * kw);
+                    if (tp_wide) {
+                        // tp wide: the gated rank output is the contiguous [N][qdim/ranks] tp_att
+                        // (there is no full-width k0 window), so stage it straight at k0 = 0;
+                        // kw equals the rank q width here, so source and destination pitches
+                        // match and this is a plain row-by-row copy.
+                        pf_cu(cudaMemcpy2DAsync(tp_att_win, (size_t)kw * 2, tp_att,
+                                                (size_t)kw * 2, (size_t)kw * 2, (size_t)N,
+                                                cudaMemcpyDeviceToDevice, st),
+                             "pfb tp o_proj window");
+                    } else
+                        pf_cu(cudaMemcpy2DAsync(tp_att_win, (size_t)kw * 2, att + k0,
+                                                (size_t)qdim * 2, (size_t)kw * 2, (size_t)N,
+                                                cudaMemcpyDeviceToDevice, st),
+                         "pfb tp o_proj window");
+                    bool wo_fp4_tp = false;
+                    if (attn_nvfp4 && (attn_fp4_mask & 2) &&
+                        w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
+                        kernels::launch_prefill_nvfp4_quant_a(tp_att_win, fp4_attn_a, fp4_attn_as,
+                                                              N, kw, st)) {
+                        // Non-residual form only: the residual add runs on the summed buffer, after
+                        // the all-reduce, via the !attn_fused tail below.
+                        wo_fp4_tp = kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                                        w.wo_fp4, w.wo_fp4_sf,
+                                                                        ao, N, H, kw, fp4_attn_ws,
+                                                                        st, w.wo_fp4_alpha);
+                    }
+                    if (!wo_fp4_tp)
+                        proj_fused(tp_att_win, w.wo, w.wo_type, w.wo_rs, ao, H, kw);
+                }
+                attn_fused = false;
+                tp_prefill_allreduce_bf16(ao, (size_t)N * H);
+            } else if (wo_fp4_q38) {
                 attn_fused = wo_fp4_resid;
             } else if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
@@ -3022,6 +3310,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             h_ready = h0 + nh >= ffn;
                         }
                     }
+                    // tp=2 FFN: rank-width gate/up (row-split) + rank-width down (K-split) GEMMs, in-place rank
+                    // SwiGLU, then allreduce this rank's down output into ao (mirrors the full-attn o_proj tp
+                    // idiom: rank GEMM -> local buffer -> tp_prefill_allreduce_bf16, as at the o_proj site).
+                    // Excludes every non-bf16 arm (fused-residual / qi8 / fp4 / grouped / i8-stage / partial-h).
+                    const int ffn_ranks = tp_active ? c.linear_v_heads / s.gdn_window.v_count : 1; // G-b idiom
+                    const int ffn_r = ffn / ffn_ranks; // 8704 for 27B
+                    const bool tp_ffn = tp_active && ffn_ranks > 1 && (ffn % ffn_ranks == 0) &&
+                                       !ffn_fused && !ffn_qi8 && !layer_fp4 && !(use_i8 && ffn_i8_stage) &&
+                                       !ffn_grouped && !h_ready;
+                    if (tp_ffn) {
+                        // tp prefill: rank-SwiGLU + rank-K down + allreduce; i8/fp4/fused-residual paths are tp-inert (27B prefill = bf16).
+                        // rank-dense scratch: lazy per-chunk arena alloc (this block is per-chunk, fn rows); freed with the arena at pass end.
+                        bf16* tp_ffg = a.alloc<bf16>((size_t)fn * ffn_r);
+                        bf16* tp_ffu = a.alloc<bf16>((size_t)fn * ffn_r);
+                        proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, tp_ffg, ffn_r, H, fn);
+                        proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   tp_ffu, ffn_r, H, fn);
+                        kernels::launch_prefill_swiglu(tp_ffg, tp_ffu, tp_ffg, (long)fn * ffn_r, st);
+                        proj(tp_ffg, down_pf, down_pf_type, ao + (size_t)fo * H, H, ffn_r, fn);
+                        tp_prefill_allreduce_bf16(ao + (size_t)fo * H, (size_t)fn * H);
+                    } else {
                     if (!ffn_grouped && !h_ready) {
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, ffg, ffn, H, fn);
                         proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   ffu, ffn, H, fn);
@@ -3075,6 +3383,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         if (!ffn_fused || !proj_resid(ffg, down_pf, down_pf_type,
                                                       x + (size_t)fo * H, H, ffn, fn))
                             proj(ffg, down_pf, down_pf_type, ao + (size_t)fo * H, H, ffn, fn);
+                    }
                     }
                 }
             }
@@ -3866,6 +4175,103 @@ static void gemv_fp8_rows_any(const bf16* in, const void* w, bf16* out, int rows
         kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
 }
 
+// S7c-27r2: ONE-SHOT CACHED GDN conv-weight repad for dflash verify under tp. Each rank's
+// w.ssm_conv blob is rank-width ([2*gdn_ql + gdn_vl][taps] rows of the [lqkv][taps] qkv) while
+// both verify conv kernels (batched and compact) index conv_w by GLOBAL element d over the full
+// width, so the rank blob is OOB for them. The verify path is per-tier graph-captured, so the
+// repad cannot be per-call: it is computed ONCE per (layer, rank, blob) at function entry --
+// which runs before this function's BeginCapture (a graph LAUNCH is not a stream capture) --
+// into one lazily-allocated process-lifetime device buffer, and the conv sites pass the
+// per-layer slice. tp=1: tp_gdn is false, nothing is ever primed or allocated, and both conv
+// calls stay the original verbatim. The device buffer is never freed (serving process; the
+// allocation is at most ~4 MB).
+namespace {
+constexpr int kGdnConvRepadMaxLayers = 256;
+struct GdnConvRepadEntry {
+    const void* w = nullptr;  // the rank blob this slice was primed from; a changed blob re-primes
+    int taps = 0;
+    bool primed = false;
+    bf16* dev = nullptr;      // this layer's slice of g_gdn_conv_repad_dev
+};
+GdnConvRepadEntry g_gdn_conv_repad[kGdnConvRepadMaxLayers];
+bf16* g_gdn_conv_repad_dev = nullptr;
+size_t g_gdn_conv_repad_bytes = 0;
+
+// The primed full-width repad slice for GDN layer L (null if L is unknown or never primed).
+inline bf16* gdn_conv_repad_dev(int l) {
+    if (l < 0 || l >= kGdnConvRepadMaxLayers) return nullptr;
+    return g_gdn_conv_repad[l].dev;
+}
+
+// Prime (or re-prime, when the weight blob changed) the cached full-width repad of every GDN
+// layer's rank-sliced ssm_conv into one shared device buffer. Called only from dflash_verify's
+// entry, before its capture region, so the D2H below is eager and legal; after the first prime
+// every entry is `primed` and later calls do nothing. tp=1 never calls this. A prime is a
+// D2H, which is not a capturable node: the entry cannot be mid-capture, but if it ever were,
+// fail hard (stop 1) rather than corrupt a capture.
+void gdn_conv_repad_prime(const Qwen35PrefillCtx& s, const Qwen35Config& c, cudaStream_t st) {
+    if (s.gdn_window.v_count <= 0) return;
+    if (c.n_layers > kGdnConvRepadMaxLayers) return;  // cache cannot hold this model; leave unprimed
+    // Same rank idiom as the S7c-27r branch head (layer-independent, so computed once here):
+    const int gdn_ranks = c.linear_v_heads / s.gdn_window.v_count;
+    const int gdn_r = s.gdn_window.v_start / s.gdn_window.v_count;
+    const int lqkv = s.linear_qkvdim, lvdim = s.linear_vdim;
+    const int gdn_ql = (lqkv - lvdim) / (2 * gdn_ranks);
+    const int gdn_vl = lvdim / gdn_ranks;
+    const int taps = c.linear_conv_kernel;
+    int n_gdn = 0;
+    for (int L = 0; L < c.n_layers; ++L)
+        if (s.w.layers[L].linear_attn) ++n_gdn;
+    if (!n_gdn) return;
+    const size_t slice = (size_t)lqkv * (size_t)taps;
+    const size_t need = (size_t)n_gdn * slice * sizeof(bf16);
+    if (g_gdn_conv_repad_dev == nullptr || g_gdn_conv_repad_bytes < need) {
+        if (g_gdn_conv_repad_dev)
+            pf_cu(cudaFree(g_gdn_conv_repad_dev), "gdn repad dev free");
+        pf_cu(cudaMalloc(&g_gdn_conv_repad_dev, need), "gdn repad dev alloc");
+        g_gdn_conv_repad_bytes = need;
+        for (auto& e : g_gdn_conv_repad) e.primed = false;  // slices moved: re-prime all
+    }
+    size_t off = 0;
+    for (int L = 0; L < c.n_layers; ++L) {
+        if (!s.w.layers[L].linear_attn) continue;
+        GdnConvRepadEntry& e = g_gdn_conv_repad[L];
+        e.dev = g_gdn_conv_repad_dev + off / sizeof(bf16);
+        off += slice * sizeof(bf16);
+        const void* blob = s.w.layers[L].ssm_conv;
+        if (e.primed && e.w == blob) continue;  // the one-shot is already done for this exact blob
+        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+        pf_cu(cudaStreamIsCapturing(st, &capturing), "gdn repad capture probe");
+        if (capturing != cudaStreamCaptureStatusNone) { fprintf(stderr, "[prefill] gdn repad: FATAL — prime demanded while the stream is capturing (stop 1); aborting rather than corrupting the capture\n"); std::abort(); }
+        // 26 Hunk B mechanics, verbatim, into the cached slice: rank blob D2H (synchronous,
+        // read-only weight), zeroed host full-width, this rank's q/k/v windows scattered in,
+        // H2D on st stream-ordered before every conv (the weights are static, so each replay
+        // of the captured graph reads the same primed bytes).
+        const size_t rankw = 2 * (size_t)gdn_ql + (size_t)gdn_vl;
+        std::vector<bf16> src(rankw * (size_t)taps);
+        pf_cu(cudaMemcpy(src.data(), blob, rankw * (size_t)taps * sizeof(bf16),
+                          cudaMemcpyDeviceToHost), "gdn repad D2H");
+        std::vector<bf16> full(slice, 0);
+        for (int i = 0; i < gdn_ql; ++i)
+            for (int t = 0; t < taps; ++t)
+                full[(gdn_r * gdn_ql + i) * (size_t)taps + t] = src[i * (size_t)taps + t];
+        for (int i = 0; i < gdn_ql; ++i)
+            for (int t = 0; t < taps; ++t)
+                full[(((lqkv - lvdim) / 2 + gdn_r * gdn_ql) + i) * (size_t)taps + t]
+                    = src[(gdn_ql + i) * (size_t)taps + t];
+        for (int i = 0; i < gdn_vl; ++i)
+            for (int t = 0; t < taps; ++t)
+                full[(((lqkv - lvdim) + gdn_r * gdn_vl) + i) * (size_t)taps + t]
+                    = src[(2 * gdn_ql + i) * (size_t)taps + t];
+        pf_cu(cudaMemcpyAsync(e.dev, full.data(), slice * sizeof(bf16),
+                              cudaMemcpyHostToDevice, st), "gdn repad H2D");
+        e.w = blob;
+        e.taps = taps;
+        e.primed = true;
+    }
+}
+}  // namespace
+
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only) {
@@ -3969,6 +4375,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* nv_ps_a = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
     signed char* nv_pq_b = a.alloc<signed char>((size_t)NA * nv_pwide);
     float* nv_ps_b = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
+    // S7c-27r2: prime the one-shot CACHED GDN conv-weight repad (tp only) here, at entry,
+    // BEFORE this function's capture region begins (cudaStreamBeginCapture, ~90 lines below on
+    // the recording path): a D2H is legal only outside a capture, and the entry is always
+    // outside it (a first call of a tier, and any later call, runs this region eagerly; the
+    // capture is this function's own). The prime is a no-op once every GDN layer's blob is
+    // primed, so steady-state calls pay nothing. tp=1 never enters it.
+    if (s.gdn_window.v_count > 0) gdn_conv_repad_prime(s, c, st);
     // WIDE-BATCH CHECKPOINT-FP8 PROJECTIONS. A checkpoint that ships the Gated-DeltaNet projections
     // as FP8 runs them below as row-GEMVs, which are compute-bound: every row redoes the whole
     // dot product, so a projection costs the same per row at 32 rows as at one. From eight rows,
@@ -5168,6 +5581,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             bf16* rq = rec_qkv + (size_t)L * N * lqkv;
             bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
             bf16* rv = rec_v + (size_t)L * N * lvdim;
+            // S7c-27r: tp=2 window-fill for the GDN in-projections. Each rank's qkv/z/alpha/
+            // beta blobs are rank-width, so under tp these GEMMs run rank-dense into rank-sized
+            // scratch (tp_*) and the results are gathered into this rank's column windows of
+            // the full-width arena (rq/lz/ra/rb); the other rank's windows are neither written
+            // nor read here (this arena is this rank's, and its consumers are windowed to the
+            // same windows, 26 hunk A's isolation argument). tp=1: tp_gdn is false, no scratch
+            // is allocated, and every call below stays the original verbatim.
+            const bool tp_gdn = (s.gdn_window.v_count > 0);
+            const int gdn_ranks = tp_gdn ? (c.linear_v_heads / s.gdn_window.v_count) : 1;
+            const int gdn_r = (s.gdn_window.v_count > 0) ? (s.gdn_window.v_start / s.gdn_window.v_count) : 0;
+            const int gdn_ql = (lqkv - lvdim) / (2 * gdn_ranks);
+            const int gdn_vl = lvdim / gdn_ranks;
+            const int gdn_vh = vh / gdn_ranks;
+            const size_t rowqkv = 2 * (size_t)gdn_ql + gdn_vl;
+            bf16* tp_qkv = nullptr;
+            bf16* tp_z = nullptr;
+            bf16* tp_a = nullptr;
+            bf16* tp_b = nullptr;
+            if (tp_gdn) {
+                // NA rows (not N) keeps the arena layout identical for every tier, the same
+                // rule every arena buffer in this function obeys; the GEMMs write the first N
+                // rows and the gathers move exactly those.
+                tp_qkv = a.alloc<bf16>((size_t)NA * rowqkv);
+                tp_z = a.alloc<bf16>((size_t)NA * gdn_vl);
+                tp_a = a.alloc<bf16>((size_t)NA * gdn_vh);
+                tp_b = a.alloc<bf16>((size_t)NA * gdn_vh);
+            }
             bf16* ra = rec_a + (size_t)L * N * vh;
             bf16* rb = rec_b + (size_t)L * N * vh;
             // wqkv, wqkv_gate and alpha/beta are three independent reads of the same xn. wqkv is
@@ -5215,7 +5655,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }();
             if (gdn_in_gemm && gdn_z_stream)
                 supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st);
-            const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H;
+            // tp: the in-projections run in-order on st (gst = st), so no fork: the rank
+            // GEMMs and their gathers must precede the conv on the same stream, and a forked
+            // side stream would need join events the tp arm does not record.
+            const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H && !tp_gdn;
             cudaStream_t gst = fork_gdn ? s.stream_k : st;
             cudaStream_t zst = (gdn_z_stream && fork_gdn) ? s.stream_k : st;
             if (fork_gdn) {
@@ -5231,12 +5674,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                 fp4_a, fp4_asf, w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
                                 rq, Ng, lqkv, H, fp4_ws, st, w.gdn_qkv_fp4_alpha);
             }
+            else if (tp_gdn)
+                supported = proj(xn, w.wqkv, w.wqkv_type, tp_qkv, rowqkv, H);
             else
                 supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
             // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
             // almost entirely launch/graph-node latency. One fused launch, same per-row math.
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
-                kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst);
+                (tp_gdn
+                 ? (kernels::launch_gemv_rows(xn, w.ssm_alpha, tp_a, N, gdn_vh, H, gst) &&
+                    kernels::launch_gemv_rows(xn, w.ssm_beta, tp_b, N, gdn_vh, H, gst))
+                 : kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst));
             // Split join. One join here made the side branch's 11.8 MB wqkv_gate GEMV complete
             // before conv_compact -- which reads only rq, off the MAIN stream -- and before the
             // scan, which reads only alpha/beta. Nothing needs lz until gated_norm, three launches
@@ -5255,14 +5703,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                          ? kernels::launch_prefill_nvfp4_gemm(
                                fp4_a, fp4_asf, w.gdn_z_fp4, w.gdn_z_fp4_sf,
                                lz, Ng, lvdim, H, fp4_ws, zst, w.gdn_z_fp4_alpha)
-                         : proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H)) &&
-                        (ab_fused || (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
-                                      proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
+                         : (tp_gdn
+                            ? proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, tp_z, gdn_vl, H)
+                            : proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H))) &&
+                        (ab_fused ||
+                         (tp_gdn
+                          ? (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, tp_a, gdn_vh, H) &&
+                             proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, tp_b, gdn_vh, H))
+                          : (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
+                             proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H))));
             if (fork_gdn) {
                 pf_cu(cudaEventRecord(ev_join, s.stream_k), "verify gdn join");
                 if (!split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn join wait");
             }
             if (!supported) break;
+            if (tp_gdn) {
+                // 26 hunk A's gather shape, verify edition: each rank scratch block lands in
+                // this rank's window of the full-width arena row -- q and k at their in-row
+                // bases, v and z at the v-window bases, alpha/beta in the a/b rows -- all on st,
+                // in order after the GEMMs and before the conv below, which is what makes the
+                // unwindowed conv and the windowed AR batched see a consistent arena.
+                kernels::launch_gather_rows(rq + gdn_r * gdn_ql, lqkv, tp_qkv, rowqkv, gdn_ql, N, st);
+                kernels::launch_gather_rows(rq + (lqkv - lvdim) / 2 + gdn_r * gdn_ql, lqkv, tp_qkv + gdn_ql, rowqkv, gdn_ql, N, st);
+                kernels::launch_gather_rows(rq + (lqkv - lvdim) + gdn_r * gdn_vl, lqkv, tp_qkv + 2 * gdn_ql, rowqkv, gdn_vl, N, st);
+                kernels::launch_gather_rows(lz + gdn_r * gdn_vl, lvdim, tp_z, gdn_vl, gdn_vl, N, st);
+                kernels::launch_gather_rows(ra + gdn_r * gdn_vh, vh, tp_a, gdn_vh, gdn_vh, N, st);
+                kernels::launch_gather_rows(rb + gdn_r * gdn_vh, vh, tp_b, gdn_vh, gdn_vh, N, st);
+            }
             const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
             // gdn_vloc (not vh): a windowed arena's slot is vloc v-head blocks wide, so the
             // slot offset within each sequence's own arena scales with the window; unsplit,
@@ -5275,8 +5742,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // in place. That in-place update is why packed mode has no commit stage: the
                 // compact pair below deliberately does NOT touch the live state, because a
                 // speculative verify must be able to discard rejected rows.
+                // S7c-27r2: under tp the rank-sliced w.ssm_conv is OOB for this kernel (it
+                // indexes conv_w by global element d over the full width): pass the one-shot
+                // cached full-width repad instead. tp=1 keeps w.ssm_conv, verbatim.
                 kernels::launch_qwen36_conv_split_l2norm_fused_batched(
-                    rq, w.ssm_conv, s.packed_lin_conv, conv_off, gq, rk, rv,
+                    rq, tp_gdn ? (const void*)gdn_conv_repad_dev(L) : w.ssm_conv,
+                    s.packed_lin_conv, conv_off, gq, rk, rv,
                     N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel,
                     c.rms_eps, st);
                 if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "packed gdn ab wait");
@@ -5296,7 +5767,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 }
             } else {
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;
-            kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
+            // S7c-27r2: same tp OOB fix as the batched call above: the rank blob would be OOB
+            // for this kernel's global-d conv_w indexing; the else arm (tp=1) is verbatim.
+            kernels::launch_dflash_gdn_conv_compact(
+                rq, tp_gdn ? (const void*)gdn_conv_repad_dev(L) : w.ssm_conv,
+                conv_live, gq, rk, rv,
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
             // The compact scan has no windowed kernel: its kernels live in the dflash TUs, which
             // this dispatch leaves read-only (the only windowed GDN prefill kernel here is the

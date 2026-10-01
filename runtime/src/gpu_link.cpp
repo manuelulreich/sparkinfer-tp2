@@ -507,6 +507,23 @@ bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtyp
   if (bytes % esize != 0) return fail("size not a multiple of the element size", cudaSuccess);
   const size_t n = bytes / esize;
 
+  // Entry-time cross-context events: record each rank's event on its own stream NOW, before this
+  // call posts any copy or kernel. The record point sits after every op the caller already
+  // enqueued on that stream (the producers that wrote this rank's `in`), so each event snapshots
+  // "this rank's producers are done up to here." In the P2P branch each side's peer-copy (which
+  // reads the PEER's `in`) then waits on the PEER's entry event before reading, so a per-layer
+  // GEMM still in flight on the peer cannot race the copy. Both records are posted before any
+  // wait, so no wait can target an unrecorded event, and each stream waits only on the other's
+  // entry snapshot (never on the other's in-flight copy) -> symmetric, deadlock-free. The
+  // staging fallback records the same two events later (after its D2H); that later record
+  // supersedes these, so the staging waits are unaffected.
+  {
+    cudaError_t re = cudaEventRecord(im.ranks[0].event, a.stream);
+    if (re != cudaSuccess) return fail("entry event record on rank A's stream", re);
+    re = cudaEventRecord(im.ranks[1].event, b.stream);
+    if (re != cudaSuccess) return fail("entry event record on rank B's stream", re);
+  }
+
   // The peer's data must land on this rank (out, or the module's scratch when in==out)
   // before this rank's reduce kernel reads it; the kernel half is identical across
   // transports, only the landing differs.
@@ -514,10 +531,15 @@ bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtyp
   void* dst_b = (b.in == b.out) ? im.ranks[1].scratch : const_cast<void*>(b.out);
 
   if (im.resolved == GpuLink::Transport::P2pMapped) {
-    // Each rank pulls the peer's buffer into its own out/scratch on its own stream — the
+    // Each rank pulls the peer's `in` buffer into its own out/scratch on its own stream — the
     // stream-scoped D2D (destination stream) WP-1's probe proved on this pair, both
-    // directions — then runs its local reduce. No host memory, no cross-context event,
-    // no setDevice.
+    // directions — then runs its local reduce. No host memory, no setDevice.
+    //
+    // Cross-context ordering: before a rank's stream reads the PEER's `in`, it first waits on
+    // the peer's entry-time event (the one recorded on the peer's stream at the top of
+    // reduce_impl, after the peer's producers). That snapshots "peer's producers are done"
+    // without waiting on the peer's in-flight copy, so the two waits are independent and cannot
+    // deadlock (this is the same cross-context wait the staging fallback performs below).
     //
     // Driver-workaround 1: a destination that never received a P2P landing at this magnitude
     // first gets a one-time priming copy on the SAME (src, dst, stream) — the 13.4
@@ -527,6 +549,17 @@ bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtyp
     // dst) pay exactly one copy.
     // Driver-workaround 3: every copy in this path goes through the bounded re-post, because
     // a first-landing burst can have the driver reject the next post at post time.
+    {
+      // Wait on the peer's entry-time event before this rank's stream first reads the peer's
+      // `in` (the priming copy, when it fires, is also such a read, so the wait precedes it
+      // too). A waits on B's entry event before A's copies read b.in; B waits on A's before B's
+      // copies read a.in. Each stream waits only on the other's entry snapshot, never on the
+      // other's in-flight copy -> no circular wait, deadlock-free.
+      cudaError_t we = cudaStreamWaitEvent(a.stream, im.ranks[1].event, 0);
+      if (we != cudaSuccess) return fail("P2P: rank A wait on rank B's entry event", we);
+      we = cudaStreamWaitEvent(b.stream, im.ranks[0].event, 0);
+      if (we != cudaSuccess) return fail("P2P: rank B wait on rank A's entry event", we);
+    }
     if (glink_needs_prime(impl_->prim_mu, impl_->primed, dst_a, bytes)) {
       cudaError_t p =
           post_copy_retry(op, "P2P priming copy into rank A", dst_a, b.in, bytes,
