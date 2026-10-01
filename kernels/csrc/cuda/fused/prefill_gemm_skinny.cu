@@ -231,8 +231,8 @@ __global__ void pf_gemm_skinny_reduce(const float* __restrict__ P,
                 reinterpret_cast<__nv_bfloat16*>(C), M, N, K);                              \
             return true;                                                                    \
         }                                                                                   \
-        static float* parts = nullptr;                                                      \
-        static size_t parts_n = 0;                                                          \
+        static thread_local float* parts = nullptr; /* per thread = per rank under tp */  \
+        static thread_local size_t parts_n = 0;                                             \
         const size_t need = (size_t)M * (size_t)N;                                          \
         if (parts_n < need) {                                                               \
             if (parts) { cudaFree(parts); note_prefill_scratch_moved(); }                   \

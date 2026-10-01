@@ -18,6 +18,8 @@
 // already has the dependency, mirroring where qwen3_gguf_config.h itself lives.
 
 #include "sparkinfer/models/qwen_config.h"
+#include <cstdio>
+#include <cstdlib>
 
 #include <fstream>
 #include <string>
@@ -49,6 +51,17 @@ static bool qwen38_config_from_hf_json(const std::string& model_dir,
 
     cfg.hidden     = geti("hidden_size", cfg.hidden);
     cfg.n_layers   = geti("num_hidden_layers", cfg.n_layers);
+    // DEBUG ONLY: SPARKINFER_DEBUG_N_LAYERS=N truncates the stack to its first N layers, so a
+    // model too big for one card can be compared tp=1 vs tp=2 layer-for-layer. Output is
+    // meaningless as text; it exists for logit diffing. Unset = the checkpoint's own count.
+    if (const char* e = std::getenv("SPARKINFER_DEBUG_N_LAYERS")) {
+        const int n = std::atoi(e);
+        if (n > 0 && n < cfg.n_layers) {
+            fprintf(stderr, "[config] DEBUG: truncating %d -> %d layers (SPARKINFER_DEBUG_N_LAYERS)\n",
+                    cfg.n_layers, n);
+            cfg.n_layers = n;
+        }
+    }
     cfg.vocab      = geti("vocab_size", cfg.vocab);
     cfg.n_q_heads  = geti("num_attention_heads", cfg.n_q_heads);
     cfg.n_kv_heads = geti("num_key_value_heads", cfg.n_kv_heads);

@@ -21,6 +21,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
+#include <condition_variable>
 #include <map>
 
 #include <mutex>
@@ -646,7 +647,8 @@ struct Qwen35Model::Impl {
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
     bf16 *qraw = nullptr, *qgate = nullptr;
-    bf16 *dbg_xn_dump = nullptr;   // DEBUG ONLY (SPARKINFER_MG_STAGE_DEBUG): [n_layers, H] xn snapshot
+    int tp_cur_pos = 0;        // (dual-GPU) forward_token_tp's decode position, read by tp_attn_layer_tp
+    bf16 *dbg_xn_dump = nullptr;   // DEBUG ONLY (SPARKINFER_MG_STAGE_DEBUG): [2*n_layers+1, H] xn/final-norm/hn snapshot
     bf16 *lin_qkv = nullptr, *lin_q = nullptr, *lin_k = nullptr, *lin_v = nullptr;
     bf16 *lin_z = nullptr, *lin_alpha = nullptr, *lin_beta = nullptr;
     bf16 *lin_gdn = nullptr, *lin_norm = nullptr, *shared_gate_tmp = nullptr;
@@ -1302,28 +1304,85 @@ static void tp_leader_rendezvous(const char* what, F&& post) {
 
 // (dual-GPU) Rank-1 mirroring. The serving engine drives only the rank-0 model; every
 // state-changing public call (sessions, penalties, prompt ingest, decode) is replayed on the
-// rank-1 model by TpMirrorScope: the peer's call runs on a one-shot worker thread (bound once to
-// the peer's device -- the op path itself never setDevice) concurrently with the leader's own
-// body, which the rendezvous above needs, and is joined before the leader returns. The
+// rank-1 model by TpMirrorScope: the peer's call runs on the peer device's persistent worker
+// thread (TpWorker below, bound once to that device -- the op path itself never setDevice)
+// concurrently with the leader's own body, which the rendezvous above needs, and is waited for
+// before the leader returns. The
 // thread-local depth makes only the OUTERMOST call mirror (ingest -> prefill -> ... must not
 // replay twice); a null peer just holds the depth, which is also how a leader-only call is made.
 static thread_local int t_tp_mirror_depth = 0;
 
+// One PERSISTENT worker thread per peer device runs every mirrored op. It binds its device once
+// and keeps its thread_local state (prefill arenas, graph keys, events, split-K scratch) across
+// ops, so "thread_local" means "per rank" -- the property every such cache in the forward/prefill
+// code relies on. A one-shot thread per op (the first design) started each op with EMPTY caches
+// and leaked everything they allocated when it exited.
+struct TpWorker {
+    std::mutex scope_mu;   // one mirrored op at a time (held by TpMirrorScope for its lifetime)
+    std::mutex mu;
+    std::condition_variable cv;
+    std::function<void()>* job = nullptr;
+    bool done = false, stop = false;
+    std::thread th;
+    explicit TpWorker(int dev) {
+        th = std::thread([this, dev] {
+            if (dev >= 0) cu(cudaSetDevice(dev), "tp worker setDevice");
+            t_tp_mirror_depth = 1;   // ops on this thread never mirror again
+            std::unique_lock<std::mutex> lk(mu);
+            for (;;) {
+                cv.wait(lk, [&] { return job != nullptr || stop; });
+                if (stop) return;
+                std::function<void()>* j = job;
+                lk.unlock();
+                (*j)();
+                lk.lock();
+                job = nullptr;
+                done = true;
+                cv.notify_all();
+            }
+        });
+    }
+    void post(std::function<void()>* j) {
+        std::lock_guard<std::mutex> lk(mu);
+        job = j;
+        done = false;
+        cv.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return done; });
+    }
+    ~TpWorker() {
+        { std::lock_guard<std::mutex> lk(mu); stop = true; }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+    }
+};
+
+static TpWorker& tp_worker_for(int dev) {
+    static std::mutex reg_mu;
+    static std::map<int, std::unique_ptr<TpWorker>> reg;
+    std::lock_guard<std::mutex> lk(reg_mu);
+    auto& w = reg[dev];
+    if (!w) w = std::make_unique<TpWorker>(dev);
+    return *w;
+}
+
 struct TpMirrorScope {
-    std::thread worker;
+    TpWorker* worker = nullptr;
+    std::unique_lock<std::mutex> hold;
+    std::function<void()> job;
     template <class F>
     TpMirrorScope(Qwen35Model* peer, F&& fn) {
         ++t_tp_mirror_depth;
         if (!peer) return;
-        worker = std::thread([peer, fn = std::forward<F>(fn)]() mutable {
-            const int dev = peer->tp_rank_view().device;
-            if (dev >= 0) cu(cudaSetDevice(dev), "tp mirror setDevice");
-            t_tp_mirror_depth = 1;
-            fn(*peer);
-        });
+        job = [peer, f = std::forward<F>(fn)]() mutable { f(*peer); };
+        worker = &tp_worker_for(peer->tp_rank_view().device);
+        hold = std::unique_lock<std::mutex>(worker->scope_mu);
+        worker->post(&job);
     }
     ~TpMirrorScope() {
-        if (worker.joinable()) worker.join();
+        if (worker) worker->wait();
         --t_tp_mirror_depth;
     }
     TpMirrorScope(const TpMirrorScope&) = delete;
@@ -1707,16 +1766,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         if (mgd) kernels::launch_mg_debug_f32(p, n, tag, layer, position, st);
     };
     // DEBUG ONLY: SPARKINFER_MG_DUMP_STEP=<position> additionally raw-dumps tag=10 (this
-    // layer's pre-attn-norm xn) for EVERY layer at that one decode step into a [n_layers,H]
-    // bf16 device buffer, D2H-copied and written to SPARKINFER_MG_DUMP_FILE (default
-    // /tmp/mg_xn_dump.bin) right after this step's graph launch is synced. Lets a later-layer
-    // hypothesis be checked against a from-scratch Python reference seeded with sparkinfer's
-    // OWN xn for that layer, without needing to replicate every earlier layer.
+    // layer's pre-attn-norm xn) for EVERY layer at that one decode step, then the final norm,
+    // then each layer's post-attn hn, into a [2*n_layers+1,H] bf16 device buffer, D2H-copied
+    // and written to SPARKINFER_MG_DUMP_FILE (default /tmp/mg_xn_dump.bin) right after this
+    // step's graph launch is synced. Lets a later-layer hypothesis be checked against a
+    // from-scratch Python reference seeded with sparkinfer's OWN xn for that layer, without needing to replicate every earlier layer.
     static int dump_step = -2;
     if (dump_step < -1) { const char* e = getenv("SPARKINFER_MG_DUMP_STEP"); dump_step = e ? atoi(e) : -1; }
     const bool mgdump = mgd && dump_step == position;
     if (mgdump && !s.dbg_xn_dump)
-        cu(cudaMalloc(&s.dbg_xn_dump, (size_t)(c.n_layers + 1) * H * sizeof(bf16)), "dbg_xn_dump alloc");
+        cu(cudaMalloc(&s.dbg_xn_dump, (size_t)(2 * c.n_layers + 1) * H * sizeof(bf16)), "dbg_xn_dump alloc");
     auto dbg_xn_snapshot = [&](const void* p, int layer) {
         if (mgdump) cu(cudaMemcpyAsync(s.dbg_xn_dump + (size_t)layer * H, p, (size_t)H * sizeof(bf16),
                                        cudaMemcpyDeviceToDevice, st), "dbg_xn_dump copy");
@@ -2306,7 +2365,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             kernels::launch_qwen36_gdn_ar(s.lin_q + gdn_qshift, s.lin_k + gdn_qshift,
                                           s.lin_v + gdn_v0 * c.linear_head_dim,
                                           s.lin_alpha + gdn_v0, s.lin_beta + gdn_v0,
-                                          w.ssm_dt + gdn_v0, w.ssm_a + gdn_v0,
+                                          static_cast<const bf16*>(w.ssm_dt) + gdn_v0, static_cast<const bf16*>(w.ssm_a) + gdn_v0,
                                           s.lin_state, state_off, s.lin_gdn + gdn_v0 * c.linear_head_dim,
                                           p_->gdn_window.v_count > 0
                                               ? (c.gdn_qh_block ? gdn_vloc / gdn_g : gdn_vloc)
@@ -2689,6 +2748,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             dbg_bf16(s.h, H, 50, L);
             dbg_bf16(s.hn, H, 51, L);
         }
+        dbg_xn_snapshot(s.hn, c.n_layers + 1 + L);   // slots n_layers+1.. : post-attn hn
 
         const bool qmoe = w.shared_gate_q && w.shared_up_q && w.shared_down_q
                        && w.shared_gate_qtype == 8 && c.hidden == 2048 && c.moe_ffn == 512;
@@ -3168,7 +3228,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
     cu(cudaStreamSynchronize(st), "sync");
     if (mgdump) {
-        std::vector<bf16> host((size_t)(c.n_layers + 1) * H);
+        std::vector<bf16> host((size_t)(2 * c.n_layers + 1) * H);
         cu(cudaMemcpy(host.data(), s.dbg_xn_dump, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
            "dbg_xn_dump readback");
         const char* path = getenv("SPARKINFER_MG_DUMP_FILE");
@@ -3350,6 +3410,19 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
     // its slice base, since its table holds only its half), the other rank zeroes its copy, and
     // one all-reduce gives both ranks the full row. It then seeds x and primes layer 0's input
     // norm, exactly as the tp=1 body's op entry does.
+    // A sequence's first token starts from zero recurrent + conv state, as in the tp=1 body:
+    // open_session does NOT zero lin_state/lin_conv_state (the position-0 reset there and in the
+    // prefill does), so without this a rank decodes on whatever its fresh allocation held.
+    if (c.hybrid && position == 0 && s.lin_state && s.lin_conv_state) {
+        cu(cudaMemsetAsync(s.lin_state, 0,
+                           (size_t)gdn_state_slots(c) * gdn_v_local() * c.linear_head_dim *
+                               c.linear_head_dim * sizeof(float), st),
+           "tp linear state reset");
+        cu(cudaMemsetAsync(s.lin_conv_state, 0,
+                           (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim * sizeof(bf16), st),
+           "tp linear conv reset");
+    }
+
     const int rows_per_rank = c.vocab / 2;
     const int owning_rank = rows_per_rank > 0 ? token_id / rows_per_rank : 0;
     if ((int)s.tp_rank == owning_rank) {
@@ -3365,9 +3438,27 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
        "tp xrow -> x");
     kernels::launch_rmsnorm(s.x, s.w.layers[0].input_norm, s.xn, 1, H, c.rms_eps, st);
 
+    s.tp_cur_pos = position;   // the attention layers' KV slot / rotary position
+
+    // DEBUG ONLY: SPARKINFER_MG_DUMP_STEP=<position> dumps, at that step, the same
+    // [2*n_layers+1, H] bf16 layout as the tp=1 dump (each layer's input-normed xn, the final
+    // norm, then each layer's post-attention hn) into <SPARKINFER_MG_DUMP_FILE>.tp<rank>.<n> --
+    // for layer-by-layer tp=1 vs tp=2 diffing.
+    static int tp_dump_step = -2;
+    if (tp_dump_step < -1) { const char* e = getenv("SPARKINFER_MG_DUMP_STEP"); tp_dump_step = e ? atoi(e) : -1; }
+    std::vector<bf16> tp_dump;
+    if (tp_dump_step == position) tp_dump.resize((size_t)(2 * c.n_layers + 1) * H);
+    auto tp_dump_xn = [&](int slot, const void* src = nullptr) {
+        if (tp_dump.empty()) return;
+        cu(cudaMemcpyAsync(tp_dump.data() + (size_t)slot * H, src ? src : s.xn, (size_t)H * sizeof(bf16),
+                           cudaMemcpyDeviceToHost, st), "tp dump");
+        cu(cudaStreamSynchronize(st), "tp dump sync");
+    };
+
     // -- 64-layer loop: per-layer partials + one all-reduce per block; layer tails unchanged --
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
+        tp_dump_xn(L);
         // The two attention flavors share the same tp shape: each helper computes this rank's
         // partial into the tp_ar row (GDN: windowed qkv GEMV + rank-local conv/recurrence/norm +
         // K-windowed ssm_out; attn: N-windowed q/k/v GEMVs + rank-local QK-norm/RoPE/KV-append/
@@ -3378,6 +3469,7 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
         tp_allreduce_row(s.tp_ar, (size_t)2 * H, /*is_xrow=*/false);
         // tail1 (unchanged vs tp=1): h = x + attn_out ; hn = RMSNorm(h, post_attn_norm)
         kernels::launch_add_rmsnorm2(s.x, s.tp_ar, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
+        tp_dump_xn(c.n_layers + 1 + L, s.hn);
         // FFN partial (tp_ar row 0: this rank's ffn partial; AR-B below combines the ranks).
         tp_ffn_layer_tp(L, s.xn, s.tp_ar);
         // AR-B: combine the ffn_down partial across ranks.
@@ -3385,6 +3477,15 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
         // tail2 (unchanged vs tp=1): x = h + ffn_out ; xn = RMSNorm(x, nextnorm)
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(s.h, s.tp_ar, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+    }
+    tp_dump_xn(c.n_layers);
+    if (!tp_dump.empty()) {
+        static int tp_dump_call[2] = {0, 0};
+        const char* path = getenv("SPARKINFER_MG_DUMP_FILE");
+        const std::string ps = std::string(path ? path : "/tmp/mg_xn_dump.bin") + ".tp" +
+                               std::to_string(s.tp_rank) + "." + std::to_string(tp_dump_call[s.tp_rank & 1]++);
+        if (FILE* f = fopen(ps.c_str(), "wb")) { fwrite(tp_dump.data(), sizeof(bf16), tp_dump.size(), f); fclose(f); }
+        fprintf(stderr, "[tp-debug] dumped xn for step=%d -> %s\n", position, ps.c_str());
     }
 
     // -- epilogue (design item 4, S4c-2): vocab-split lm_head GEMV + (m,t) combine --
@@ -3636,11 +3737,13 @@ void Qwen35Model::tp_attn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
         return;
     }
 
-    // -- this rank's position/seq_len. The tp path never writes d_scalars[1]/[3] (d_pos/d_seqlen),
-    // and this rank appends into its OWN pool, so the (rotary) position is its own pool's token
-    // allocation and the seq length follows it (tp=1: seqlen = position+1). mrope offset 0 (27B
-    // is text-only). tp_pos[0] feeds the append's positions, tp_pos[1] the flash-decode seq_lens.
-    const int pos    = s.kv->allocated_tokens(s.active_seq_id);
+    // -- this rank's position/seq_len: the decode position forward_token_tp was called with
+    // (identical on both ranks: the peer runs the mirrored call with the same arguments), exactly
+    // the tp=1 body's h_scalars[2]/[3] (slot = position, seqlen = position + 1). NOT the pool's
+    // allocated_tokens(): that is the sequence's block CAPACITY (blocks x block_size, the whole
+    // request budget), so every token appended to one fixed slot at one fixed rotary position and
+    // flash-decode read unwritten slots. Rotary == slot (mrope offset 0: the 27B is text-only).
+    const int pos    = s.tp_cur_pos;
     const int seqlen = pos + 1;
     s.h_tp_pos[0] = pos;
     s.h_tp_pos[1] = seqlen;
@@ -3873,14 +3976,17 @@ void Qwen35Model::tp_gdn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
     };
 
     // -- qkv: one GEMV into staging (rows [ql q | ql k | vloc v] of the rank's blob), then
-    // three D2D copies scatter the windows into the full-width buffers at global offsets --
+    // three D2D copies scatter the windows into the full-width PACKED qkv buffer at their global
+    // offsets ([q | k | v], the layout the conv kernel below reads as its input; it writes the
+    // split lin_q/lin_k/lin_v itself) --
+    const int qdim = c.linear_q_heads * HD;
     proj(w.wqkv, w.wqkv_type, s.tp_qkv, 2 * ql * HD + vloc * HD);
-    cu(cudaMemcpyAsync(s.lin_q + q0 * HD, s.tp_qkv, (size_t)ql * HD * sizeof(bf16),
+    cu(cudaMemcpyAsync(s.lin_qkv + q0 * HD, s.tp_qkv, (size_t)ql * HD * sizeof(bf16),
                        cudaMemcpyDeviceToDevice, st), "tp gdn q");
-    cu(cudaMemcpyAsync(s.lin_k + q0 * HD, s.tp_qkv + ql * HD, (size_t)ql * HD * sizeof(bf16),
+    cu(cudaMemcpyAsync(s.lin_qkv + qdim + q0 * HD, s.tp_qkv + ql * HD, (size_t)ql * HD * sizeof(bf16),
                        cudaMemcpyDeviceToDevice, st), "tp gdn k");
-    cu(cudaMemcpyAsync(s.lin_v + v0 * HD, s.tp_qkv + 2 * ql * HD, (size_t)vloc * HD * sizeof(bf16),
-                       cudaMemcpyDeviceToDevice, st), "tp gdn v");
+    cu(cudaMemcpyAsync(s.lin_qkv + 2 * qdim + v0 * HD, s.tp_qkv + 2 * ql * HD,
+                       (size_t)vloc * HD * sizeof(bf16), cudaMemcpyDeviceToDevice, st), "tp gdn v");
     proj(w.wqkv_gate, w.wqkv_gate_type, s.lin_z + v0 * HD, vloc * HD);
     proj(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha + v0, vloc);
     proj(w.ssm_beta, w.ssm_beta_type, s.lin_beta + v0, vloc);
@@ -3919,7 +4025,7 @@ void Qwen35Model::tp_gdn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
     kernels::launch_qwen36_gdn_ar(s.lin_q + q0 * HD, s.lin_k + q0 * HD,
                                   s.lin_v + v0 * HD,
                                   s.lin_alpha + v0, s.lin_beta + v0,
-                                  w.ssm_dt + v0, w.ssm_a + v0,
+                                  static_cast<const bf16*>(w.ssm_dt) + v0, static_cast<const bf16*>(w.ssm_a) + v0,   // typed: void* + n is BYTES
                                   s.lin_state, state_off, s.lin_gdn + v0 * HD,
                                   c.gdn_qh_block ? vloc / g : vloc,
                                   vloc,
@@ -4129,6 +4235,31 @@ void Qwen35Model::tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow) {
         if (!s.tp_link->allreduce(a, b, elems * sizeof(uint16_t), GpuLink::Dtype::BFloat16))
             { cu(cudaErrorUnknown, "tp allreduce"); note_tp_fatal("GpuLink decode allreduce failed"); }
     });
+}
+
+static float g_tp_seed_m1 = 0.f;
+static int g_tp_seed_t1 = -1;
+static int g_tp_seed_win = -1;
+
+int tp_prefill_seed_exchange(float local_m, int local_t, int rows_per_rank) {
+    if (!g_tp_prefill_link || g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return -1;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        (dev != g_tp_prefill_dev[0] && dev != g_tp_prefill_dev[1]))
+        return -1;
+    if (dev != g_tp_prefill_dev[0]) {
+        // Peer: publish before arriving (the leader reads after the arrival), then read the
+        // winner after the post. Neither slot can be rewritten before the other side has read
+        // it: the leader writes g_tp_seed_win only inside a post, which needs our next arrival.
+        g_tp_seed_m1 = local_m;
+        g_tp_seed_t1 = local_t + rows_per_rank;
+        tp_peer_rendezvous("prefill seed");
+        return g_tp_seed_win;
+    }
+    tp_leader_rendezvous("prefill seed", [&] {
+        g_tp_seed_win = (local_m >= g_tp_seed_m1) ? local_t : g_tp_seed_t1;   // rank 0 wins ties
+    });
+    return g_tp_seed_win;
 }
 
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {

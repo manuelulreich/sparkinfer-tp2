@@ -765,9 +765,11 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
 }
 
 // Workspace cache. The scan is called once per linear layer with the same N, so one allocation is
-// reused across all 24 layers and every subsequent prefill; it only ever grows.
-void* g_ws = nullptr;
-size_t g_ws_bytes = 0;
+// reused across all 24 layers and every subsequent prefill; it only ever grows. Per THREAD: under
+// tensor parallelism each rank's prefill runs on its own thread (bound to its own device) at the
+// same time as the other's, so a process-wide workspace would be shared across ranks and devices.
+thread_local void* g_ws = nullptr;
+thread_local size_t g_ws_bytes = 0;
 
 bool ws_reserve(size_t bytes) {
     if (bytes <= g_ws_bytes) return true;

@@ -530,6 +530,16 @@ bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtyp
     e = post_copy_retry(op, "D2D copy into rank B", dst_b, a.in, bytes, cudaMemcpyDeviceToDevice,
                          b.stream);
     if (e != cudaSuccess) return fail("D2D copy into rank B", e);
+    // Exit fence: neither rank may write its in/out (the in-place reduce below, or any later op
+    // on its stream) until the PEER's copy has finished reading it. Without this a rank that runs
+    // ahead overwrites its partial with the sum while the peer is still copying it, and the peer
+    // computes b + (a+b) -- a silent, timing-dependent wrong sum. The entry events are re-recorded
+    // as "my copy is done" (the waits above already snapshotted their entry records).
+    e = cudaEventRecord(im.ranks[0].event, a.stream);
+    if (e == cudaSuccess) e = cudaEventRecord(im.ranks[1].event, b.stream);
+    if (e == cudaSuccess) e = cudaStreamWaitEvent(a.stream, im.ranks[1].event, 0);
+    if (e == cudaSuccess) e = cudaStreamWaitEvent(b.stream, im.ranks[0].event, 0);
+    if (e != cudaSuccess) return fail("P2P: exit fence", e);
     e = detail::launch_glink_reduce(a.out, a.in, dst_a, n, dtype, is_max, a.stream);
     if (e != cudaSuccess) return fail("reduce kernel on rank A", e);
     e = detail::launch_glink_reduce(b.out, b.in, dst_b, n, dtype, is_max, b.stream);
@@ -566,6 +576,13 @@ bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtyp
                          b.stream);
   if (e == cudaSuccess) e = detail::launch_glink_reduce(b.out, b.in, dst_b, n, dtype, is_max, b.stream);
   if (e != cudaSuccess) return fail("peer staging on rank B", e);
+  // Exit fence (staging): each rank's NEXT D2H overwrites its pinned buffer, which the peer's
+  // H2D above may still be reading; order every later op on each stream after the peer's H2D.
+  e = cudaEventRecord(ra.event, a.stream);
+  if (e == cudaSuccess) e = cudaEventRecord(rb.event, b.stream);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(a.stream, rb.event, 0);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(b.stream, ra.event, 0);
+  if (e != cudaSuccess) return fail("staging: exit fence", e);
   return true;
 }
 

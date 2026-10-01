@@ -34,5 +34,29 @@ void launch_gather_rows(void* dst_bf16, size_t dst_pitch, const void* src_bf16, 
         dst_pitch, src_pitch, width, total);
 }
 
+// Vocab-row-split embedding (tp>1): this rank's table holds rows [v0, v0+vcount) of the full
+// vocabulary. out[i] = table[ids[i] - v0] when ids[i] is in the window, else a zero row -- so a
+// sum (all-reduce) over the ranks reconstructs the full embedding exactly.
+__global__ void embedding_vocab_window_kernel(const int* __restrict__ ids,
+                                              const __nv_bfloat16* __restrict__ table,
+                                              __nv_bfloat16* __restrict__ out, int hidden,
+                                              int v0, int vcount) {
+    const int row = blockIdx.x;
+    const int id = ids[row] - v0;
+    const bool own = id >= 0 && id < vcount;
+    __nv_bfloat16* o = out + (size_t)row * hidden;
+    const __nv_bfloat16* t = own ? table + (size_t)id * hidden : nullptr;
+    for (int c = threadIdx.x; c < hidden; c += blockDim.x)
+        o[c] = own ? t[c] : __float2bfloat16(0.f);
+}
+
+void launch_embedding_vocab_window(const int* ids, const void* table, void* out, int n_tokens,
+                                   int hidden, int v0, int vcount, cudaStream_t stream) {
+    if (n_tokens <= 0) return;
+    embedding_vocab_window_kernel<<<n_tokens, 256, 0, stream>>>(
+        ids, reinterpret_cast<const __nv_bfloat16*>(table),
+        reinterpret_cast<__nv_bfloat16*>(out), hidden, v0, vcount);
+}
+
 }  // namespace kernels
 }  // namespace sparkinfer

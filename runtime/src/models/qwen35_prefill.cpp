@@ -736,6 +736,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bf16* tp_qwide = nullptr;
     bf16* tp_att = nullptr;
     bool tp_wide = false;
+    // (tp) GDN window-fill and FFN rank scratch. The arena is a bump allocator that is only
+    // released at pass end, so these are allocated ONCE (lazily, at first use) and reused by
+    // every layer -- allocating them per layer (per chunk, for the FFN) grew the pass by ~1.9 GB
+    // at 1.7k tokens on the 27B (48 GDN layers x ~39 MB) and ran the card out of memory.
+    bf16 *tp_gdn_qkv = nullptr, *tp_gdn_z = nullptr, *tp_gdn_a = nullptr, *tp_gdn_b = nullptr;
+    bf16 *tp_gdn_conv = nullptr, *tp_gdn_ln = nullptr;
+    bf16 *tp_ffg_buf = nullptr, *tp_ffu_buf = nullptr;   // sized by the first (largest) chunk
     const bool attn_vi8 = !c.muse_glimmer && c.hybrid && N >= 32768 &&
         [] { const char* e = getenv("SPARKINFER_PREFILL_ATTN_VI8"); return !e || e[0] != '0'; }();
     signed char* vi8 = nullptr;
@@ -1581,8 +1588,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (ffn_wcache_env && s.gguf && !use_i8_ffn && use_i8 && !moe && !c.muse_glimmer && !gu_nvfp4 &&
         N > FC &&
         W_i8 && wbuf && sw && (size_t)ffn * H <= maxw && ffn <= maxNO) {
-        static float* wc_sw = nullptr;
-        static size_t wc_sw_n = 0;
+        static thread_local float* wc_sw = nullptr;   // per thread = per rank under tp
+        static thread_local size_t wc_sw_n = 0;
         const size_t need = (size_t)ffn + (size_t)H;
         if (need > wc_sw_n) {
             if (wc_sw) cudaFree(wc_sw);
@@ -2143,6 +2150,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         kernels::launch_embedding_ptq1_unrotate(
             d_ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_sign_hidden),
             x, N, H, s.bonsai_block, st);
+    } else if (tp_active) {
+        // Vocab row-split table: this rank holds rows [r*V/2, (r+1)*V/2). Each rank fills only
+        // the rows of the tokens it owns (zero elsewhere); one all-reduce gives both the full x.
+        const int tp_vr = c.vocab / 2;
+        const int r = (s.gdn_window.v_count > 0) ? (s.gdn_window.v_start / s.gdn_window.v_count) : 0;
+        kernels::launch_embedding_vocab_window(d_ids, s.w.embed_tokens, x, N, H, r * tp_vr, tp_vr, st);
+        tp_prefill_allreduce_bf16(x, (size_t)N * H);
     } else {
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
     }
@@ -2207,26 +2221,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // qkv: rank blob [2*gdn_ql + gdn_vl][H] (q window | k window | v window) -> the
                 // b8 row's q/k/v blocks at this rank's in-row window bases; z -> the lz window.
                 const size_t rowqkv = 2 * (size_t)gdn_ql + gdn_vl;
-                bf16* tp_qkv = a.alloc<bf16>((size_t)N * rowqkv);
-                bf16* tp_z   = a.alloc<bf16>((size_t)N * gdn_vl);
+                if (!tp_gdn_qkv) tp_gdn_qkv = a.alloc<bf16>((size_t)N * rowqkv);
+                if (!tp_gdn_z)   tp_gdn_z   = a.alloc<bf16>((size_t)N * gdn_vl);
+                bf16* tp_qkv = tp_gdn_qkv;
+                bf16* tp_z   = tp_gdn_z;
                 proj_fused(xn, w.wqkv,      w.wqkv_type,      w.wqkv_rs,      tp_qkv, rowqkv, H, N);
                 proj_fused(xn, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, tp_z,   gdn_vl, H, N);
-                kernels::launch_gather_rows(b8 + gdn_r * gdn_ql, wide, tp_qkv, rowqkv, gdn_ql, N, st);
-                kernels::launch_gather_rows(b8 + (lqkv - lvdim) / 2 + gdn_r * gdn_ql, wide, tp_qkv + gdn_ql, rowqkv, gdn_ql, N, st);
-                kernels::launch_gather_rows(b8 + (lqkv - lvdim) + gdn_r * gdn_vl, wide, tp_qkv + 2 * gdn_ql, rowqkv, gdn_vl, N, st);
+                // b8 rows are DENSE at pitch lqkv (what gdn_qkv_z writes and the conv kernel reads),
+                // not the arena's allocation width `wide`.
+                kernels::launch_gather_rows(b8 + gdn_r * gdn_ql, lqkv, tp_qkv, rowqkv, gdn_ql, N, st);
+                kernels::launch_gather_rows(b8 + (lqkv - lvdim) / 2 + gdn_r * gdn_ql, lqkv, tp_qkv + gdn_ql, rowqkv, gdn_ql, N, st);
+                kernels::launch_gather_rows(b8 + (lqkv - lvdim) + gdn_r * gdn_vl, lqkv, tp_qkv + 2 * gdn_ql, rowqkv, gdn_vl, N, st);
                 kernels::launch_gather_rows(lz + gdn_r * gdn_vl, lvdim, tp_z, gdn_vl, gdn_vl, N, st);
             } else {
                 gdn_qkv_z(xn, w, attn_norm_deferred);                    // qkv + z gate (fp8: fused)
             }
             if (tp_gdn) {
-                bf16* tp_a = a.alloc<bf16>((size_t)N * gdn_vh);
+                if (!tp_gdn_a) tp_gdn_a = a.alloc<bf16>((size_t)N * gdn_vh);
+                bf16* tp_a = tp_gdn_a;
                 proj(xn, w.ssm_alpha, w.ssm_alpha_type, tp_a, gdn_vh, H, N);
                 kernels::launch_gather_rows(la + gdn_r * gdn_vh, vh, tp_a, gdn_vh, gdn_vh, N, st);
             } else {
                 proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
             }
             if (tp_gdn) {
-                bf16* tp_b = a.alloc<bf16>((size_t)N * gdn_vh);
+                if (!tp_gdn_b) tp_gdn_b = a.alloc<bf16>((size_t)N * gdn_vh);
+                bf16* tp_b = tp_gdn_b;
                 proj(xn, w.ssm_beta, w.ssm_beta_type, tp_b, gdn_vh, H, N);
                 kernels::launch_gather_rows(lb + gdn_r * gdn_vh, vh, tp_b, gdn_vh, gdn_vh, N, st);
             } else {
@@ -2256,7 +2276,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 for (int c = 0; c < gdn_vl; c++)
                     for (int t = 0; t < taps; t++)
                         full[((lqkv - lvdim) + gdn_r * gdn_vl + c) * taps + t] = src[(2 * gdn_ql + c) * taps + t];
-                bf16* conv_scratch = a.alloc<bf16>((size_t)lqkv * taps);
+                if (!tp_gdn_conv) tp_gdn_conv = a.alloc<bf16>((size_t)lqkv * taps);
+                bf16* conv_scratch = tp_gdn_conv;
                 pf_cu(cudaMemcpyAsync(conv_scratch, full.data(), (size_t)lqkv * taps * sizeof(bf16),
                                   cudaMemcpyHostToDevice, st), "gdn tp conv H2D");
                 gdn_conv_w = conv_scratch;
@@ -2360,7 +2381,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // only; 27B prefill is bf16, so the tp path is the plain proj + AR.
             bool out_fp4 = false;
             if (tp_gdn) {
-                bf16* tp_lnA = a.alloc<bf16>((size_t)N * gdn_vl);
+                if (!tp_gdn_ln) tp_gdn_ln = a.alloc<bf16>((size_t)N * gdn_vl);
+                bf16* tp_lnA = tp_gdn_ln;
                 kernels::launch_gather_rows(tp_lnA, gdn_vl, lnrm + gdn_r * gdn_vl, lvdim, gdn_vl, N, st);
                 proj(tp_lnA, w.ssm_out, w.ssm_out_type, ao, H, gdn_vl, N);
                 tp_prefill_allreduce_bf16(ao, (size_t)N * H);
@@ -3325,9 +3347,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     const bool tp_ffn = tp_ffn_split && (ffn % ffn_ranks == 0);
                     if (tp_ffn) {
                         // tp prefill: rank-SwiGLU + rank-K down + allreduce; the projections still pick int8/NVFP4 per weight inside proj_fused/proj.
-                        // rank-dense scratch: lazy per-chunk arena alloc (this block is per-chunk, fn rows); freed with the arena at pass end.
-                        bf16* tp_ffg = a.alloc<bf16>((size_t)fn * ffn_r);
-                        bf16* tp_ffu = a.alloc<bf16>((size_t)fn * ffn_r);
+                        // rank-dense scratch, allocated once at the first (largest) chunk and reused.
+                        if (!tp_ffg_buf) tp_ffg_buf = a.alloc<bf16>((size_t)fn * ffn_r);
+                        if (!tp_ffu_buf) tp_ffu_buf = a.alloc<bf16>((size_t)fn * ffn_r);
+                        bf16* tp_ffg = tp_ffg_buf;
+                        bf16* tp_ffu = tp_ffu_buf;
                         proj_fused(hn_c, gate_pf, gate_pf_type, w.gate_rs, tp_ffg, ffn_r, H, fn);
                         proj_fused(hn_c, up_pf,   up_pf_type,   w.up_rs,   tp_ffu, ffn_r, H, fn);
                         kernels::launch_prefill_swiglu(tp_ffg, tp_ffu, tp_ffg, (long)fn * ffn_r, st);
@@ -3972,6 +3996,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         cudaEventDestroy(moe_ev_sg);
 
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
+    // Under tp the lm_head is this rank's V/2-row window (vocab row-split).
+    const int tp_vr = c.vocab / 2;
+    const int head_rows = tp_active ? tp_vr : c.vocab;
     // A packed pass has one per prompt, each read back as it is produced (it never captures).
     for (int si = 0; si < (multi ? nseg : 1); ++si) {
         const int last_row = multi ? s.multi_off[si] + s.multi_len[si] - 1 : N - 1;
@@ -3982,21 +4009,40 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // larger half of what that one launch reads after the weights themselves.
         if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
             kernels::launch_quantize_q8_1(xn_last, lm_q8, lm_ad, lm_as, H, st);
-            kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, c.vocab, H, st);
+            kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, head_rows, H, st);
         } else if (s.w.lm_head_type == kPtq1GgmlType && s.bonsai_rot && s.bonsai_sign_hidden) {
             // Ternary head: prefill's seed argmax reads it too, and launch_gemv_q_f32 does not
             // know this type -- it would read blocks of the wrong size rather than refuse.
             kernels::launch_hadamard_rotate_bf16(
                 xn_last, s.bonsai_rot, static_cast<const signed char*>(s.bonsai_sign_hidden),
                 H, H, s.bonsai_block, st);
-            kernels::launch_gemv_ptq1_f32(s.bonsai_rot, s.w.lm_head, s.logits, c.vocab, H, st);
+            kernels::launch_gemv_ptq1_f32(s.bonsai_rot, s.w.lm_head, s.logits, head_rows, H, st);
         } else if (s.w.lm_head_type)
-            kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+            kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, head_rows, H, st);
         else
-            kernels::launch_gemv_f32(xn_last, s.w.lm_head, s.logits, c.vocab, H, st);
+            kernels::launch_gemv_f32(xn_last, s.w.lm_head, s.logits, head_rows, H, st);
         // Muse Glimmer tanh final-logit softcap before argmax (decode qwen35.cpp:1365).
         if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
             kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
+        if (tp_active) {
+            // Vocab row-split: this rank's lm_head holds only V/2 rows (the GEMV above ran over
+            // tp_vr of them), so the seed is the cross-rank argmax: local argmax + its logit here,
+            // the global winner from the host exchange (both ranks get the same token).
+            kernels::launch_argmax(s.logits, s.d_out_id, 1, tp_vr, st);
+            pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st),
+                  "tp seed t");
+            pf_cu(cudaStreamSynchronize(st), "tp seed t sync");
+            const int lt = *s.h_out_id;
+            float lm = 0.f;
+            pf_cu(cudaMemcpy(&lm, s.logits + lt, sizeof(float), cudaMemcpyDeviceToHost), "tp seed m");
+            const int tok = tp_prefill_seed_exchange(lm, lt, tp_vr);
+            *s.h_out_id = tok;
+            pf_cu(cudaMemcpyAsync(s.d_out_id, s.h_out_id, sizeof(int), cudaMemcpyHostToDevice, st),
+                  "tp seed out");
+            pf_cu(cudaStreamSynchronize(st), "tp seed out sync");
+            if (multi) s.multi_seed[si] = tok;
+            continue;
+        }
         kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
         if (multi) {
             pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st),

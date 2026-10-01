@@ -1107,8 +1107,9 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
 // query tile, i.e. n_tokens/BM = 1024 times per window.
 // ============================================================================
 namespace {
-void*  g_vpack = nullptr;
-size_t g_vpack_bytes = 0;
+// Per thread = per tensor-parallel rank (each rank prefills on its own thread and device).
+thread_local void*  g_vpack = nullptr;
+thread_local size_t g_vpack_bytes = 0;
 
 bool vpack_reserve(size_t bytes) {
     if (bytes <= g_vpack_bytes) return true;

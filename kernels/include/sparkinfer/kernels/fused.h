@@ -63,6 +63,10 @@ void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
 // reverse gather for the GDN-out A operand).
 void launch_gather_rows(void* dst_bf16, size_t dst_pitch, const void* src_bf16, size_t src_pitch,
                         size_t width, size_t rows, cudaStream_t stream = nullptr);
+// Vocab-row-split embedding (tp>1): rows of tokens outside [v0, v0+vcount) come out zero, so the
+// ranks' outputs sum (all-reduce) to the full embedding. `table` holds only the window's rows.
+void launch_embedding_vocab_window(const int* ids, const void* table, void* out, int n_tokens,
+                                   int hidden, int v0, int vcount, cudaStream_t stream = nullptr);
 
 // Muse Glimmer's sandwich-norm tail in one launch instead of two:
 //   out_x  = residual + RMSNorm(branch, post_w, post_eps)   (what launch_norm_then_add does)

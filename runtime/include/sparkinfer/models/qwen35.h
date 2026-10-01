@@ -841,4 +841,11 @@ private:
 // (a tp=1 process) makes this a no-op, exactly like tp_allreduce_row for a peer rank.
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems);
 
+// Prefill seed argmax across the vocab split: each rank passes its OWN half's argmax (the
+// local row index into its V/2-row lm_head window) and that row's logit; returns the GLOBAL
+// winning token (max logit; rank 0 wins ties, as in the decode epilogue) on both ranks. A
+// host-only exchange inside the same two-way rendezvous as tp_prefill_allreduce_bf16. Returns
+// -1 when no tp link is attached (tp=1 never calls it).
+int tp_prefill_seed_exchange(float local_m, int local_t, int rows_per_rank);
+
 } // namespace sparkinfer
