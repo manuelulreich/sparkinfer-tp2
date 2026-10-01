@@ -77,6 +77,44 @@ hand off to lossless autoregressive decoding. `/metrics` exposes
 `sparkinfer_speculative_runs_total`, `sparkinfer_speculative_tokens_total`, and
 `sparkinfer_speculative_handoffs_total` so this is observable in production.
 
+### Serve on two cards (`--tp 2`)
+
+Qwen3.8-27B NVFP4 splits across two GPUs with tensor parallelism: each card holds half the
+attention and GDN heads, half the FFN and half the vocabulary rows, and the two meet in one
+all-reduce per block (128 per token) over peer-to-peer PCIe. Two 16 GB cards run what one 32 GB
+card does.
+
+```bash
+./build/server/sparkinfer_server -m "$MODEL" --tokenizer "$MODEL/tokenizer.json" \
+  --tp 2 --devices 0,1 --ctx 131072
+# DSpark: the drafter runs on the first card; 49152 is the most that card leaves room for
+./build/server/sparkinfer_server -m "$MODEL" --tokenizer "$MODEL/tokenizer.json" \
+  --tp 2 --devices 0,1 --ctx 49152 --draft-model "$DRAFT"
+```
+
+Measured on 2× RTX 5060 Ti 16 GB (PCIe Gen3 x8 P2P, `dual-gpu/gates/baseline_2x5060ti.json`):
+greedy decode 52 tok/s, prefill 2,159 tok/s at 3,072 tokens, DSpark 186 tok/s (counting) /
+72 tok/s (prose). Under `SPARKINFER_DETERMINISTIC=1` DSpark output is byte-identical to ordinary
+decode on the same pair, and sampling, logprobs, logit bias, prefix caching, images and continuous
+batching all work. What to know:
+
+- **Peer-to-peer.** `/v1/info` reports `"link": "p2p-mapped"` when the cards reach each other
+  directly (consumer boards route it through the PCIe root complex — measured 6.5–7.2 GB/s on Gen3
+  x8) or `"pinned-staging"` when they cannot (host-staged, about half that; correct, slower). Every
+  all-reduce crosses this link: decode spends ~15% of its time there, a long prefill ~35%.
+- **Memory.** 131,072 tokens fit without the drafter. With `--draft-model` the first card also
+  holds the drafter (~2.6 GB with its quantized copies), so `--ctx` tops out at 49,152; a larger
+  value is refused at load with "lower --ctx" (`SPARKINFER_DSPARK_MIN_FREE_MB`). The vision tower
+  goes on the last card.
+- **Numerics.** tp=2 is not bit-identical to one card — the per-card partial sums are rounded to
+  bf16 before they are added — but greedy text, retrieval and the teacher-forced score track the
+  single-card model closely (`dual-gpu/gates/score_gate.py` measures the gap against a reference
+  server).
+- **Not supported at `--tp 2`:** the LMCache sidecar (refused at load: it caches one card's KV pool
+  while each card holds half the KV heads). `--tp` greater than 2 is not implemented.
+- **Failure policy.** An unrecoverable error on either card or on the link marks the whole server
+  unhealthy (`/health` 503, restart required); `/metrics` carries per-card gauges.
+
 ### Serve a GGUF instead of NVFP4
 
 The server also loads Qwen3.8-27B from a GGUF, for example unsloth's
@@ -543,6 +581,12 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_PROMPT_TOKENS_PER_MINUTE` | — | Optional prompt-token/minute capacity published by `/v1/models`. |
 | `SPARKINFER_COMPLETION_TOKENS_PER_MINUTE` | — | Optional completion-token/minute capacity published by `/v1/models`. |
 | `SPARKINFER_OPENROUTER_PROVIDER` | `0` | `1` emits the strict, closed OpenRouter v2.4 model document. The OpenRouter launcher sets this automatically. |
+| `SPARKINFER_VISION` | `1` | `0` skips loading the vision tower (~1 GB); image requests are then refused. |
+| `SPARKINFER_VISION_DEVICE` | last card at `--tp 2`, else the first | Card the vision tower loads and runs on. |
+| `SPARKINFER_GLINK_FLAG` | `1` | `--tp 2`: small all-reduces (≤ 256 KiB) run as one P2P-store kernel per card with a flag handshake instead of copy + event waits (+12% decode). `0` keeps the copy path. Identical results either way. |
+| `SPARKINFER_PREFILL_ALIGN` / `_MIN` | auto (≤ 64-SM cards) / `2048` | Split a prefill of at least `_MIN` tokens into its 128-row-aligned bulk plus the remainder, so the bulk takes the fast full-tile GEMMs (+13% at 3k tokens on an RTX 5060 Ti). `1`/`0` force it on/off. |
+| `SPARKINFER_DSPARK_MIN_FREE_MB` | `256` | `--tp 2` with a drafter: free memory every card must keep after the drafter loads; below it the server refuses to start ("lower --ctx"). |
+| `CUDA_MODULE_LOADING` | `EAGER` at `--tp 2` | Set by the server for tp>1 unless already set: lazy loading can fail silently on a nearly full card. Costs ~30 MB per card. |
 
 ### Release container settings
 
@@ -552,7 +596,8 @@ above. Pass them with `-e NAME=value`. Server flags appended after the image nam
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CTX` | `262144`; `131072` with `serve-dspark` | Context length, passed as `--ctx` |
+| `CTX` | `262144`; `131072` with `serve-dspark`. With `TP=2`: `131072`; `49152` with `serve-dspark` | Context length, passed as `--ctx` |
+| `TP` / `DEVICES` | — / all | `TP=2` splits the model across two GPUs (`--tp 2`); `DEVICES=0,1` picks which (`--devices`). See [Serve on two cards](#serve-on-two-cards---tp-2); `docker/smoke-tp2.sh` checks a two-card box end to end. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `16384` | Per-request generation cap (see the table above) |
 | `SPARKINFER_NO_DOWNLOAD` | `0` | `1` never downloads: the weights must already be in `MODEL_DIR` (and `DRAFT_DIR` for `serve-dspark`). A missing checkpoint fails immediately with what to mount, instead of attempting an egress the box may not have. |
 | `MODEL_REPO` / `MODEL_DIR` | `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` / `/models/qwen38-nvfp4` | Target checkpoint, downloaded on first run |

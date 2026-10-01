@@ -271,6 +271,13 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     // tp>1 each rank holds only its share of the KV heads in its own pool, so a sidecar would
     // cache half the heads and splice them into both ranks. The dual-GPU KV tier is deferred
     // (v2): refuse the combination at load rather than serve wrong attention.
+    // The split paths are written for exactly two ranks (vocab, head and FFN halves, a 2-node
+    // link); a larger group would load and then compute with the wrong slices.
+    if (plan.tp > 2) {
+        fprintf(stderr, "[sparkinfer-server] --tp %d is not supported: tensor parallelism is implemented "
+                        "for two cards (--tp 2)\n", plan.tp);
+        return false;
+    }
     if (plan.tp > 1 && lmcache_enabled()) {
         fprintf(stderr, "[sparkinfer-server] SPARKINFER_LMCACHE_ENABLE=1 is not supported with --tp %d: "
                         "the LMCache sidecar caches a single device's KV pool, and at tp>1 each card "

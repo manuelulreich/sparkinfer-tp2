@@ -60,6 +60,24 @@ server flags such as `--ctx 65536` after the image name or after `serve-dspark`.
 [container settings](server/README.md#release-container-settings) and
 [all server parameters](server/README.md#env).
 
+**Two 16 GB cards.** The 27B does not fit one 16 GB card; add `-e TP=2` and it splits across two
+(tensor parallel: half the attention heads, GDN heads, FFN and vocabulary per card):
+
+```bash
+docker run --gpus all -p 8080:8080 -v qwen38:/models -e TP=2 \
+  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest            # append serve-dspark for DSpark
+```
+
+Measured on 2× RTX 5060 Ti 16 GB (PCIe Gen3 x8, peer-to-peer): 52 tok/s greedy decode, ~2,000 tok/s
+prefill at 4k tokens, and DSpark up to 186 tok/s on predictable text — byte-identical to the same
+pair's ordinary decode. Context defaults to 131,072 tokens, 49,152 with `serve-dspark` (the card
+that holds the drafter has no room for more). The two cards need peer-to-peer access (most
+consumer boards provide it through the PCIe root complex; without it the all-reduce falls back to
+host staging — still correct, roughly half the link speed), and every all-reduce crosses that
+link, so a card pair on a slower slot decodes slower. From source: `--tp 2 --devices 0,1`. The
+LMCache sidecar is single-card only and is refused at `--tp 2`. Details:
+[server README](server/README.md#serve-on-two-cards---tp-2).
+
 Provenance is attested to the image digest:
 
 ```bash

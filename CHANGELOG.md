@@ -5,6 +5,31 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Two-card serving (`--tp 2`)
+
+- **Qwen3.8-27B runs across two 16 GB cards** with tensor parallelism (`--tp 2 --devices 0,1`, or
+  `-e TP=2` in the container): each card holds half the attention/GDN heads, half the FFN and half
+  the vocabulary, joined by one all-reduce per block over peer-to-peer PCIe (a hand-rolled 2-card
+  link; no NCCL dependency — NCCL could not run on the target pair). Measured on 2× RTX 5060 Ti
+  16 GB, PCIe Gen3 x8: 52 tok/s greedy decode, ~2,000 tok/s prefill at 3–4k tokens, 131,072-token
+  context. Sampling, logprobs, logit bias, prefix caching, images/video, function tools and
+  continuous batching work as on one card.
+- **DSpark at tp=2 is byte-lossless** against the same pair's ordinary decode
+  (`SPARKINFER_DETERMINISTIC=1`, 8/8 prompts incl. CJK and long context) and reaches 186 tok/s on
+  predictable text; the drafter runs on the first card, so `--ctx` tops out at 49,152 there (a
+  larger value is refused at load).
+- **Flag all-reduce:** small cross-card sums run as one P2P-store kernel per card with a device-side
+  handshake instead of copy-engine copies and cross-device event waits — +12% decode at tp=2.
+- **Prefill on small-SM cards:** prompts of 2k+ tokens split into a 128-row-aligned bulk plus the
+  remainder so the bulk takes the fast full-tile GEMMs (+7–14% on the 36-SM RTX 5060 Ti; the
+  170-SM RTX 5090 is unaffected).
+- Gates and tooling: `dual-gpu/gates/tp2_gates.py` (lossless, determinism, batching, and
+  no-regression perf tiers against `baseline_2x5060ti.json`), `dual-gpu/gates/run_gpu_tests.sh`
+  (every GPU test on each card), `dual-gpu/gates/score_gate.py` (teacher-forced tp=1 vs tp=2
+  comparison), `docker/smoke-tp2.sh`; `bench/scripts/_common.sh` pins every card's clock.
+- Not at tp=2: the LMCache sidecar (refused at load), `--tp` above 2 (refused).
+
+
 ### Project
 
 - **Ternary-Bonsai-2-27B has a PR eval bot** (`eval/pr_bonsai_bot.py`, #1138). It scores decode and
