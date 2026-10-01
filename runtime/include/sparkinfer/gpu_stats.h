@@ -17,6 +17,8 @@ struct GpuStats {
     int    temp_c           = -1;     // GPU core temperature, °C (heat)
     int    power_w          = -1;     // instantaneous board power draw, W
     int    sm_clock_mhz     = -1;     // SM clock, MHz (drops when thermal-throttling)
+    int    util_pct         = -1;     // GPU utilization over NVML's last sample period, %
+    int    device_id        = -1;     // the CUDA ordinal this sample is for
     size_t vram_used_bytes  = 0;      // resident VRAM = total - free
     size_t vram_total_bytes = 0;      // device VRAM capacity
 

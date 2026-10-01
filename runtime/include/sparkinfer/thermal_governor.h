@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 namespace sparkinfer {
 
@@ -21,6 +22,11 @@ public:
     struct Config {
         bool enabled    = false;   // master switch (default OFF)
         int  device_id  = -1;      // -1 = current CUDA device
+        // (dual-gpu WP-5, CHG-0019) Every card the decode loop spans. Empty = {device_id}, i.e.
+        // today's single-card governor, unchanged. At tp=2 pass both ranks' ordinals: the pace is
+        // taken from the HOTTEST card (max over the cards) -- one decode loop drives both, so the
+        // slower/hotter card sets the thermal state. Still sleep-only: tokens are unchanged.
+        std::vector<int> device_ids;
 
         // Temperature thresholds (°C), ascending. A mode engages at >= its threshold.
         int  balanced_c  = 65;
@@ -57,6 +63,9 @@ public:
 
     // Pure temperature→mode mapping (no hardware, no sleep) — the tiering policy, unit-testable.
     static Mode classify(const Config& cfg, int temp_c);
+    // The governing temperature over several cards: the max of the readings that exist (>= 0);
+    // -1 when no card reported one (the governor then never throttles). Pure, unit-testable.
+    static int governing_temp_c(const std::vector<int>& temps_c);
     static const char* mode_name(Mode m);
 
     Mode   mode()          const { return mode_; }

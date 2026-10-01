@@ -35,6 +35,23 @@ int main() {
     CHECK(off.mode() == G::Mode::Turbo);
     CHECK(off.throttled_tokens() == 0);
 
+    // (dual-gpu WP-5) tp=2 governs on the hottest card: max over the readings that exist.
+    CHECK(G::governing_temp_c({}) == -1);
+    CHECK(G::governing_temp_c({-1}) == -1);
+    CHECK(G::governing_temp_c({-1, -1}) == -1);
+    CHECK(G::governing_temp_c({55}) == 55);                 // tp=1: the one card, unchanged
+    CHECK(G::governing_temp_c({55, 71}) == 71);             // card B hotter -> B governs
+    CHECK(G::governing_temp_c({83, 60}) == 83);             // card A hotter -> A governs
+    CHECK(G::governing_temp_c({-1, 66}) == 66);             // a card without a sensor is ignored
+    CHECK(G::classify(c, G::governing_temp_c({60, 72})) == G::Mode::Safe);
+    // The default config still names no device list (the single-card governor, unchanged), and a
+    // disabled multi-card governor is the same strict no-op.
+    CHECK(c.device_ids.empty());
+    G::Config c3; c3.device_ids = {0, 1};
+    G off2(c3);
+    CHECK(off2.pace() == 0.0);
+    CHECK(off2.mode() == G::Mode::Turbo);
+
     CHECK(std::string(G::mode_name(G::Mode::Turbo))     == "turbo");
     CHECK(std::string(G::mode_name(G::Mode::Emergency)) == "emergency");
 

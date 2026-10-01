@@ -945,6 +945,9 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     if (device_lost()) {
         job.error = "CUDA context lost (unrecoverable device error) -- request aborted; "
                     "the server requires a restart";
+        // (dual-gpu WP-5) Name the first fatal event: which card, or the tp=2 link/rendezvous.
+        const DeviceLostInfo info = device_lost_info();
+        if (!info.reason.empty()) job.error += " [" + info.reason + "]";
         {
             std::lock_guard<std::mutex> lock(mu_);   // done lets the waiting thread destroy the Job
             job.done = true;

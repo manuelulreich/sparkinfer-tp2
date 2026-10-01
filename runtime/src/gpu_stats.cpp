@@ -38,6 +38,7 @@ GpuStats query_gpu_stats(int device_id) {
 
     int dev = device_id;
     if (dev < 0) cudaGetDevice(&dev);
+    s.device_id = dev;
 
     // VRAM — cudaMemGetInfo reports the *current* device, so switch to `dev` and restore.
     int prev = -1;
@@ -66,6 +67,8 @@ GpuStats query_gpu_stats(int device_id) {
             if (nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU, &t) == NVML_SUCCESS) s.temp_c = (int)t;
             if (nvmlDeviceGetPowerUsage(h, &p) == NVML_SUCCESS)                        s.power_w = (int)(p / 1000); // mW→W
             if (nvmlDeviceGetClockInfo(h, NVML_CLOCK_SM, &c) == NVML_SUCCESS)          s.sm_clock_mhz = (int)c;
+            nvmlUtilization_t u{};
+            if (nvmlDeviceGetUtilizationRates(h, &u) == NVML_SUCCESS)                  s.util_pct = (int)u.gpu;
 #pragma GCC diagnostic pop
             s.valid = true;
         }

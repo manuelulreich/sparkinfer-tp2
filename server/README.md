@@ -105,11 +105,11 @@ Compared with the NVFP4 checkpoints:
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | `{"status":"ok"}` |
+| `GET /health` | `{"status":"ok"}`; `503` with `{"status":"unhealthy","reason":…,"detail":…,"device":…}` once an unrecoverable error (on either card under `--tp 2`, or the tp link) has downgraded the server — restart required |
 | `GET /v1/models` | OpenAI model list plus OpenRouter provider schema v2.4 capabilities (includes live `context_length`) |
-| `GET /v1/info` | Model limits (`max_context`, `max_output_tokens`) — live values, not build-time constants |
+| `GET /v1/info` | Model limits (`max_context`, `max_output_tokens`) — live values, not build-time constants — plus `tp` (tensor-parallel size), `devices` (one entry per card/rank: `rank`, `device`, `name`, live VRAM used/total, `temperature_c`, `power_w`, `utilization_pct`, `sm_clock_mhz`, that rank's `kv_free_blocks`/`kv_total_blocks`; `null` where the driver reports nothing), `link` (tp=2 only: `p2p-mapped`/`pinned-staging`) and `healthy` (+ `unhealthy_reason`/`unhealthy_device` when not) |
 | `GET /v1/capacity` | This worker's live occupancy: `active_requests`, `free_kv_blocks`, `max_queue_depth`, `accepting_requests`. Single-process only — not fleet-wide. |
-| `GET /metrics` | Prometheus text-exposition counters/gauges: request totals by outcome (`ok`/`client_error`/`overloaded`/`timeout`/`cancelled`/`server_error`), prompt/completion token totals, active requests, free KV blocks, uptime. |
+| `GET /metrics` | Prometheus text-exposition counters/gauges: request totals by outcome (`ok`/`client_error`/`overloaded`/`timeout`/`cancelled`/`server_error`), prompt/completion token totals, active requests, free KV blocks, uptime; plus `sparkinfer_tp_size`, `sparkinfer_device_healthy`, and per-card gauges labelled `{rank,device,name}` — `sparkinfer_gpu_vram_{used,total}_bytes`, `sparkinfer_gpu_temperature_celsius`, `sparkinfer_gpu_power_watts`, `sparkinfer_gpu_utilization_percent`, `sparkinfer_gpu_sm_clock_mhz`, `sparkinfer_kv_pool_{free,total}_blocks` — and `sparkinfer_gpu_max_temperature_celsius` (the hottest card; a reading the driver does not report is omitted). |
 | `POST /v1/tokenize` | Token count for a chat request body |
 | `POST /v1/completions` | Legacy OpenAI text completion (`prompt` string, `echo`, integer `logprobs`). `echo` prepends the prompt TEXT; it does not report per-prompt-token logprobs — use `/v1/score` for that. |
 | `POST /v1/score` | **Teacher-forced scoring.** Per-token logprobs of a *supplied* continuation, no generation. See below. |
@@ -412,7 +412,7 @@ export CTX=36864          # 32k prompt + 4k completion KV pool
 export HOST=0.0.0.0
 ./server/run.sh --download
 curl -s http://127.0.0.1:8080/v1/info
-# {"model":"qwen3.6-35b-a3b","max_context":32768,"max_output_tokens":4096}
+# {"model":"qwen3.6-35b-a3b","max_context":32768,"max_output_tokens":4096,"tp":1,"devices":[{"rank":0,"device":0,"name":"...",...}],"healthy":true}
 ```
 
 On RTX 5090 (32 GB) use a smaller `--ctx` (8k–16k) or `CTX=0` for GGUF defaults — the

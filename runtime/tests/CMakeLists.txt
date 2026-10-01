@@ -163,6 +163,20 @@ add_executable(tp_config_cpu_test tp_config_cpu_test.cpp)
 set_target_properties(tp_config_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME tp_config_cpu_test COMMAND tp_config_cpu_test)
 
+# WP-5: per-card observability rendering (/metrics + /v1/info shape at tp=1 and tp=2) -- pure
+# C++ against server/include/gpu_metrics.hpp; no CUDA, no linkage, GPU-free.
+add_executable(gpu_metrics_cpu_test gpu_metrics_cpu_test.cpp)
+set_target_properties(gpu_metrics_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME gpu_metrics_cpu_test COMMAND gpu_metrics_cpu_test)
+
+# WP-5: the failure policy's bookkeeping (device_health.h: either-card / tp-link fatal -> whole
+# engine unhealthy, first reason kept). CUDA headers + cudart symbols only; never calls the driver.
+add_executable(device_health_cpu_test device_health_cpu_test.cpp)
+target_include_directories(device_health_cpu_test PRIVATE ../include)
+target_link_libraries(device_health_cpu_test PRIVATE CUDA::cudart Threads::Threads)
+set_target_properties(device_health_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME device_health_cpu_test COMMAND device_health_cpu_test)
+
 # WP-6: the per-tensor TP placement table -- split/disjoint/cover pattern classes, rank
 # symmetry, the tp=1 degenerate invariance, the two-tier out-of-pattern fallback, and the 27B
 # class-aware on-disk budget audit -- pure C++ against runtime/include/sparkinfer/tp_layout.hpp;

@@ -648,8 +648,8 @@
       ],
       "verification": "Runtime exposes stats for BOTH cards (the server polls each); /metrics carries per-GPU gauges",
       "source": "manual",
-      "status": "confirmed",
-      "notes": "NVML-by-PciBusId means the hard part is already solved; this is mostly plumbing."
+      "status": "implemented",
+      "notes": "NVML-by-PciBusId means the hard part is already solved; this is mostly plumbing. | WP-5 implemented (2026-10-01): GpuStats gains util_pct (NVML utilization) + device_id; ModelEngine::gpu_rows() samples every rank's card (rank order, from the Runtime per-device table) OUTSIDE the engine lock -- one row at tp=1, two at tp=2 -- with that rank's KV pool free/total blocks. query_gpu_stats keeps its save/restore of the calling (HTTP) thread's device only; no rank thread is touched."
     },
     {
       "id": "CHG-0019",
@@ -667,8 +667,8 @@
       ],
       "verification": "Policy decision recorded: pace on max(cardA, cardB) (default proposal -- simplest, matches 'one decode loop') vs per-card pacing; the pace is still sleep-only, so tokens are unchanged",
       "source": "manual",
-      "status": "confirmed",
-      "notes": "WP-2 decision: tp=2 pacing = max(cardA, cardB) (one decode loop, the slower card dominates the thermal state); the governor stays sleep-only (no clock manipulation), so token timing is unchanged. gpu_stats (CHG-0018) already reports per-card after the setDevice swap/restore audit."
+      "status": "implemented",
+      "notes": "WP-2 decision: tp=2 pacing = max(cardA, cardB) (one decode loop, the slower card dominates the thermal state); the governor stays sleep-only (no clock manipulation), so token timing is unchanged. gpu_stats (CHG-0018) already reports per-card after the setDevice swap/restore audit. | WP-5 implemented (2026-10-01): ThermalGovernor::Config gains device_ids (empty = the single-card governor, unchanged sampling path); non-empty -> governs on governing_temp_c = max over the cards' readings (cards without a sensor ignored). Still sleep-only. Note: the server has no governor instance (it serves unpaced); the governor is the Qwen35Model::generate(gov) path used by the examples -- a tp=2 caller passes both ordinals. /metrics exposes the governing reading as sparkinfer_gpu_max_temperature_celsius. CPU test: thermal_governor_cpu_test (governing_temp_c asserts)."
     },
     {
       "id": "CHG-0020",
@@ -707,8 +707,8 @@
       ],
       "verification": "/v1/info lists tp size and both GPUs; /metrics gains per-GPU vram/temp/power and per-pool free blocks; existing consumer of free_kv_blocks (admission logging) unaffected",
       "source": "manual",
-      "status": "confirmed",
-      "notes": ""
+      "status": "implemented",
+      "notes": "WP-5 implemented (2026-10-01): /v1/info gains (additively) tp, devices[] {rank, device, name, vram_used/total_bytes, temperature_c, power_w, utilization_pct, sm_clock_mhz, kv_free/total_blocks; null when unreported}, link (tp=2: p2p-mapped/pinned-staging) and healthy (+ unhealthy_reason/unhealthy_device). /metrics gains sparkinfer_tp_size, sparkinfer_device_healthy, per-card gauges labelled {rank,device,name} (vram used/total, temperature, power, utilization, sm clock, kv_pool free/total blocks; unreported samples omitted) and sparkinfer_gpu_max_temperature_celsius. Existing sparkinfer_free_kv_blocks / admission logging unchanged. Rendering is pure C++ in server/include/gpu_metrics.hpp, pinned by gpu_metrics_cpu_test (tp=1 one row, tp=2 two rows). On-box /v1/info shape check on the 2-card box still pending (cards reserved)."
     },
     {
       "id": "CHG-0022",
@@ -945,8 +945,8 @@
       "depends_on": [],
       "verification": "Policy decision recorded for two contexts: (a) any fatal error on either GPU downgrades the whole server (default proposal -- matches today's operator expectations and the eval's trust model), (b) per-GPU isolation with degraded single-GPU serving (far more code, questionable value at 16 GB/card where one dead card probably means the model doesn't fit at all). Go with (a)",
       "source": "manual",
-      "status": "confirmed",
-      "notes": "WP-2 decision: (a) any fatal CUDA/NVML error on EITHER GPU downgrades the whole server. Rationale: with tp=2 the two cards are one logical unit (shared KV block numbering, per-layer collectives, one thermal budget), so per-card isolation (b) would buy almost nothing at 16 GB/card (one dead card usually means the model no longer fits) while costing far more code. device_health already holds the global flag; tp=2 only changes the trigger to either-device and logs which card."
+      "status": "implemented",
+      "notes": "WP-2 decision: (a) any fatal CUDA/NVML error on EITHER GPU downgrades the whole server. Rationale: with tp=2 the two cards are one logical unit (shared KV block numbering, per-layer collectives, one thermal budget), so per-card isolation (b) would buy almost nothing at 16 GB/card (one dead card usually means the model no longer fits) while costing far more code. device_health already holds the global flag; tp=2 only changes the trigger to either-device and logs which card. | WP-5 implemented (2026-10-01), decision (a): device_health.h gains note_device_fatal(device, reason) / note_tp_fatal(what) / device_lost_info() -- the first fatal event's reason + card are kept (note_cuda_error now records the calling thread's device, i.e. which rank's card died). qwen35.cpp (minimal): the tp host rendezvous spin returns at once when device_lost() (no 60 s per remaining op -> no hang after the first failure) and a timeout calls note_tp_fatal; the three GpuLink op failures (decode allreduce, prefill allreduce, maxreduce) call note_tp_fatal (cudaErrorUnknown is not sticky, so before WP-5 they only logged and decoding continued on an un-reduced hidden state). Effect: in-flight jobs fail at their next step (the error names the event), new requests 503, /health 503 with detail+device. Per-GPU isolation (b) documented as rejected in device_health.h. CPU test: device_health_cpu_test. Not covered: a rank thread wedged inside a CUDA call (driver hang) still blocks the leader's TpMirrorScope join -- only an external watchdog can catch that; the injected-fault on-box test is pending (cards reserved)."
     },
     {
       "id": "CHG-0035",

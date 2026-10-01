@@ -784,6 +784,72 @@ int ModelEngine::eos_id() const {
 
 bool ModelEngine::device_healthy() const { return !sparkinfer::device_lost(); }
 
+std::string ModelEngine::unhealthy_reason() const {
+    const sparkinfer::DeviceLostInfo info = sparkinfer::device_lost_info();
+    if (!info.lost) return std::string();
+    return info.reason.empty() ? std::string("unrecoverable device error") : info.reason;
+}
+
+int ModelEngine::unhealthy_device() const {
+    const sparkinfer::DeviceLostInfo info = sparkinfer::device_lost_info();
+    return info.lost ? info.device : -1;
+}
+
+int ModelEngine::tp_size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!impl_->ready || !impl_->rt) return 1;
+    return 1 + (int)impl_->tp_models.size();
+}
+
+std::string ModelEngine::link_transport() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!impl_->tp_link || !impl_->tp_link->is_ready()) return std::string();
+    return impl_->tp_link->transport() == sparkinfer::GpuLink::Transport::P2pMapped
+               ? "p2p-mapped"
+               : "pinned-staging";
+}
+
+std::vector<GpuRow> ModelEngine::gpu_rows() const {
+    // Snapshot the rank -> device table and the KV pool counts under the lock, then sample the
+    // cards OUTSIDE it: an NVML/cudaMemGetInfo query is milliseconds and must not hold up the
+    // request path. query_gpu_stats saves/restores this (HTTP) thread's current device only, so
+    // it cannot disturb the ranks' own threads.
+    std::vector<GpuRow> rows;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!impl_->ready || !impl_->rt) return rows;
+        const int n = impl_->rt->device_count();
+        for (int i = 0; i < n; ++i) {
+            const sparkinfer::GpuDeviceInfo d = impl_->rt->device_info((size_t)i);
+            GpuRow r;
+            r.rank = i;
+            r.device = d.id;
+            r.name = d.name;
+            // Rank 0's pool is the serving pool; ranks 1.. hold their head-window pools.
+            const sparkinfer::KVCacheManager* kv =
+                (i == 0) ? impl_->kv.get()
+                         : ((size_t)(i - 1) < impl_->tp_kvs.size() ? impl_->tp_kvs[i - 1].get()
+                                                                   : nullptr);
+            if (kv) {
+                r.kv_free_blocks = kv->num_free_blocks();
+                r.kv_total_blocks = kv->num_total_blocks();
+            }
+            rows.push_back(std::move(r));
+        }
+    }
+    for (GpuRow& r : rows) {
+        const sparkinfer::GpuStats s = sparkinfer::query_gpu_stats(r.device);
+        r.valid = s.valid;
+        r.temp_c = s.temp_c;
+        r.power_w = s.power_w;
+        r.sm_clock_mhz = s.sm_clock_mhz;
+        r.util_pct = s.util_pct;
+        r.vram_used_bytes = s.vram_used_bytes;
+        r.vram_total_bytes = s.vram_total_bytes;
+    }
+    return rows;
+}
+
 bool ModelEngine::is_stop_token(int token_id) const {
     if (!impl_ || !impl_->ready || token_id < 0) return false;
     return token_id == impl_->cfg.eos_id ||
@@ -1277,6 +1343,9 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
         // against a context that can no longer service them. /health is already 503.
         if (sparkinfer::device_lost()) {
             out.error = "cuda context lost (unrecoverable device error) -- restart required";
+            // (WP-5) Name the first fatal event (which card, or the tp=2 link).
+            const sparkinfer::DeviceLostInfo info = sparkinfer::device_lost_info();
+            if (!info.reason.empty()) out.error += " [" + info.reason + "]";
             out.alloc_failed = true;   // 503, permanent until restart
             return out;
         }

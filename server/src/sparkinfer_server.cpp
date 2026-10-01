@@ -1124,9 +1124,15 @@ int main(int argc, char** argv) {
     svr.Get("/health", [&engine](const httplib::Request&, httplib::Response& res) {
         if (!engine.device_healthy()) {
             res.status = 503;
-            res.set_content("{\"status\":\"unhealthy\",\"reason\":\"cuda context lost "
-                            "(unrecoverable device error) -- restart required\"}",
-                            "application/json");
+            // The legacy reason string is kept verbatim; WP-5 appends the first fatal event's
+            // detail (which card, or the tp link) as additive fields.
+            nlohmann::json j = {
+                {"status", "unhealthy"},
+                {"reason", "cuda context lost (unrecoverable device error) -- restart required"},
+                {"detail", engine.unhealthy_reason()}};
+            const int dev = engine.unhealthy_device();
+            j["device"] = dev >= 0 ? nlohmann::json(dev) : nlohmann::json(nullptr);
+            res.set_content(j.dump(), "application/json");
             return;
         }
         res.set_content("{\"status\":\"ok\"}", "application/json");
@@ -1239,7 +1245,15 @@ int main(int argc, char** argv) {
         }
         std::ostringstream body;
         body << "{\"model\":\"" << g_model_name << "\",\"max_context\":" << engine.max_seq()
-             << ",\"max_output_tokens\":" << max_output_tokens() << "}";
+             << ",\"max_output_tokens\":" << max_output_tokens();
+        // (dual-gpu WP-5) Additive fields: tp size, one entry per card (rank, ordinal, name, live
+        // VRAM/temp/power/util, that rank's KV pool), the tp link transport, and health.
+        const bool healthy = engine.device_healthy();
+        body << sparkinfer_server::render_gpu_info_json(
+                    engine.gpu_rows(), engine.tp_size(), engine.link_transport(), healthy,
+                    healthy ? std::string() : engine.unhealthy_reason(),
+                    healthy ? -1 : engine.unhealthy_device())
+             << "}";
         res.set_content(body.str(), "application/json");
     });
 
@@ -1371,6 +1385,14 @@ int main(int argc, char** argv) {
                  << "# HELP sparkinfer_speculative_tier_stops_total Speculative runs that stopped at a KV split tier boundary and finished as ordinary decode\n"
                     "# TYPE sparkinfer_speculative_tier_stops_total counter\n"
                  << "sparkinfer_speculative_tier_stops_total " << sp.tier_stops << "\n";
+        }
+        // (dual-gpu WP-5) tp size, health, and per-card gauges labelled {rank,device,name}; one
+        // sample per family at tp=1, two at tp=2. Omitted entirely before the model is loaded.
+        {
+            const auto rows = engine.gpu_rows();
+            if (!rows.empty())
+                body << sparkinfer_server::render_gpu_metrics(rows, engine.tp_size(),
+                                                              engine.device_healthy());
         }
         res.set_content(body.str(), "text/plain; version=0.0.4");
     });

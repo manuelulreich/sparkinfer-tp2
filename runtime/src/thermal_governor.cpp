@@ -34,6 +34,13 @@ ThermalGovernor::Mode ThermalGovernor::classify(const Config& c, int temp_c) {
     return Mode::Turbo;
 }
 
+int ThermalGovernor::governing_temp_c(const std::vector<int>& temps_c) {
+    int m = -1;
+    for (int t : temps_c)
+        if (t >= 0 && t > m) m = t;
+    return m;
+}
+
 static double pace_ms_for(const ThermalGovernor::Config& c, ThermalGovernor::Mode m) {
     switch (m) {
         case ThermalGovernor::Mode::Balanced:  return c.balanced_ms;
@@ -49,16 +56,30 @@ double ThermalGovernor::pace() {
     const uint64_t t = now_ns();
     // Rate-limit sensor reads; reuse the cached temperature between samples.
     if (!started_ || (t - last_sample_ns_) >= (uint64_t)cfg_.sample_interval_ms * 1000000ull) {
-        GpuStats g = query_gpu_stats(cfg_.device_id);
-        if (g.valid && g.temp_c >= 0) {
+        int temp = -1;
+        if (cfg_.device_ids.empty()) {
+            // Single card: today's sample, unchanged.
+            GpuStats g = query_gpu_stats(cfg_.device_id);
+            if (g.valid) temp = g.temp_c;
+        } else {
+            // (WP-5) tp>1: govern on the hottest card.
+            std::vector<int> temps;
+            temps.reserve(cfg_.device_ids.size());
+            for (int dev : cfg_.device_ids) {
+                GpuStats g = query_gpu_stats(dev);
+                temps.push_back(g.valid ? g.temp_c : -1);
+            }
+            temp = governing_temp_c(temps);
+        }
+        if (temp >= 0) {
             if (prev_sample_temp_ >= 0 && prev_sample_ns_ > 0) {
                 const double dt_s = (double)(t - prev_sample_ns_) / 1e9;
-                if (dt_s > 0.0) slope_ = (g.temp_c - prev_sample_temp_) / dt_s;
+                if (dt_s > 0.0) slope_ = (temp - prev_sample_temp_) / dt_s;
             }
-            prev_sample_temp_ = g.temp_c;
+            prev_sample_temp_ = temp;
             prev_sample_ns_   = t;
-            last_temp_ = g.temp_c;
-            if (g.temp_c > peak_temp_) peak_temp_ = g.temp_c;
+            last_temp_ = temp;
+            if (temp > peak_temp_) peak_temp_ = temp;
         }
         last_sample_ns_ = t;
         started_ = true;

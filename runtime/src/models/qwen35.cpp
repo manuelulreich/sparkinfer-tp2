@@ -1271,9 +1271,14 @@ static bool tp_spin_until(const std::atomic<unsigned long long>& v, unsigned lon
                           const char* what) {
     const auto t0 = std::chrono::steady_clock::now();
     while (v.load(std::memory_order_acquire) < target) {
+        // (WP-5 failure policy, device_health.h) Once either rank is lost -- or an earlier
+        // rendezvous already timed out -- stop waiting: the ranks are no longer in step and
+        // every later op would otherwise burn its own 60 s, i.e. hang the request.
+        if (device_lost()) return false;
         if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) {
             fprintf(stderr, "[tp] rendezvous timeout (%s, op %llu): the ranks are out of step\n",
                     what, target);
+            note_tp_fatal("rendezvous timeout");
             return false;
         }
         std::this_thread::yield();
@@ -4122,7 +4127,7 @@ void Qwen35Model::tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow) {
     if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
     tp_leader_rendezvous("decode allreduce", [&] {
         if (!s.tp_link->allreduce(a, b, elems * sizeof(uint16_t), GpuLink::Dtype::BFloat16))
-            cu(cudaErrorUnknown, "tp allreduce");
+            { cu(cudaErrorUnknown, "tp allreduce"); note_tp_fatal("GpuLink decode allreduce failed"); }
     });
 }
 
@@ -4148,7 +4153,7 @@ void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
         GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_prefill_stream[1], g_tp_prefill_buf[1],
                            g_tp_prefill_buf[1]};
         if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
-            cu(cudaErrorUnknown, "tp prefill allreduce");
+            { cu(cudaErrorUnknown, "tp prefill allreduce"); note_tp_fatal("GpuLink prefill allreduce failed"); }
     });
 }
 
@@ -4178,7 +4183,7 @@ void Qwen35Model::tp_maxreduce_f32(int kind, size_t elems) {
     if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
     tp_leader_rendezvous("maxreduce", [&] {
         if (!s.tp_link->maxreduce(a, b, elems * sizeof(float), GpuLink::Dtype::Float32))
-            cu(cudaErrorUnknown, "tp maxreduce");
+            { cu(cudaErrorUnknown, "tp maxreduce"); note_tp_fatal("GpuLink maxreduce failed"); }
     });
 }
 

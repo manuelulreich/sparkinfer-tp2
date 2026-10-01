@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sparkinfer/token_constraint.h"
+#include "gpu_metrics.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -102,6 +103,20 @@ public:
     // /health reports it so an orchestrator replaces the process instead of routing to a server
     // that can only 503.
     bool device_healthy() const;
+    // (dual-gpu WP-5) Why device_healthy() went false -- the FIRST fatal event, e.g. a sticky CUDA
+    // error on one card or a tp=2 collective/rendezvous failure -- and the failing CUDA ordinal
+    // (-1 = unknown / the link). Empty / -1 while healthy. The policy (any fatal error on either
+    // card downgrades the whole server) is documented in sparkinfer/device_health.h.
+    std::string unhealthy_reason() const;
+    int unhealthy_device() const;
+    // (dual-gpu WP-5) Per-card observability: one row per tensor-parallel rank, in rank order
+    // (exactly one row at tp=1), each a live sample (VRAM/temp/power/util/clock) plus that rank's
+    // KV pool occupancy. Empty before load. Safe to call from any thread.
+    std::vector<GpuRow> gpu_rows() const;
+    // The effective tensor-parallel size (1 at the default, and before load).
+    int tp_size() const;
+    // The resolved GpuLink transport ("p2p-mapped" / "pinned-staging"); empty at tp=1.
+    std::string link_transport() const;
     // True for any token the runtime treats as a stop token -- eos_id AND the optional second
     // stop id (cfg.eos_id2, e.g. Muse Glimmer's <|eot|>). eos_id() alone is not sufficient:
     // step_job() stops on either, so either can be the final emitted token.
