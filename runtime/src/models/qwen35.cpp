@@ -3463,14 +3463,14 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
         if (is_linear_layer(c, L)) tp_gdn_layer_tp(L, s.x, s.xn);
         else                        tp_attn_layer_tp(L, s.x, s.xn);
         // AR-A: combine the attention-block partial (o_proj/s.ao once the body lands) across ranks.
-        tp_allreduce_row(s.tp_ar, (size_t)2 * H, /*is_xrow=*/false);
+        tp_allreduce_row(s.tp_ar, (size_t)H, /*is_xrow=*/false);   // the partial is row 0 [H]
         // tail1 (unchanged vs tp=1): h = x + attn_out ; hn = RMSNorm(h, post_attn_norm)
         kernels::launch_add_rmsnorm2(s.x, s.tp_ar, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
         tp_dump_xn(c.n_layers + 1 + L, s.hn);
         // FFN partial (tp_ar row 0: this rank's ffn partial; AR-B below combines the ranks).
         tp_ffn_layer_tp(L, s.xn, s.tp_ar);
         // AR-B: combine the ffn_down partial across ranks.
-        tp_allreduce_row(s.tp_ar, (size_t)2 * H, /*is_xrow=*/false);
+        tp_allreduce_row(s.tp_ar, (size_t)H, /*is_xrow=*/false);   // the partial is row 0 [H]
         // tail2 (unchanged vs tp=1): x = h + ffn_out ; xn = RMSNorm(x, nextnorm)
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(s.h, s.tp_ar, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);

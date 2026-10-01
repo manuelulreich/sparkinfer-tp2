@@ -102,6 +102,18 @@ inline size_t glink_dtype_size(GpuLink::Dtype dtype) {
 cudaError_t launch_glink_reduce(void* dst, const void* a, const void* b, size_t n,
                                  GpuLink::Dtype dtype, bool is_max, cudaStream_t stream);
 
+// Flag all-reduce (P2P, sum, f32/bf16, ops up to kFlagMaxBytes): one single-block kernel per
+// rank. It stores this rank's `in` into the peer's landing buffer `peer_land` over P2P, fences,
+// stores `seq` into the peer's flag, spins until its own flag reaches `seq` (the peer's data has
+// landed in `my_land`), then writes out[i] = in[i] + my_land[i] -- the same float sum, rounded
+// back per dtype, as the copy path's reduce kernel, so both transports give identical bits.
+// A peer that never arrives traps the kernel after ~10 s instead of hanging the stream forever.
+constexpr size_t kFlagMaxBytes = 256u << 10;
+cudaError_t launch_glink_flag_allreduce(const void* in, void* out, void* peer_land,
+                                        const void* my_land, unsigned* peer_flag,
+                                        const unsigned* my_flag, unsigned seq, size_t n,
+                                        GpuLink::Dtype dtype, cudaStream_t stream);
+
 }  // namespace detail
 
 }  // namespace sparkinfer

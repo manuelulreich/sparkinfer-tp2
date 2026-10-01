@@ -68,6 +68,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+#include <cstdlib>
 
 namespace sparkinfer {
 
@@ -219,8 +220,15 @@ struct GpuLink::Impl {
     cudaEvent_t event = nullptr;
     void* pinned = nullptr;
       void* scratch = nullptr;
+    // Flag all-reduce (P2P transport, small sums): the peer pushes its partial into `fbuf`
+    // (two kFlagMaxBytes halves, alternating by op parity) and then stores the op's sequence
+    // number into `fflag`. Both on this rank's device, written by the peer over P2P.
+    void* fbuf = nullptr;
+    unsigned* fflag = nullptr;
   };
   Rank ranks[2];  // [0] = dev_a, [1] = dev_b
+  unsigned flag_seq = 0;   // flag-path ops posted so far (both ranks post every op, in order)
+  bool flag_on = false;
 
   // Driver-workaround 1 state: destinations that already received a P2P priming copy, keyed by
   // (pointer, size class) so one priming covers one allocation at one magnitude class. Bounded
@@ -385,6 +393,26 @@ bool GpuLink::init(int dev_a, int dev_b, GpuLink::Transport transport, size_t ma
     impl_->ranks[r].scratch = rs.scratch;
   }
 
+  // Flag all-reduce buffers (P2P only; SPARKINFER_GLINK_FLAG=0 keeps every op on the copy path).
+  if (resolved == GpuLink::Transport::P2pMapped) {
+    const char* fe = getenv("SPARKINFER_GLINK_FLAG");
+    bool ok = !(fe && fe[0] == '0');
+    int prev = -1;
+    cudaGetDevice(&prev);
+    for (int r = 0; r < 2 && ok; r++) {
+      if (cudaSetDevice(r == 0 ? dev_a : dev_b) != cudaSuccess ||
+          cudaMalloc(&impl_->ranks[r].fbuf, 2 * detail::kFlagMaxBytes) != cudaSuccess ||
+          cudaMalloc(&impl_->ranks[r].fflag, sizeof(unsigned)) != cudaSuccess ||
+          cudaMemset(impl_->ranks[r].fflag, 0, sizeof(unsigned)) != cudaSuccess)
+        ok = false;
+    }
+    if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
+    if (prev >= 0) cudaSetDevice(prev);
+    impl_->flag_on = ok;
+    GLINK_LOG("[gpu_link] init: flag all-reduce %s (ops <= %zu bytes)\n", ok ? "on" : "off",
+              (size_t)detail::kFlagMaxBytes);
+  }
+
   impl_->ready = true;
   if (resolved == GpuLink::Transport::P2pMapped)
     GLINK_LOG("[gpu_link] init: transport=p2p-mapped (peer access enabled both ways), dev A=%d, dev B=%d, max_bytes=%zu\n",
@@ -413,6 +441,20 @@ bool GpuLink::shutdown() {
   // Contract: the caller has drained every stream it posted ops on. This call may (and
   // must) block: it is where a failed free is reported.
   bool ok = true;
+  {
+    int prev = -1;
+    cudaGetDevice(&prev);
+    for (int r = 0; r < 2; r++) {
+      auto& rk = impl_->ranks[r];
+      if (!rk.fbuf && !rk.fflag) continue;
+      cudaSetDevice(r == 0 ? impl_->dev_a : impl_->dev_b);
+      if (rk.fbuf && cudaFree(rk.fbuf) != cudaSuccess) ok = false;
+      if (rk.fflag && cudaFree(rk.fflag) != cudaSuccess) ok = false;
+      rk.fbuf = nullptr; rk.fflag = nullptr;
+    }
+    if (prev >= 0) cudaSetDevice(prev);
+    impl_->flag_on = false;
+  }
   for (int r = 0; r < 2; r++) {
     const int dev = (r == 0) ? impl_->dev_a : impl_->dev_b;
     const auto& rk = impl_->ranks[r];
@@ -481,6 +523,29 @@ bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtyp
   // transports, only the landing differs.
   void* dst_a = (a.in == a.out) ? im.ranks[0].scratch : const_cast<void*>(a.out);
   void* dst_b = (b.in == b.out) ? im.ranks[1].scratch : const_cast<void*>(b.out);
+
+  // Flag all-reduce: the small per-layer sums. One kernel per rank pushes its partial into the
+  // peer's landing buffer over P2P, publishes the op's sequence number in the peer's flag, waits
+  // for the peer's flag, and sums -- no copy engine, no cross-device event, and no exit fence
+  // (nothing ever reads this rank's `in` from the other side). Stream order alone sequences it
+  // after this rank's producers. The landing halves alternate by op parity: a rank can only be
+  // writing op k+2 into a half once the peer has finished op k+1, i.e. finished reading op k.
+  if (im.resolved == GpuLink::Transport::P2pMapped && im.flag_on && !is_max &&
+      bytes <= detail::kFlagMaxBytes && (dtype == Dtype::Float32 || dtype == Dtype::BFloat16)) {
+    const unsigned seq = ++impl_->flag_seq;
+    const size_t half = (seq & 1) ? detail::kFlagMaxBytes : 0;
+    const auto& ra = im.ranks[0];
+    const auto& rb = im.ranks[1];
+    cudaError_t e = detail::launch_glink_flag_allreduce(
+        a.in, a.out, static_cast<char*>(rb.fbuf) + half, static_cast<const char*>(ra.fbuf) + half,
+        rb.fflag, ra.fflag, seq, n, dtype, a.stream);
+    if (e != cudaSuccess) return fail("flag all-reduce on rank A", e);
+    e = detail::launch_glink_flag_allreduce(
+        b.in, b.out, static_cast<char*>(ra.fbuf) + half, static_cast<const char*>(rb.fbuf) + half,
+        ra.fflag, rb.fflag, seq, n, dtype, b.stream);
+    if (e != cudaSuccess) return fail("flag all-reduce on rank B", e);
+    return true;
+  }
 
   if (im.resolved == GpuLink::Transport::P2pMapped) {
     // Each rank pulls the peer's `in` buffer into its own out/scratch on its own stream — the
