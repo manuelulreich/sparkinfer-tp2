@@ -202,5 +202,5 @@ add_test(NAME gdn_split_cpu_test COMMAND gdn_split_cpu_test)
 # two contexts, e.g. with an LLM resident).
 add_executable(tp_weights_cpu_test tp_weights_cpu_test.cpp)
 set_target_properties(tp_weights_cpu_test PROPERTIES CXX_STANDARD 17)
-target_link_libraries(tp_weights_cpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+target_link_libraries(tp_weights_cpu_test PRIVATE sparkinfer_runtime CUDA::cudart CUDA::cuda_driver)
 add_test(NAME tp_weights_cpu_test COMMAND tp_weights_cpu_test)

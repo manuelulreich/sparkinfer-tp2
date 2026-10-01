@@ -9,17 +9,20 @@
 //       262k (exceeds) context against a 16 GiB card.
 //   (c) The tp=1 degenerate table: every name whole on device 0, axis None, no ranges -- the
 //       loaders' byte-identical path.
-//   (d) GPU one-shot (skip-guarded, exit 0 when skipped by design): a tiny hybrid model,
+//   (d) GPU one-shot (skip-guarded, exit 0 when skipped by design): a tiny dense model,
 //       Flat-convention table, two Qwen35Model instances on two devices each loading their own
-//       slice -- per-rank allocated bytes vs the table's own gather arithmetic, values
-//       spot-checked against the file bytes the ranges select, print_tp_audit on both ranks,
-//       and a third tp=1 instance reading back byte-identical to the files (FNV-1a).
+//       slice -- every tensor's device allocation size (cuMemGetAddressRange, exact) vs the
+//       table's own share arithmetic, values spot-checked against the file bytes the ranges
+//       select, print_tp_audit on both ranks, and a third tp=1 instance reading back
+//       byte-identical to the files (FNV-1a over device read-backs).
 //
 // (a)-(c) and all the audit arithmetic are pure CPU and always run; on this box (an LLM holds
 // the cards, no new context fits) only (d) SKIPs by design.
 
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/tp_layout.hpp"
+
+#include <cuda.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -238,17 +241,20 @@ static void test_tp1_degenerate() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) GPU one-shot: tiny hybrid model, Flat table, two instances on two cards.
+// (d) GPU one-shot: tiny dense model, Flat table, two instances on two cards.
 // ---------------------------------------------------------------------------
 
 static Qwen35Config cfgSmall() {
     Qwen35Config c;
-    c.hybrid = true;
-    c.n_layers = 2;              // layer 0 GDN, layer 1 full attention (interval 2)
-    c.full_attn_interval = 2;
+    // Non-hybrid: the flat .bin convention carries only full-attention + FFN tensors (the
+    // loader reads no GDN names), so both layers are full attention with the plain qdim q
+    // projection the flat files store (a hybrid table would ask for the 2x-wide folded-gate
+    // q, which a flat wq does not have -- the loader refuses that slice).
+    c.hybrid = false;
+    c.n_layers = 2;
     c.hidden = 64;
     c.n_q_heads = 4;
-    c.n_kv_heads = 1;
+    c.n_kv_heads = 2;            // one KV head per rank
     c.head_dim = 16;
     c.linear_q_heads = 4;
     c.linear_v_heads = 8;
@@ -259,9 +265,8 @@ static Qwen35Config cfgSmall() {
     c.top_k = 1;
     c.n_shared = 0;
     c.moe_ffn = 128;
-    c.vocab = 64;   // == hidden, on purpose: the flat file stores embed/lm as [hidden fast,
-                    // vocab] while the table's Rows ranges address the fast axis, so keeping
-                    // vocab == hidden (64) keeps every table range in-bounds of the file.
+    c.vocab = 128;  // != hidden on purpose: the vocab split must land on the vocab axis (the
+                    // flat file's SLOW axis: [V][H] row-major), not on hidden.
     c.gdn_qh_block = true;
     return c;
 }
@@ -342,19 +347,67 @@ static void check_bytes(const char* what, const uint8_t* got, const uint8_t* wan
 }
 
 // What the table says this rank owns, in file bytes: replicated (device -1) or whole
-// (axis None / no ranges) -> the whole file; Cols -> d0 x range-len; Rows -> d1 x range-len;
-// assigned to another rank -> nothing.
+// (axis None / no ranges) -> the whole file; split -> the owned share of the split axis
+// (file_bytes / denom per element of the axis, orientation-free); another rank -> nothing.
 static size_t expected_owned(const Table& t, const FlatFile& f, int rank) {
     const Placement p = t.placement(f.name, rank);
     const size_t file_bytes = f.d0 * f.d1 * 2;
     if (p.device < 0) return file_bytes;
     if (p.device != rank) return 0;
     if (p.axis == Axis::None || p.ranges.empty()) return file_bytes;
-    size_t len = 0;
-    for (const auto& r : p.ranges) len += r.len;
-    if (p.axis == Axis::Cols) return f.d0 * len * 2;
-    if (p.axis == Axis::Rows) return f.d1 * len * 2;
-    return file_bytes;
+    CHECK(p.denom > 0 && file_bytes % p.denom == 0);
+    return file_bytes / p.denom * p.split_elements();
+}
+
+// The loaded device pointer of every flat file, in flat_files() order.
+static std::vector<const void*> file_ptrs(const Qwen35Config& c, const Qwen35Weights& w) {
+    std::vector<const void*> v = {w.embed_tokens, w.final_norm, w.lm_head};
+    for (int i = 0; i < c.n_layers; ++i) {
+        const Qwen35LayerWeights& l = w.layers[i];
+        for (const void* p : {(const void*)l.input_norm, (const void*)l.wq, (const void*)l.wk,
+                              (const void*)l.wv, (const void*)l.wo, (const void*)l.q_norm,
+                              (const void*)l.k_norm, (const void*)l.post_attn_norm,
+                              (const void*)l.router_w, (const void*)l.gate, (const void*)l.up,
+                              (const void*)l.down})
+            v.push_back(p);
+    }
+    return v;
+}
+
+// Per-tensor placement check against the table: every owned tensor is its own device
+// allocation of EXACTLY the table's share (cuMemGetAddressRange reports the allocation's
+// requested extent, unaffected by the allocator's page granularity that makes cudaMemGetInfo
+// deltas useless at this size), resident on this rank's device; nothing owned -> null.
+// Returns the summed allocation bytes.
+static size_t check_alloc_sizes(const Table& t, const std::vector<FlatFile>& files,
+                                const std::vector<const void*>& ptrs, int rank, int device) {
+    size_t sum = 0;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const size_t want = expected_owned(t, files[i], rank);
+        if (want == 0) {
+            if (ptrs[i] != nullptr) {
+                ++failures;
+                std::printf("FAIL rank%d %s: table assigns nothing, but a buffer is loaded\n",
+                            rank, files[i].name.c_str());
+            }
+            continue;
+        }
+        CUdeviceptr base = 0;
+        size_t size = 0;
+        cudaPointerAttributes attr{};
+        const bool ok = ptrs[i] != nullptr &&
+                        cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptrs[i]) == CUDA_SUCCESS &&
+                        cudaPointerGetAttributes(&attr, ptrs[i]) == cudaSuccess;
+        if (!ok || base != (CUdeviceptr)ptrs[i] || size != want || attr.device != device) {
+            ++failures;
+            std::printf("FAIL rank%d %s: allocation %zu B on device %d (base match %d), table "
+                        "share %zu B on device %d\n",
+                        rank, files[i].name.c_str(), size, ok ? attr.device : -1,
+                        (int)(base == (CUdeviceptr)ptrs[i]), want, device);
+        }
+        sum += size;
+    }
+    return sum;
 }
 
 static void test_gpu_oneshot() {
@@ -418,36 +471,33 @@ static void test_gpu_oneshot() {
         CHECK(cudaMemGetInfo(&fa, &ta) == cudaSuccess);
         CHECK(m->load_weights(dir));
         CHECK(cudaMemGetInfo(&fb, &tb) == cudaSuccess);
-        size_t delta = fa - fb;
+        const Qwen35Weights& w = m->weights();
         size_t expected = 0;
         for (const auto& f : files) expected += expected_owned(t2, f, 0);
-        CHECK(delta == expected || (delta >= expected && delta - expected <= (1u << 20)));
-        std::printf("[tp-weights-cpu-test] rank0 (dev 0): allocated %zu B (table-gather "
-                    "expected %zu B)\n",
-                    delta, expected);
-        // Spot checks: Cols slices are file prefixes, Rows/OneD-style gather per row.
-        const Qwen35Weights& w = m->weights();
+        const size_t got = check_alloc_sizes(t2, files, file_ptrs(cfg, w), 0, 0);
+        CHECK(got == expected);
+        std::printf("[tp-weights-cpu-test] rank0 (dev 0): allocated %zu B (table share %zu B; "
+                    "cudaMemGetInfo delta %lld B, page-granular, informational)\n",
+                    got, expected, (long long)fa - (long long)fb);
+        // Spot checks: slow-axis (Cols) slices are contiguous file blocks; fast-axis (Rows)
+        // slices gather one compact sub-row per slow row.
         check_bytes("r0 layer_0.wq prefix", dev_read(w.layers[0].wq, 4096),
                     fbytes[4].data(), 4096);
-        check_bytes("r0 layer_0.wk prefix", dev_read(w.layers[0].wk, 1024), fbytes[5].data(),
-                    1024);
+        check_bytes("r0 layer_0.wk prefix", dev_read(w.layers[0].wk, 2048), fbytes[5].data(),
+                    2048);
         check_bytes("r0 layer_0.gate prefix", dev_read(w.layers[0].gate, 8192), fbytes[12].data(),
                     8192);
         check_bytes("r0 final_norm whole", dev_read(w.final_norm, 128), fbytes[1].data(), 128);
-        // embed/lm: per-row [0,32) element slice (d0 = d1 = 64, row stride 128 B).
+        // embed/lm: vocab rows [0,64) of [128][64] -> the contiguous file block [0, 8192).
+        check_bytes("r0 embed_tokens vocab[0,64)", dev_read(w.embed_tokens, 8192),
+                    fbytes[0].data(), 8192);
+        check_bytes("r0 lm_head vocab[0,64)", dev_read(w.lm_head, 8192), fbytes[2].data(), 8192);
+        // down: Rows [0,64) over the fast F=128 axis, 64 slow rows (file row stride 256 B) ->
+        // compact 64 x 128 B.
         std::vector<uint8_t> expv(8192);
         for (int row = 0; row < 64; ++row)
-            std::memcpy(&expv[row * 128], fbytes[0].data() + row * 128, 64);
-        check_bytes("r0 embed_tokens rows[0,32)", dev_read(w.embed_tokens, 8192), expv.data(),
-                    expv.size());
-        for (int row = 0; row < 64; ++row)
-            std::memcpy(&expv[row * 128], fbytes[2].data() + row * 128, 64);
-        check_bytes("r0 lm_head rows[0,32)", dev_read(w.lm_head, 8192), expv.data(), expv.size());
-        // down: Rows [0,64) over d0=128, 64 slow rows (row stride 256 B).
-        expv.assign(16384, 0);  // 64 rows x 256 B - larger than the embed/lm buffer above
-        for (int row = 0; row < 64; ++row)
-            std::memcpy(&expv[row * 256], fbytes[14].data() + row * 256, 128);
-        check_bytes("r0 layer_0.down rows[0,64)", dev_read(w.layers[0].down, 16384), expv.data(),
+            std::memcpy(&expv[row * 128], fbytes[14].data() + row * 256, 128);
+        check_bytes("r0 layer_0.down rows[0,64)", dev_read(w.layers[0].down, 8192), expv.data(),
                     expv.size());
         m->print_tp_audit(131072);
     }   // m destroyed with the context on device 0
@@ -458,35 +508,32 @@ static void test_gpu_oneshot() {
         CHECK(cudaMemGetInfo(&fa, &ta) == cudaSuccess);
         CHECK(m->load_weights(dir));
         CHECK(cudaMemGetInfo(&fb, &tb) == cudaSuccess);
-        size_t delta = fa - fb;
+        const Qwen35Weights& w = m->weights();
         size_t expected = 0;
         for (const auto& f : files) expected += expected_owned(t2, f, 1);
-        CHECK(delta == expected || (delta >= expected && delta - expected <= (1u << 20)));
-        std::printf("[tp-weights-cpu-test] rank1 (dev 1): allocated %zu B (table-gather "
-                    "expected %zu B)\n",
-                    delta, expected);
-        const Qwen35Weights& w = m->weights();
-        // Cols [32,64) of wq -> file bytes [4096, 8192); wk [8,16) -> [1024, 2048);
+        const size_t got = check_alloc_sizes(t2, files, file_ptrs(cfg, w), 1, 1);
+        CHECK(got == expected);
+        std::printf("[tp-weights-cpu-test] rank1 (dev 1): allocated %zu B (table share %zu B; "
+                    "cudaMemGetInfo delta %lld B, page-granular, informational)\n",
+                    got, expected, (long long)fa - (long long)fb);
+        // Cols [32,64) of wq -> file bytes [4096, 8192); wk [16,32) -> [2048, 4096);
         // gate [64,128) -> [8192, 16384).
         check_bytes("r1 layer_0.wq mid", dev_read(w.layers[0].wq, 4096),
                     fbytes[4].data() + 4096, 4096);
-        check_bytes("r1 layer_0.wk mid", dev_read(w.layers[0].wk, 1024), fbytes[5].data() + 1024,
-                    1024);
+        check_bytes("r1 layer_0.wk mid", dev_read(w.layers[0].wk, 2048), fbytes[5].data() + 2048,
+                    2048);
         check_bytes("r1 layer_0.gate mid", dev_read(w.layers[0].gate, 8192),
                     fbytes[12].data() + 8192, 8192);
-        // Per-row [32,64) element slices (offset 64, length 64 in 128-B rows).
+        // embed/lm: vocab rows [64,128) -> the contiguous file block [8192, 16384).
+        check_bytes("r1 embed_tokens vocab[64,128)", dev_read(w.embed_tokens, 8192),
+                    fbytes[0].data() + 8192, 8192);
+        check_bytes("r1 lm_head vocab[64,128)", dev_read(w.lm_head, 8192),
+                    fbytes[2].data() + 8192, 8192);
+        // down: fast-axis [64,128) of each 256-B file row -> compact 64 x 128 B.
         std::vector<uint8_t> expv(8192);
         for (int row = 0; row < 64; ++row)
-            std::memcpy(&expv[row * 128], fbytes[0].data() + row * 128 + 64, 64);
-        check_bytes("r1 embed_tokens rows[32,64)", dev_read(w.embed_tokens, 8192), expv.data(),
-                    expv.size());
-        for (int row = 0; row < 64; ++row)
-            std::memcpy(&expv[row * 128], fbytes[2].data() + row * 128 + 64, 64);
-        check_bytes("r1 lm_head rows[32,64)", dev_read(w.lm_head, 8192), expv.data(), expv.size());
-        expv.assign(16384, 0);  // 64 rows x 256 B
-        for (int row = 0; row < 64; ++row)
-            std::memcpy(&expv[row * 256], fbytes[14].data() + row * 256 + 128, 128);
-        check_bytes("r1 layer_0.down rows[64,128)", dev_read(w.layers[0].down, 16384), expv.data(),
+            std::memcpy(&expv[row * 128], fbytes[14].data() + row * 256 + 128, 128);
+        check_bytes("r1 layer_0.down rows[64,128)", dev_read(w.layers[0].down, 8192), expv.data(),
                     expv.size());
         m->print_tp_audit(131072);
     }   // m destroyed with the context on device 1
@@ -500,24 +547,19 @@ static void test_gpu_oneshot() {
         auto m = std::make_unique<Qwen35Model>(cfg, nullptr, nullptr, GdnStateWindow{}, 0, 0);
         CHECK(m->load_weights(dir));
         const Qwen35Weights& w = m->weights();
+        // The weights are device buffers: read each back before hashing (a host-side hash over
+        // the raw device pointers would segfault).
+        const std::vector<const void*> ptrs = file_ptrs(cfg, w);
+        CHECK(check_alloc_sizes(t1, files, ptrs, 0, 0) > 0);
         uint32_t h = 2166136261u;
-        h = fnv1a_step(h, w.embed_tokens, fbytes[0].size());
-        h = fnv1a_step(h, w.final_norm, fbytes[1].size());
-        h = fnv1a_step(h, w.lm_head, fbytes[2].size());
-        for (int i = 0; i < cfg.n_layers; ++i) {
-            const Qwen35LayerWeights& lw = w.layers[i];
-            h = fnv1a_step(h, lw.input_norm, fbytes[3 + 12 * i].size());
-            h = fnv1a_step(h, lw.wq, fbytes[4 + 12 * i].size());
-            h = fnv1a_step(h, lw.wk, fbytes[5 + 12 * i].size());
-            h = fnv1a_step(h, lw.wv, fbytes[6 + 12 * i].size());
-            h = fnv1a_step(h, lw.wo, fbytes[7 + 12 * i].size());
-            h = fnv1a_step(h, lw.q_norm, fbytes[8 + 12 * i].size());
-            h = fnv1a_step(h, lw.k_norm, fbytes[9 + 12 * i].size());
-            h = fnv1a_step(h, lw.post_attn_norm, fbytes[10 + 12 * i].size());
-            h = fnv1a_step(h, lw.router_w, fbytes[11 + 12 * i].size());
-            h = fnv1a_step(h, lw.gate, fbytes[12 + 12 * i].size());
-            h = fnv1a_step(h, lw.up, fbytes[13 + 12 * i].size());
-            h = fnv1a_step(h, lw.down, fbytes[14 + 12 * i].size());
+        for (size_t i = 0; i < files.size(); ++i) {
+            const uint8_t* b = dev_read(ptrs[i], fbytes[i].size());
+            if (b == nullptr) {
+                ++failures;
+                std::printf("FAIL tp=1 %s: device read failed\n", files[i].name.c_str());
+                break;
+            }
+            h = fnv1a_step(h, b, fbytes[i].size());
         }
         std::printf("[tp-weights-cpu-test] tp=1 read-back FNV-1a = %08X (ref %08X)\n", h,
                     ref_fnv);
