@@ -5308,6 +5308,41 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                                  int pos0) {
     TP_MIRROR(prefill_batched(prompt_ids, n, want_seed_logprob, pos0));
     Impl& s = *p_;
+    // (dual-GPU WP-14) Tile-aligned split on small-SM cards. The prefill GEMMs' fast arms -- the
+    // 4-warp 3-stage int8 kernel and the fused gate/up SwiGLU -- need the row count to be a
+    // multiple of their 128-row M tile; one ragged row drops the WHOLE pass to the 2-stage
+    // kernel. Measured on the 36-SM RTX 5060 Ti (27B, tp=2): 3072 tokens prefill in 1415 ms,
+    // 3074 in 1790 ms. So prefill the aligned bulk in one pass and the < 128-row remainder in a
+    // second. That second pass is NOT cheap: every pass has a ~150 ms floor on this card (the
+    // per-pass NVFP4 -> int8 weight conversion dominates it; a 2-token pass takes 164 ms), so the
+    // split only pays above ~2k tokens -- measured: 3074 1790 -> 1584 ms, 3199 1829 -> 1655,
+    // 2000 a wash, 1100 a loss (720 -> 755) -- hence SPARKINFER_PREFILL_ALIGN_MIN = 2048.
+    // Padding the GEMMs' M inside one pass would avoid the second pass entirely (a deeper
+    // arena change, recorded as follow-up). Arch-keyed: the 170-SM 5090's tuning is
+    // untouched (SPARKINFER_PREFILL_ALIGN=1/0 forces it on/off). Not with a pending image or
+    // MRoPE table, whose positions are rows of THIS pass. Both tp ranks decide identically (n,
+    // SM count and the mirrored pending state agree), and the inner calls are nested, so each
+    // rank splits its own mirrored call the same way.
+    {
+        static const int align_mode = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_ALIGN");
+            return e ? (e[0] == '0' ? 0 : 1) : -1;
+        }();
+        static const int align_min = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_ALIGN_MIN");
+            return e ? std::max(129, atoi(e)) : 2048;
+        }();
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, s.device);
+        const bool on = align_mode >= 0 ? align_mode == 1 : (sms > 0 && sms <= 64);
+        constexpr int kTile = 128;
+        if (on && n >= align_min && (n % kTile) != 0 && !s.d_vision_emb && !s.d_mrope_pos) {
+            const int bulk = n - n % kTile;
+            const int first = prefill_batched(prompt_ids, bulk, false, pos0);
+            if (first < 0) return first;
+            return prefill_batched(prompt_ids + bulk, n - bulk, want_seed_logprob, pos0 + bulk);
+        }
+    }
     // A long batched prefill needs the scratch arena more than a wide decode needs the head, and
     // on a 32-GB card the two do not both fit: measured at ctx=32768 the arena wants 3.6 GB and
     // the head operand's 0.81 GB is enough to make it fail, which drops the WHOLE prompt onto the
