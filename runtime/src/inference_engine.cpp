@@ -130,7 +130,7 @@ ContinuousBatchEngine::~ContinuousBatchEngine() {
         // seq_id 0 is a valid prefix session (cannot use truthiness).
         if (kv.second->seq_id != 0) model_->close_session(kv.second->seq_id);
         else if (kv.second->req.use_prefix_session) {
-            kv_->free(0);
+            kv_free(0);
             model_->release_prefix_session();
         }
     }
@@ -421,6 +421,73 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
 void ContinuousBatchEngine::enable_prefix_cache(const PrefixCache::Limits& limits) {
     std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
     if (!prefix_cache_) prefix_cache_ = std::make_unique<PrefixCache>(kv_, limits);
+    prefix_cache_->set_mirror(kv_peer_);
+}
+
+void ContinuousBatchEngine::set_kv_mirror(KVCacheManager* peer) {
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+    kv_peer_ = peer;
+    if (prefix_cache_) prefix_cache_->set_mirror(peer);
+}
+
+bool ContinuousBatchEngine::kv_allocate(uint64_t seq_id, int num_tokens) {
+    // Under the device mutex, like every model-side (mirrored) block op: both managers must see
+    // all ops in ONE order for their block numbering to stay identical.
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+    if (!kv_->allocate(seq_id, num_tokens)) return false;
+    if (kv_peer_ && !kv_peer_->allocate(seq_id, num_tokens)) {
+        // Same pool size and history, so this cannot fail where rank 0 succeeded; if it ever
+        // does, undo nothing (allocate only grows) but refuse the request -- rank 1 has no KV.
+        fprintf(stderr, "[tp] kv mirror: rank-1 allocate(seq %llu, %d) failed where rank 0 succeeded\n",
+                (unsigned long long)seq_id, num_tokens);
+        return false;
+    }
+    kv_check(seq_id, "allocate");
+    return true;
+}
+
+void ContinuousBatchEngine::kv_free(uint64_t seq_id) {
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());   // see kv_allocate
+    kv_->free(seq_id);
+    if (kv_peer_) kv_peer_->free(seq_id);
+}
+
+bool ContinuousBatchEngine::kv_truncate(uint64_t seq_id, int keep_blocks) {
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());   // see kv_allocate
+    const bool ok = kv_->truncate_blocks(seq_id, keep_blocks);
+    if (kv_peer_ && kv_peer_->truncate_blocks(seq_id, keep_blocks) != ok)
+        fprintf(stderr, "[tp] kv mirror: truncate(seq %llu) disagreed across ranks\n",
+                (unsigned long long)seq_id);
+    return ok;
+}
+
+std::vector<int> ContinuousBatchEngine::kv_retain(uint64_t seq_id, int n_blocks) {
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());   // see kv_allocate
+    std::vector<int> blocks = kv_->retain_prefix_blocks(seq_id, n_blocks);
+    if (!kv_peer_) return blocks;
+    std::vector<int> peer = kv_peer_->retain_prefix_blocks(seq_id, n_blocks);
+    if (peer != blocks) {
+        // Diverged numbering would hand rank 1 the wrong blocks on a hit: cache nothing.
+        fprintf(stderr, "[tp] kv mirror: retain(seq %llu) block lists differ across ranks; "
+                        "prefix not cached\n", (unsigned long long)seq_id);
+        kv_->release_blocks(blocks);
+        kv_peer_->release_blocks(peer);
+        return {};
+    }
+    return blocks;
+}
+
+void ContinuousBatchEngine::kv_check(uint64_t seq_id, const char* where) {
+    if (!kv_peer_) return;
+    if (kv_->physical_block_ids(seq_id) != kv_peer_->physical_block_ids(seq_id)) {
+        static bool noted = false;
+        if (!noted) {
+            noted = true;
+            fprintf(stderr, "[tp] kv mirror: block numbering diverged across ranks after %s "
+                            "(seq %llu) -- prefix sharing is unsafe from here on\n",
+                    where, (unsigned long long)seq_id);
+        }
+    }
 }
 
 PrefixCache::Stats ContinuousBatchEngine::prefix_cache_stats() const {
@@ -473,7 +540,7 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
         if (job.req.use_prefix_session) {
             seq_id = 0;
-            if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
+            if (!kv_allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
             model_->activate_session(seq_id);
             // The KV blocks survived the previous request, but its decoding advanced the hybrid
             // recurrent state past the prefix. Replay the end-of-prefix snapshot so the 48
@@ -510,6 +577,7 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
                 }
             }
             if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
+            kv_check(seq_id, "open_session");
             if (hit.tokens > 0) {
                 if (model_->restore_recurrent_state(seq_id, hit.state)) {
                     job.req.prefill_start = hit.tokens;
@@ -531,7 +599,7 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
             job.seq_id = seq_id;
             if (!apply_constraint_mask(job)) {
                 if (seq_id != 0) model_->close_session(seq_id);   // session 0 is the shared prefix
-                else kv_->free(seq_id);
+                else kv_free(seq_id);
                 return fail(EnqueueError::BAD_REQUEST);
             }
         }
@@ -696,7 +764,7 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
         if (prefix_cache_ && !j.checkpoints.empty() && j.phase != SeqPhase::PREFILL && j.error.empty()) {
             std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
             for (Job::Checkpoint& cp : j.checkpoints) {
-                std::vector<int> blocks = kv_->retain_prefix_blocks(j.seq_id, cp.pos / kv_->block_size());
+                std::vector<int> blocks = kv_retain(j.seq_id, cp.pos / kv_->block_size());
                 if (!blocks.empty())
                     prefix_cache_->insert(std::vector<int>(j.req.prompt.begin(), j.req.prompt.begin() + cp.pos),
                                           std::move(blocks), std::move(cp.state));
@@ -718,10 +786,10 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
         // recurrent state is NOT kept -- decoding mutated it -- and is replayed from
         // cache_prefix()'s snapshot by restore_prefix_state() on the next reuse.
         const int keep = j.req.use_prefix_session ? model_->prefix_block_count() : 0;
-        if (keep > 0 && kv_->truncate_blocks(j.seq_id, keep)) {
+        if (keep > 0 && kv_truncate(j.seq_id, keep)) {
             // prefix stays installed and active; nothing else to do
         } else {
-            kv_->free(j.seq_id);
+            kv_free(j.seq_id);
             if (j.req.use_prefix_session) model_->release_prefix_session();
         }
     }

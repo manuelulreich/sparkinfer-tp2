@@ -266,6 +266,14 @@ public:
     // All zeros while the cache is off.
     PrefixCache::Stats prefix_cache_stats() const;
 
+    // (dual-GPU) Tensor parallelism: rank 1's KV manager. The engine drives only rank 0's model
+    // (which mirrors its own calls onto rank 1), but it also manages blocks DIRECTLY -- the shared
+    // prefix session's allocation, prefix-cache retains/releases, truncation, frees. Those are
+    // applied to this manager too, in the same order, so both pools keep one block numbering
+    // (the block lists a cache hit hands to open_session are then valid on both ranks). Call
+    // before submitting; null (the default) is tp=1.
+    void set_kv_mirror(KVCacheManager* peer);
+
 private:
     struct Job;
     enum class EnqueueError { NONE, BAD_REQUEST, OVERLOADED, ALLOC_FAILED };
@@ -296,6 +304,13 @@ private:
 
     Qwen35Model* model_;
     KVCacheManager* kv_;
+    KVCacheManager* kv_peer_ = nullptr;   // (dual-GPU) rank 1's manager; see set_kv_mirror
+    // Engine-side block ops, applied to kv_ and (under tp) kv_peer_ with a numbering check.
+    bool kv_allocate(uint64_t seq_id, int num_tokens);
+    void kv_free(uint64_t seq_id);
+    bool kv_truncate(uint64_t seq_id, int keep_blocks);
+    std::vector<int> kv_retain(uint64_t seq_id, int n_blocks);
+    void kv_check(uint64_t seq_id, const char* where);
     Scheduler scheduler_;
     SchedulePolicy policy_ = SchedulePolicy::CONTINUOUS_BATCHING;
     const QwenVisionWeights* vision_weights_ = nullptr;

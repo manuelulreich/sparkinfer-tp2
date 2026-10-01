@@ -80,6 +80,11 @@ public:
 
     Stats stats() const;
 
+    // (dual-GPU) Tensor parallelism: rank 1's KV manager, which holds the same block numbering as
+    // kv (every engine-side block op is mirrored onto it), so each block release is applied to it
+    // too. Null (the default) at tp=1.
+    void set_mirror(KVCacheManager* peer) { kv_peer_ = peer; }
+
 private:
     struct Entry {
         std::vector<int> tokens;
@@ -92,6 +97,8 @@ private:
     void enforce_limits_locked();
 
     KVCacheManager* kv_;
+    KVCacheManager* kv_peer_ = nullptr;
+    void release(const std::vector<int>& blocks);   // kv_ and, under tp, kv_peer_
     Limits limits_;
     mutable std::mutex mu_;
     std::vector<Entry> entries_;

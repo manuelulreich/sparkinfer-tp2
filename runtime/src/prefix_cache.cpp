@@ -7,9 +7,14 @@ namespace sparkinfer {
 
 PrefixCache::PrefixCache(KVCacheManager* kv, const Limits& limits) : kv_(kv), limits_(limits) {}
 
+void PrefixCache::release(const std::vector<int>& blocks) {
+    kv_->release_blocks(blocks);
+    if (kv_peer_) kv_peer_->release_blocks(blocks);
+}
+
 PrefixCache::~PrefixCache() {
     std::lock_guard<std::mutex> lock(mu_);
-    for (const Entry& e : entries_) kv_->release_blocks(e.blocks);
+    for (const Entry& e : entries_) release(e.blocks);
     entries_.clear();
 }
 
@@ -49,7 +54,7 @@ void PrefixCache::insert(std::vector<int> tokens, std::vector<int> blocks,
         }
     }
     if (!well_formed || duplicate || state.bytes() > limits_.max_host_bytes) {
-        kv_->release_blocks(blocks);
+        release(blocks);
         return;
     }
     Entry e;
@@ -87,7 +92,7 @@ void PrefixCache::evict_one_locked() {
     if (entries_.empty()) return;
     auto oldest = std::min_element(entries_.begin(), entries_.end(),
                                    [](const Entry& a, const Entry& b) { return a.last_used < b.last_used; });
-    kv_->release_blocks(oldest->blocks);
+    release(oldest->blocks);
     host_bytes_ -= oldest->state.bytes();
     for (int b : oldest->blocks) {
         auto it = held_.find(b);

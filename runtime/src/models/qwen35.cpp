@@ -5295,8 +5295,21 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
 }
 
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
-    // (dual-GPU) A snapshot holds one rank's state only; prefix-cache snapshots are not tp-aware yet.
-    if (tp_active()) return false;
+    // (dual-GPU) Each rank holds only its own GDN window: the leader snapshots its half into
+    // `out` and rank 1's (on rank 1's worker/device) into out.peer; both must succeed.
+    if (Qwen35Model* peer = tp_mirror_peer()) {
+        auto ps = std::make_shared<RecurrentStateSnapshot>();
+        bool ok = false, peer_ok = false;
+        {
+            TpMirrorScope m(&p_->device_mu, peer, [&](Qwen35Model& pm) {
+                peer_ok = pm.snapshot_recurrent_state(seq_id, *ps);
+            });
+            ok = snapshot_recurrent_state(seq_id, out);
+        }
+        if (!ok || !peer_ok) { out = RecurrentStateSnapshot{}; return false; }
+        out.peer = std::move(ps);
+        return true;
+    }
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!needs_linear_state(s.cfg)) {
@@ -5330,7 +5343,19 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
 }
 
 bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap) {
-    if (tp_active()) return false;   // see snapshot_recurrent_state
+    // (dual-GPU) Restore both halves (see snapshot_recurrent_state); a snapshot without the peer
+    // half (taken at tp=1) cannot restore a split model.
+    if (Qwen35Model* peer = tp_mirror_peer()) {
+        if (!snap.peer) return false;
+        bool ok = false, peer_ok = false;
+        {
+            TpMirrorScope m(&p_->device_mu, peer, [&](Qwen35Model& pm) {
+                peer_ok = pm.restore_recurrent_state(seq_id, *snap.peer);
+            });
+            ok = restore_recurrent_state(seq_id, snap);
+        }
+        return ok && peer_ok;
+    }
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!needs_linear_state(s.cfg)) return true;

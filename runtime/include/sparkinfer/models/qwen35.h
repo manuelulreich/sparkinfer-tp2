@@ -661,7 +661,10 @@ public:
         std::shared_ptr<void> host;   // pinned; state_bytes of lin_state, then conv_bytes
         size_t state_bytes = 0;
         size_t conv_bytes = 0;
-        size_t bytes() const { return state_bytes + conv_bytes; }
+        // (dual-GPU) Under tensor parallelism each rank holds only its own GDN window, so the
+        // leader's snapshot carries rank 1's half here (taken/restored on rank 1's device).
+        std::shared_ptr<RecurrentStateSnapshot> peer;
+        size_t bytes() const { return state_bytes + conv_bytes + (peer ? peer->bytes() : 0); }
     };
     // Copy seq_id's recurrent state into `out`. False, leaving `out` untouched, when the session is
     // unknown, its state was compacted to bf16 by packed decode (a prefill-time snapshot never is),
