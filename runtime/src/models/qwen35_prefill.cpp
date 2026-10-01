@@ -4025,23 +4025,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
             kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
         if (tp_active) {
-            // Vocab row-split: this rank's lm_head holds only V/2 rows (the GEMV above ran over
-            // tp_vr of them), so the seed is the cross-rank argmax: local argmax + its logit here,
-            // the global winner from the host exchange (both ranks get the same token).
-            kernels::launch_argmax(s.logits, s.d_out_id, 1, tp_vr, st);
-            pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st),
-                  "tp seed t");
-            pf_cu(cudaStreamSynchronize(st), "tp seed t sync");
-            const int lt = *s.h_out_id;
-            float lm = 0.f;
-            pf_cu(cudaMemcpy(&lm, s.logits + lt, sizeof(float), cudaMemcpyDeviceToHost), "tp seed m");
-            const int tok = tp_prefill_seed_exchange(lm, lt, tp_vr);
-            *s.h_out_id = tok;
-            pf_cu(cudaMemcpyAsync(s.d_out_id, s.h_out_id, sizeof(int), cudaMemcpyHostToDevice, st),
-                  "tp seed out");
-            pf_cu(cudaStreamSynchronize(st), "tp seed out sync");
-            if (multi) s.multi_seed[si] = tok;
-            continue;
+            // Vocab row-split: this rank's lm_head holds only V/2 rows (the GEMV above wrote them
+            // at the row's start). Move them to the rank's global window, zero the rest, and one
+            // f32 all-reduce leaves the FULL last-position logits row in s.logits on both ranks --
+            // exactly what the tp=1 tail leaves, which the caller relies on (logit-bias re-pick,
+            // the seed logprob distribution). The argmax below is then tp=1's verbatim.
+            const int r = (s.gdn_window.v_count > 0) ? (s.gdn_window.v_start / s.gdn_window.v_count) : 0;
+            if (r != 0) {
+                pf_cu(cudaMemcpyAsync(s.logits + (size_t)r * tp_vr, s.logits, (size_t)tp_vr * sizeof(float),
+                                      cudaMemcpyDeviceToDevice, st), "tp seed half move");
+                pf_cu(cudaMemsetAsync(s.logits, 0, (size_t)tp_vr * sizeof(float), st), "tp seed zero lo");
+            } else {
+                pf_cu(cudaMemsetAsync(s.logits + tp_vr, 0, (size_t)(c.vocab - tp_vr) * sizeof(float), st),
+                      "tp seed zero hi");
+            }
+            tp_prefill_allreduce_f32(s.logits, (size_t)c.vocab);
         }
         kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
         if (multi) {

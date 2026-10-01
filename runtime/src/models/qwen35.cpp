@@ -4137,31 +4137,6 @@ void Qwen35Model::tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow) {
     });
 }
 
-static float g_tp_seed_m1 = 0.f;
-static int g_tp_seed_t1 = -1;
-static int g_tp_seed_win = -1;
-
-int tp_prefill_seed_exchange(float local_m, int local_t, int rows_per_rank) {
-    if (!g_tp_prefill_link || g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return -1;
-    int dev = -1;
-    if (cudaGetDevice(&dev) != cudaSuccess ||
-        (dev != g_tp_prefill_dev[0] && dev != g_tp_prefill_dev[1]))
-        return -1;
-    if (dev != g_tp_prefill_dev[0]) {
-        // Peer: publish before arriving (the leader reads after the arrival), then read the
-        // winner after the post. Neither slot can be rewritten before the other side has read
-        // it: the leader writes g_tp_seed_win only inside a post, which needs our next arrival.
-        g_tp_seed_m1 = local_m;
-        g_tp_seed_t1 = local_t + rows_per_rank;
-        tp_peer_rendezvous("prefill seed");
-        return g_tp_seed_win;
-    }
-    tp_leader_rendezvous("prefill seed", [&] {
-        g_tp_seed_win = (local_m >= g_tp_seed_m1) ? local_t : g_tp_seed_t1;   // rank 0 wins ties
-    });
-    return g_tp_seed_win;
-}
-
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
     // Prefill o_proj partial (S7a-1): each rank's pass calls this with its per-pass [N][H] buffer
     // right after enqueuing its K-compact o_proj GEMM. The call registers the buffer in the
@@ -4185,6 +4160,28 @@ void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
                            g_tp_prefill_buf[1]};
         if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
             { cu(cudaErrorUnknown, "tp prefill allreduce"); note_tp_fatal("GpuLink prefill allreduce failed"); }
+    });
+}
+
+void tp_prefill_allreduce_f32(float* in_out, size_t elems) {
+    // Same registration + two-way rendezvous as tp_prefill_allreduce_bf16, for an f32 buffer
+    // (the prefill seed's zero-padded [vocab] logits row).
+    if (!g_tp_prefill_link || !in_out || elems == 0) return;
+    if (g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        (dev != g_tp_prefill_dev[0] && dev != g_tp_prefill_dev[1]))
+        return;
+    const int r = (dev == g_tp_prefill_dev[0]) ? 0 : 1;
+    g_tp_prefill_buf[r] = in_out;
+    if (r != 0) { tp_peer_rendezvous("prefill f32 allreduce"); return; }
+    tp_leader_rendezvous("prefill f32 allreduce", [&] {
+        GpuLink::RankRef a{g_tp_prefill_dev[0], g_tp_prefill_stream[0], g_tp_prefill_buf[0],
+                           g_tp_prefill_buf[0]};
+        GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_prefill_stream[1], g_tp_prefill_buf[1],
+                           g_tp_prefill_buf[1]};
+        if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(float), GpuLink::Dtype::Float32))
+            cu(cudaErrorUnknown, "tp prefill f32 allreduce");
     });
 }
 
