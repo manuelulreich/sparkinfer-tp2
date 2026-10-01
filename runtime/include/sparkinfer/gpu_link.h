@@ -109,6 +109,8 @@ cudaError_t launch_glink_reduce(void* dst, const void* a, const void* b, size_t 
 // back per dtype, as the copy path's reduce kernel, so both transports give identical bits.
 // A peer that never arrives traps the kernel after ~10 s instead of hanging the stream forever.
 constexpr size_t kFlagMaxBytes = 256u << 10;
+// Forces the flag kernels' module to load on the current device (lazy loading); false on failure.
+bool preload_glink_flag_kernels();
 cudaError_t launch_glink_flag_allreduce(const void* in, void* out, void* peer_land,
                                         const void* my_land, unsigned* peer_flag,
                                         const unsigned* my_flag, unsigned seq, size_t n,

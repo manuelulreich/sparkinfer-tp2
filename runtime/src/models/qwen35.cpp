@@ -3582,6 +3582,106 @@ void Qwen35Model::tp_allreduce_logits() {
 
 constexpr int kTpVerifyRows = 16;
 
+// (dual-GPU WP-12) verify_rows_tp's scratch, all-or-nothing and agreed across the ranks. Called
+// lazily by the first verify, or up front by reserve_tp_verify() so the draft's load accounts for it.
+bool Qwen35Model::tp_verify_alloc() {
+    Impl& s = *p_;
+    if (s.vr_ready) return true;
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden;
+    const int R = kTpVerifyRows;
+    const int HD = c.head_dim;
+    const int qdim_l = (c.n_q_heads / 2) * HD, kvdim_l = (c.n_kv_heads / 2) * HD;
+    const int fl = c.moe_ffn / 2;
+    const int lhd = c.linear_head_dim;
+    const int vloc = s.gdn_window.v_count;
+    const int g = c.linear_v_heads / c.linear_q_heads;
+    const int ql = c.gdn_qh_block ? vloc / g : vloc;
+    const int wq = (2 * ql + vloc) * lhd;
+    const int lqkv = s.linear_qkvdim;
+    const int Kw = vloc * lhd;
+    const int V = c.vocab, Vr = V / 2;
+    const int kmax = std::max(std::max(H, fl), std::max(2 * qdim_l, Kw));
+    const size_t ls = (size_t)gdn_state_slots(c) * gdn_v_local() * lhd * lhd;
+    const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * lqkv;
+    {
+        // All-or-nothing: on a failed allocation free what this call took and decline, on BOTH
+        // ranks (agreed below) -- a verify running on null scratch writes through null pointers.
+        std::vector<void*> got;
+        bool alloc_ok = true;
+        auto va = [&](size_t bytes) -> void* {
+            void* p = nullptr;
+            if (!alloc_ok || cudaMalloc(&p, bytes) != cudaSuccess) { alloc_ok = false; return nullptr; }
+            got.push_back(p);
+            return p;
+        };
+        const size_t rh = (size_t)R * H * sizeof(bf16);
+        s.vr_x = (bf16*)va(rh); s.vr_xn = (bf16*)va(rh); s.vr_h = (bf16*)va(rh);
+        s.vr_hn = (bf16*)va(rh); s.vr_ar = (bf16*)va(rh);
+        s.vr_nq = (signed char*)va((size_t)R * kmax);
+        s.vr_ns = (float*)va((size_t)R * (kmax / 16 + 1) * sizeof(float));
+        s.vr_q81_row = kernels::llama_q8_1_bytes(kmax);
+        s.vr_q81 = (char*)va((size_t)R * s.vr_q81_row);
+        s.vr_rec_qkv = (bf16*)va((size_t)c.n_layers * R * wq * sizeof(bf16));
+        s.vr_rec_a = (bf16*)va((size_t)c.n_layers * R * vloc * sizeof(bf16));
+        s.vr_rec_b = (bf16*)va((size_t)c.n_layers * R * vloc * sizeof(bf16));
+        s.vr_full = (bf16*)va((size_t)R * lqkv * sizeof(bf16));
+        s.vr_z = (bf16*)va((size_t)R * Kw * sizeof(bf16));
+        s.vr_gdn = (bf16*)va((size_t)R * Kw * sizeof(bf16));
+        s.vr_ln = (bf16*)va((size_t)R * Kw * sizeof(bf16));
+        s.vr_qraw = (bf16*)va((size_t)R * 2 * qdim_l * sizeof(bf16));
+        s.vr_q = (bf16*)va((size_t)R * qdim_l * sizeof(bf16));
+        s.vr_g = (bf16*)va((size_t)R * qdim_l * sizeof(bf16));
+        s.vr_attn = (bf16*)va((size_t)R * qdim_l * sizeof(bf16));
+        s.vr_k = (bf16*)va((size_t)R * kvdim_l * sizeof(bf16));
+        s.vr_v = (bf16*)va((size_t)R * kvdim_l * sizeof(bf16));
+        s.vr_ffn = (bf16*)va((size_t)3 * R * fl * sizeof(bf16));
+        s.vr_lh = (float*)va((size_t)R * Vr * sizeof(float));
+        s.vr_logits = (float*)va((size_t)R * V * sizeof(float));
+        s.vr_ids = (int*)va((size_t)4 * R * sizeof(int));
+        s.vr_pos = s.vr_ids + R; s.vr_seq = s.vr_ids + 2 * R; s.vr_out = s.vr_ids + 3 * R;
+        s.vr_snap_lin = (float*)va(ls * sizeof(float));
+        s.vr_snap_conv = (bf16*)va(cs * sizeof(bf16));
+        if (alloc_ok && !s.h_vr && cudaMallocHost(&s.h_vr, (size_t)4 * R * sizeof(int)) != cudaSuccess) {
+            s.h_vr = nullptr;
+            alloc_ok = false;
+        }
+        cudaGetLastError();   // a failed cudaMalloc leaves a sticky-free error in the runtime state
+        alloc_ok = tp_prefill_agree_min(alloc_ok ? 1 : 0) != 0;
+        if (!alloc_ok) {
+            for (void* p : got) cudaFree(p);
+            static bool noted = false;
+            if (!noted) {
+                noted = true;
+                fprintf(stderr, "[tp] DSpark verify scratch does not fit on this card -- speculative "
+                                "verify declined (ordinary decode serves the request); lower --ctx\n");
+            }
+            return false;
+        }
+        for (void* p : got) s.owned.push_back(p);
+        s.vr_ready = true;
+    }
+    return true;
+}
+
+// Reserve the tp verify scratch now, on both ranks (mirrored), so its memory is taken before
+// prompts size their prefill arenas against what is free. false = it does not fit.
+bool Qwen35Model::reserve_tp_verify() {
+    if (!tp_active()) return true;
+    bool peer_ok = true;
+    {
+        TP_MIRROR(reserve_tp_verify_local(&peer_ok));
+        reserve_tp_verify_local(nullptr);
+    }
+    return p_->vr_ready && peer_ok;
+}
+
+void Qwen35Model::reserve_tp_verify_local(bool* ok) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    const bool r = tp_verify_alloc();
+    if (ok) *ok = r;
+}
+
 // (dual-GPU WP-12) DSpark's batched verify at tp=2: `n` consecutive positions of the active
 // sequence in one pass, returning the accepted-prefix length (or -1: declined, nothing changed).
 // Both ranks run it (batched_forward mirrors the call). It is forward_token_tp with a row axis:
@@ -3647,43 +3747,7 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
     const size_t ls = (size_t)gdn_state_slots(c) * gdn_v_local() * lhd * lhd;
     const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * lqkv;
 
-    if (!s.vr_ready) {
-        auto va = [&](size_t bytes) -> void* {
-            void* p = nullptr;
-            cu(cudaMalloc(&p, bytes), "tp verify scratch");
-            s.owned.push_back(p);
-            return p;
-        };
-        const size_t rh = (size_t)R * H * sizeof(bf16);
-        s.vr_x = (bf16*)va(rh); s.vr_xn = (bf16*)va(rh); s.vr_h = (bf16*)va(rh);
-        s.vr_hn = (bf16*)va(rh); s.vr_ar = (bf16*)va(rh);
-        s.vr_nq = (signed char*)va((size_t)R * kmax);
-        s.vr_ns = (float*)va((size_t)R * (kmax / 16 + 1) * sizeof(float));
-        s.vr_q81_row = kernels::llama_q8_1_bytes(kmax);
-        s.vr_q81 = (char*)va((size_t)R * s.vr_q81_row);
-        s.vr_rec_qkv = (bf16*)va((size_t)c.n_layers * R * wq * sizeof(bf16));
-        s.vr_rec_a = (bf16*)va((size_t)c.n_layers * R * vloc * sizeof(bf16));
-        s.vr_rec_b = (bf16*)va((size_t)c.n_layers * R * vloc * sizeof(bf16));
-        s.vr_full = (bf16*)va((size_t)R * lqkv * sizeof(bf16));
-        s.vr_z = (bf16*)va((size_t)R * Kw * sizeof(bf16));
-        s.vr_gdn = (bf16*)va((size_t)R * Kw * sizeof(bf16));
-        s.vr_ln = (bf16*)va((size_t)R * Kw * sizeof(bf16));
-        s.vr_qraw = (bf16*)va((size_t)R * 2 * qdim_l * sizeof(bf16));
-        s.vr_q = (bf16*)va((size_t)R * qdim_l * sizeof(bf16));
-        s.vr_g = (bf16*)va((size_t)R * qdim_l * sizeof(bf16));
-        s.vr_attn = (bf16*)va((size_t)R * qdim_l * sizeof(bf16));
-        s.vr_k = (bf16*)va((size_t)R * kvdim_l * sizeof(bf16));
-        s.vr_v = (bf16*)va((size_t)R * kvdim_l * sizeof(bf16));
-        s.vr_ffn = (bf16*)va((size_t)3 * R * fl * sizeof(bf16));
-        s.vr_lh = (float*)va((size_t)R * Vr * sizeof(float));
-        s.vr_logits = (float*)va((size_t)R * V * sizeof(float));
-        s.vr_ids = (int*)va((size_t)4 * R * sizeof(int));
-        s.vr_pos = s.vr_ids + R; s.vr_seq = s.vr_ids + 2 * R; s.vr_out = s.vr_ids + 3 * R;
-        cu(cudaMallocHost(&s.h_vr, (size_t)4 * R * sizeof(int)), "tp verify pinned");
-        s.vr_snap_lin = (float*)va(ls * sizeof(float));
-        s.vr_snap_conv = (bf16*)va(cs * sizeof(bf16));
-        s.vr_ready = true;
-    }
+    if (!s.vr_ready && !tp_verify_alloc()) return -1;
 
     // Entry: ids / positions / seq_lens, the GDN snapshot, and the embedding (vocab-window gather
     // + all-reduce == the decode entry's owner-row exchange).
@@ -5533,6 +5597,9 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
     return true;
 }
 
+// Narrowest window prefill_batched_chunked retries at after a scratch decline.
+static constexpr int kMinRetryWindow = 256;
+
 int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want_seed_logprob,
                                          int* out_done) {
     int tp_peer_done = 0;
@@ -5541,7 +5608,7 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
     if (out_done) *out_done = 0;
     if (!prompt_ids || n <= 0) return -1;
     Impl& s = *p_;
-    const int window = prefill_window_tokens(s.kv);
+    int window = prefill_window_tokens(s.kv);
     // Short enough for one pass: run exactly the call this function replaced, so no context that
     // already worked changes kernel path, tile shape or arithmetic. The bound is the single-pass
     // threshold, NOT the window size -- a prompt between the two is still one pass.
@@ -5563,16 +5630,34 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
         // already written part of the cache is simply recomputed -- prefill is deterministic in
         // the prompt, and pos0 == 0 resets the recurrent state the same way the original call did.
         // Nothing here changes a context where the single pass succeeds: that returns above.
-        if (window <= 0 || n <= window) return -1;
+        // (dual-GPU) A prompt shorter than the window used to stop here and go to the token
+        // loop. A pass that cannot get its scratch declines before touching any state, so a
+        // NARROWER window is a clean retry: half the prompt, rounded to the 128-row GEMM tile.
+        // Measured: a card carrying the DSpark draft at tp=2 cannot fit a 4k-token arena (the
+        // token loop then took 70 s), while a 2k window fits.
+        if (window <= 0 || n <= window) {
+            const int half = ((n / 2 + 127) / 128) * 128;
+            if (half < kMinRetryWindow || half >= n) return -1;
+            window = half;
+        }
         fprintf(stderr, "[prefill] single pass declined at n=%d -- windowing (%d) instead of the "
                         "token loop\n", n, window);
     }
-    for (int pos = 0; pos < n; pos += window) {
+    int pos = 0;
+    while (pos < n) {
         const int len = std::min(window, n - pos);
         const bool last = (pos + len >= n);
         // Only the final window needs the seed logprob -- the earlier ones exist to fill KV and
         // carry the Gated-DeltaNet recurrence, and nothing ever reads their argmax.
         const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
+        // Scratch too large even at this width: halve the window and retry from the same position
+        // (a declined pass changed nothing). Both tp ranks decline together (the arena check is
+        // agreed), so they halve together.
+        if (seed < 0 && window > kMinRetryWindow) {
+            window = std::max(kMinRetryWindow, ((window / 2 + 127) / 128) * 128);
+            fprintf(stderr, "[prefill] window declined at pos=%d -- retrying at %d\n", pos, window);
+            continue;
+        }
         // A window that declines -- a path with no start position (Muse's rolling-window
         // attention, a DSpark capture), or a scratch allocation that failed even at window size
         // -- leaves [0, pos) correct in the cache and stops there: the caller finishes the rest
@@ -5587,6 +5672,7 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
             return seed;
         }
         if (out_done) *out_done = pos + len;
+        pos += len;
     }
     return -1;
 }
@@ -7543,6 +7629,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 if (i < active_proposal_depth && block[i + 1] != p) break;
             }
         }
+        // tp=2: the batched verify (verify_rows_tp) only ever fails by DECLINING, before any state
+        // changes (its scratch did not fit) -- hand the request to ordinary decode at this exact
+        // point, as a split-tier stop does, instead of aborting it.
+        if (vfail && compact_verify && hooks && tp_active()) { spec_tier_stop = true; break; }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); spec_failed = true; break; }
         // Climb on a full-block accept, decay on anything less. The old rule latched the score at
         // the engage threshold for any partial accept of >= 2 tokens, which kept the batched path

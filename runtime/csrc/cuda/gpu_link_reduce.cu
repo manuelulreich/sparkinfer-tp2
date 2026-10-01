@@ -102,6 +102,10 @@ cudaError_t launch_glink_reduce(void* dst, const void* a, const void* b, size_t 
   if (blocks > 512) blocks = 512;
   const int flag = is_max ? 1 : 0;
   dim3 grid(blocks);
+  // Clear the thread's error slot first: cudaGetLastError below must report THIS launch, not an
+  // earlier, already-handled failure on the thread (a declined cudaMalloc elsewhere), which would
+  // otherwise be read as a failed collective and take the whole tp group down.
+  (void)cudaGetLastError();
   if (dtype == GpuLink::Dtype::Float32)
     glink_reduce_f32<<<grid, 256, 0, stream>>>((float*)dst, (const float*)a, (const float*)b, ni, flag);
   else if (dtype == GpuLink::Dtype::BFloat16)
@@ -114,12 +118,21 @@ cudaError_t launch_glink_reduce(void* dst, const void* a, const void* b, size_t 
   return cudaGetLastError();
 }
 
+bool preload_glink_flag_kernels() {
+  cudaFuncAttributes fa;
+  return cudaFuncGetAttributes(&fa, glink_flag_allreduce_kernel<float>) == cudaSuccess &&
+         cudaFuncGetAttributes(&fa, glink_flag_allreduce_kernel<__nv_bfloat16>) == cudaSuccess &&
+         cudaFuncGetAttributes(&fa, glink_reduce_bf16) == cudaSuccess &&
+         cudaFuncGetAttributes(&fa, glink_reduce_f32) == cudaSuccess;
+}
+
 cudaError_t launch_glink_flag_allreduce(const void* in, void* out, void* peer_land,
                                         const void* my_land, unsigned* peer_flag,
                                         const unsigned* my_flag, unsigned seq, size_t n,
                                         GpuLink::Dtype dtype, cudaStream_t stream) {
   if (n == 0) return cudaSuccess;
   if (n > (size_t)INT_MAX) return cudaErrorInvalidValue;
+  (void)cudaGetLastError();   // report this launch only (see launch_glink_reduce)
   if (dtype == GpuLink::Dtype::Float32)
     glink_flag_allreduce_kernel<float><<<1, 1024, 0, stream>>>(
         (const float*)in, (float*)out, (float*)peer_land, (const float*)my_land, peer_flag,

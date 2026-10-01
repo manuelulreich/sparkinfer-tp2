@@ -765,6 +765,10 @@ public:
     // made that token take twice as long as every other one.
     void dflash_warm_verify(int n, int start_pos);
 
+    // (dual-GPU) Take the tp=2 DSpark verify scratch now on both ranks; false = it does not fit
+    // (true when not tp). The DSpark loader calls it so an oversized --ctx fails at load.
+    bool reserve_tp_verify();
+
     // Batched verify entry (may fall back to verify_block). Same contract as verify_block.
     bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
                          int* out_argmax, const void* dflash_capture_dst = nullptr);
@@ -825,6 +829,8 @@ private:
     // per-row argmax bit-identical to forward_token_tp; returns the accepted-prefix length after
     // committing exactly those rows' GDN state, or -1 when declined (nothing changed).
     int verify_rows_tp(const int* ids, int n, int start_pos, void* capture_dst, int* out_argmax);
+    bool tp_verify_alloc();
+    void reserve_tp_verify_local(bool* ok);
     // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or
     // null when this is not the attached group leader or the call is nested inside an already
     // mirrored one (only the outermost call mirrors; see TpMirrorScope in qwen35.cpp).

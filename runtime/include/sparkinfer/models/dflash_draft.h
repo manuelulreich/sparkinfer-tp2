@@ -91,6 +91,8 @@ public:
     // Build the quantized weight copies now rather than on the first forward_block, so a caller
     // that primes the draft outside a timed region does not pay for it inside one. Idempotent.
     void ensure_quant();
+    // After ensure_quant(): false when a quantized copy could not be allocated (out of memory).
+    bool quant_ok() const;
 
     //   proposals:     how many rows after the seed to score (0 = the built-in default). The
     //                  verifier picks this by context length, so the draft has to be told rather

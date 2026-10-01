@@ -415,9 +415,13 @@ struct DFlashDraftModel::Impl {
     std::vector<PendingQuant> pending_quant;
     bool quant_ready = false;
 
+    bool quant_failed = false;   // a quantized copy could not be allocated (device memory)
     void ensure_quant() {
         if (quant_ready) return;
-        for (auto& pq : pending_quant) *pq.dst = make_q8(pq.w, pq.N, pq.K);
+        for (auto& pq : pending_quant) {
+            *pq.dst = make_q8(pq.w, pq.N, pq.K);
+            if (!(pq.dst->q4 && pq.dst->dm) && !(pq.dst->q && pq.dst->s)) quant_failed = true;
+        }
         pending_quant.clear();
         quant_ready = true;
     }
@@ -1052,6 +1056,7 @@ bool ctx_gemm_enabled() {
 }  // namespace
 
 void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
+bool DFlashDraftModel::quant_ok() const { return p_ && p_->quant_ready && !p_->quant_failed; }
 
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,

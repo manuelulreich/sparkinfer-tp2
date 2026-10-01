@@ -980,7 +980,52 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
+    // tp per-rank scratch, taken HERE -- before the arena check below -- at the widest size any
+    // arm uses. It used to be taken lazily inside the layer loop, past that check: on a card with
+    // little room left the allocation came back null and the projection wrote through it (an
+    // illegal access that takes the context down), and a mid-pass failure could not have been
+    // undone anyway without the ranks falling out of step. The lazy sites below now find these set.
+    if (tp_active && s.gdn_window.v_count > 0) {
+        const int ranks = c.linear_v_heads / s.gdn_window.v_count;
+        if (ranks > 1) {
+            if (c.hybrid) {
+                const int ql = (lqkv - lvdim) / (2 * ranks), vl = lvdim / ranks, vhr = vh / ranks;
+                tp_gdn_qkv  = a.alloc<bf16>((size_t)N * (2 * ql + vl));
+                tp_gdn_z    = a.alloc<bf16>((size_t)N * vl);
+                tp_gdn_a    = a.alloc<bf16>((size_t)N * vhr);
+                tp_gdn_b    = a.alloc<bf16>((size_t)N * vhr);
+                tp_gdn_conv = a.alloc<bf16>((size_t)lqkv * c.linear_conv_kernel);
+                tp_gdn_ln   = a.alloc<bf16>((size_t)N * vl);
+            }
+            const int qr = qdim / ranks, kr = kvdim / ranks;
+            const int q_r = (c.n_q_heads / ranks) * c.head_dim, kv_r = kvdim / ranks;
+            tp_qb      = a.alloc<bf16>((size_t)N * std::max(qr, q_r));
+            tp_qg      = a.alloc<bf16>((size_t)N * std::max(qr, q_r));
+            tp_kf      = a.alloc<bf16>((size_t)N * std::max(kr, kv_r));
+            tp_vf      = a.alloc<bf16>((size_t)N * std::max(kr, kv_r));
+            tp_qwide   = a.alloc<bf16>((size_t)N * (wide / ranks));
+            tp_att     = a.alloc<bf16>((size_t)N * q_r);
+            tp_att_win = a.alloc<bf16>((size_t)N * qr);
+            if (c.dense_ffn) {
+                tp_ffg_buf = a.alloc<bf16>((size_t)FC * (ffn / ranks));
+                tp_ffu_buf = a.alloc<bf16>((size_t)FC * (ffn / ranks));
+            }
+        }
+    }
     pf_vram("after dense arena");
+    {
+        // DEBUG: SPARKINFER_DEBUG_PREFILL_DECLINE=<pos0> forces this pass's arena check to fail once
+        // when it starts at that position -- the decline/retry path without memory pressure.
+        // A comma-separated list declines once at each listed position.
+        static thread_local std::vector<int> dbg_pos = [] {
+            std::vector<int> v;
+            if (const char* e = getenv("SPARKINFER_DEBUG_PREFILL_DECLINE"))
+                for (const char* q = e; *q; ) { v.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+            return v;
+        }();
+        for (size_t i = 0; i < dbg_pos.size(); i++)
+            if (dbg_pos[i] == pos0) { dbg_pos.erase(dbg_pos.begin() + i); a.ok = false; break; }
+    }
     if (tp_active) a.ok = tp_prefill_agree_min(a.ok ? 1 : 0) != 0;   // both ranks fall back, or neither
     if (!a.ok) {
         // Report the numbers, not just the fact: this fallback costs ~50x at long context and the

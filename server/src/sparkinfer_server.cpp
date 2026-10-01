@@ -1046,6 +1046,18 @@ int main(int argc, char** argv) {
         fprintf(stderr, "error: -m model.gguf is required\n");
         return 2;
     }
+    // (dual-GPU) tp>1: load every kernel module at context creation. Under CUDA's default lazy
+    // loading a kernel's module is loaded -- and allocated for -- on its first launch, and a
+    // 16 GB card running the 27B with a DSpark draft sits within megabytes of full after a long
+    // prefill sizes its arena: a kernel first needed then (a windowed pass's arm, say) fails to
+    // load, the launch error goes unchecked, the kernel never runs, and stale data lands in the
+    // KV cache -- every later request decodes garbage. Measured cost of EAGER: ~30 MB per card.
+    // Must be set before the first CUDA call; an explicit CUDA_MODULE_LOADING wins.
+    if (sparkinfer_server::g_tp > 1 && !getenv("CUDA_MODULE_LOADING")) {
+        setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+        fprintf(stderr, "[sparkinfer-server] tp=%d: CUDA_MODULE_LOADING=EAGER (lazy loading can fail "
+                        "silently on a near-full card)\n", sparkinfer_server::g_tp);
+    }
 
     const std::string root = repo_root();
     std::string tok_path = tokenizer_json.empty() ? root + "/models/tokenizer.json" : tokenizer_json;

@@ -407,6 +407,12 @@ bool GpuLink::init(int dev_a, int dev_b, GpuLink::Transport transport, size_t ma
         ok = false;
     }
     if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
+    // Load the kernel on both devices now: under CUDA lazy loading the first launch loads the
+    // module and allocates for it, and that first launch is otherwise mid-decode, where a card
+    // near full fails it with out-of-memory and takes the whole tp group down.
+    for (int r = 0; r < 2 && ok; r++)
+      if (cudaSetDevice(r == 0 ? dev_a : dev_b) != cudaSuccess || !detail::preload_glink_flag_kernels())
+        ok = false;
     if (prev >= 0) cudaSetDevice(prev);
     impl_->flag_on = ok;
     GLINK_LOG("[gpu_link] init: flag all-reduce %s (ops <= %zu bytes)\n", ok ? "on" : "off",

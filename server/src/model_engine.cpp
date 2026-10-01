@@ -1264,6 +1264,42 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
               " -- if the log above shows CUDA out-of-memory errors, lower --ctx (131072 fits a 32 GB card)";
         return false;
     }
+    // At tp>1 the card holding the draft is the tight one, and the quantized copies (~1.2 GB) are
+    // otherwise built lazily by the first speculative request -- where running out of memory
+    // takes the request (and the tp group) down instead of failing here, cleanly, at load.
+    if (!impl_->tp_models.empty()) {
+        draft->ensure_quant();
+        // Free-memory floor on every card after the draft is in: below it the server loads but
+        // cannot open a session (each holds ~74 MB of GDN state per card on the 27B) or fit a
+        // prefill window -- every request would fail with "device out of memory". Measured on
+        // 2x 16 GB at tp=2: --ctx 49152 leaves enough, 65536 does not.
+        const char* mf = getenv("SPARKINFER_DSPARK_MIN_FREE_MB");
+        const long min_free_mb = mf ? std::max(0L, atol(mf)) : 256;
+        auto tight_card = [&]() -> int {
+            std::vector<int> devs{impl_->model->tp_rank_view().device};
+            for (auto& m : impl_->tp_models) devs.push_back(m->tp_rank_view().device);
+            int prev = -1;
+            cudaGetDevice(&prev);
+            int tight = -1;
+            for (int d : devs) {
+                size_t fb = 0, tb = 0;
+                if (d >= 0 && cudaSetDevice(d) == cudaSuccess && cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+                    (long)(fb >> 20) < min_free_mb) {
+                    fprintf(stderr, "[sparkinfer-server] DSpark at tp>1: device %d has %zu MiB free after "
+                                    "loading the draft (floor %ld MiB)\n", d, fb >> 20, min_free_mb);
+                    tight = d;
+                }
+            }
+            if (prev >= 0) cudaSetDevice(prev);
+            return tight;
+        };
+        if (!draft->quant_ok() || !impl_->model->reserve_tp_verify() || tight_card() >= 0) {
+            err = "cannot fit the DSpark draft (quantized weights + tp verify scratch + working headroom) next to the target at --ctx " +
+                  std::to_string(impl_->cfg.max_seq) + " with --tp " +
+                  std::to_string((int)impl_->tp_models.size() + 1) + " -- lower --ctx";
+            return false;
+        }
+    }
     impl_->model->set_dflash_draft(draft.get());
     impl_->draft = std::move(draft);
     impl_->batch_engine->enable_speculative(true);
