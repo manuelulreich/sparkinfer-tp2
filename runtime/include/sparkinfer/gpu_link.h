@@ -14,7 +14,7 @@
  *
  * (device, stream) purity: the op path calls only stream-scoped async copies, cross-context
  * event waits, and stream-scoped kernel launches. cudaSetDevice is confined to init/shutdown
- * (save/restore), where it is unavoidable: peer access, event creation, memory-pool creation
+ * (save/restore), where it is unavoidable: peer access, event creation, scratch allocation
  * and pinned allocation are current-context-bound in the runtime API.
  */
 
@@ -61,8 +61,7 @@ public:
   bool init(int dev_a, int dev_b, Transport transport = Transport::Auto,
             size_t max_bytes = 1u << 20);
 
-  // Tear everything down: scratch (freed back to its pool, pool trimmed and verified
-  // to 0 reserved — the per-init leak detector), pinned staging, events. Peer access
+  // Tear everything down: scratch, pinned staging, events (returns false if any free fails). Peer access
   // itself is deliberately left enabled for the life of the contexts (re-init is
   // idempotent). The caller must have drained all streams before calling.
   bool shutdown();

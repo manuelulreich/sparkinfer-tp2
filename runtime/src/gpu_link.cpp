@@ -21,15 +21,10 @@
 // landed on this rank); the scratch route exists for BOTH because the aliased in-place
 // case (in==out) must never have the kernel read a source it is about to clobber.
 //
-// Pools and their 32 MiB backing: each rank owns one memory pool (created with the
-// props CUDA 13.4 mandates: allocType=Pinned, handleTypes=None, location=device) holding
-// one max_bytes scratch allocation. Pool backing on 13.4 is a fixed 32 MiB chunk — no
-// maxSize cap is honored for backing (measured) — which is accepted against ~1 GiB of free
-// VRAM per card (WP-1's probe ran on 128 MiB per card).
-//
-// Shutdown choreography — the per-init leak detector: per rank, in that rank's context:
-// freeAsync(scratch) -> drain -> trimTo(0) -> drain -> the pool must read EXACTLY
-// reserved=0 / used=0 (a 32 MiB residue would mean an undrained allocation) -> destroy.
+// Scratch: each rank owns one max_bytes cudaMalloc scratch on its own device. It is a plain
+// allocation, not a cudaMemPool one: a copy into a pool allocation from the other device's
+// context is rejected (pool memory is not mapped by cudaDeviceEnablePeerAccess), which broke
+// every in-place op. Shutdown frees it in that rank's context.
 // cudaSetDevice is confined to init/shutdown (save/restore); the op path is 100%
 // (device, stream)-pure: stream-scoped async copies, cross-context event waits, and
 // stream-scoped kernel launches.
@@ -131,9 +126,8 @@ cudaError_t post_copy_retry(const char* op, const char* what, void* dst, const v
 struct RankResources {
   cudaEvent_t event = nullptr;
   void* pinned = nullptr;
-  cudaMemPool_t pool = nullptr;
   void* scratch = nullptr;
-  bool any() const { return event != nullptr || pinned != nullptr || pool != nullptr || scratch != nullptr; }
+  bool any() const { return event != nullptr || pinned != nullptr || scratch != nullptr; }
 };
 
 // Per-rank resource setup, in this rank's device context.
@@ -141,7 +135,7 @@ bool setup_rank_resources(int dev, RankResources& rs, GpuLink::Transport t, size
   {
     DeviceScope scope(dev);
     // A trivial allocation establishes this device's primary context in this process; the
-    // event, pool, and scratch below all live in that context.
+    // event and scratch below live in that context.
     void* tmp = nullptr;
     if (cudaMalloc(&tmp, 64) != cudaSuccess) {
       GLINK_LOG("[gpu_link] init: dev %d: context-establishing allocation failed: %s\n",
@@ -168,20 +162,13 @@ bool setup_rank_resources(int dev, RankResources& rs, GpuLink::Transport t, size
   }
   {
     DeviceScope scope(dev);
-    // CUDA 13.4: the pool props struct has no "default" allocation type — Pinned is the only
-    // valid value for a device pool — and the location must be this rank's device.
-    cudaMemPoolProps props{};
-    props.allocType = cudaMemAllocationTypePinned;
-    props.handleTypes = cudaMemHandleTypeNone;
-    props.location.type = cudaMemLocationTypeDevice;
-    props.location.id = dev;
-    if (cudaMemPoolCreate(&rs.pool, &props) != cudaSuccess) {
-      GLINK_LOG("[gpu_link] init: dev %d: cudaMemPoolCreate failed: %s\n", dev,
-                cudaGetErrorString(cudaGetLastError()));
-      return false;
-    }
-    if (cudaMallocAsync(&rs.scratch, max_bytes, rs.pool, 0) != cudaSuccess) {
-      GLINK_LOG("[gpu_link] init: dev %d: cudaMallocAsync(%zu B) failed: %s\n", dev, max_bytes,
+    // The scratch is a plain cudaMalloc, NOT a cudaMemPool allocation: pool memory is mapped
+    // only into its own device's context (cudaDeviceEnablePeerAccess does not extend to it),
+    // and a cudaMemcpyAsync is validated in the CALLING thread's current context - so a copy
+    // into the non-current rank's pool scratch was rejected with cudaErrorInvalidValue on
+    // every in-place op (both transports). cudaMalloc memory is UVA-addressable from any context.
+    if (cudaMalloc(&rs.scratch, max_bytes) != cudaSuccess) {
+      GLINK_LOG("[gpu_link] init: dev %d: cudaMalloc(%zu B) scratch failed: %s\n", dev, max_bytes,
                 cudaGetErrorString(cudaGetLastError()));
       return false;
     }
@@ -190,48 +177,15 @@ bool setup_rank_resources(int dev, RankResources& rs, GpuLink::Transport t, size
 }
 
 // Tear one rank's resources down, in that rank's context. With `gate` set (a real
-// shutdown), the pool must read as exactly empty after the trim — that is the per-init
-// leak detector (a surviving 32 MiB backing chunk means an undrained allocation).
+// shutdown), every free must succeed — a failed free is reported, not hidden.
 bool release_rank_resources(int dev, const RankResources& rs, bool gate) {
   if (!rs.any()) return true;
   bool ok = true;
   DeviceScope scope(dev);
-  if (rs.scratch && rs.pool) {
-    // The caller has drained every stream it posted ops on (shutdown's documented
-    // contract), so the free is ordered against no outstanding work; the drains make the
-    // pool stats deterministic (13.4 only reads 0 after an explicit drain + trim + drain).
-    if (cudaFreeAsync(rs.scratch, 0) != cudaSuccess) {
-      GLINK_LOG("[gpu_link] shutdown: dev %d: cudaFreeAsync(scratch) failed: %s\n", dev,
-                cudaGetErrorString(cudaGetLastError()));
-      ok = false;
-    }
-    if (cudaStreamSynchronize(0) != cudaSuccess) {
-      GLINK_LOG("[gpu_link] shutdown: dev %d: post-free drain failed: %s\n", dev,
-                cudaGetErrorString(cudaGetLastError()));
-      ok = false;
-    }
-    if (cudaMemPoolTrimTo(rs.pool, 0) != cudaSuccess) {
-      GLINK_LOG("[gpu_link] shutdown: dev %d: cudaMemPoolTrimTo(0) failed: %s\n", dev,
-                cudaGetErrorString(cudaGetLastError()));
-      ok = false;
-    }
-    if (cudaStreamSynchronize(0) != cudaSuccess) {
-      GLINK_LOG("[gpu_link] shutdown: dev %d: post-trim drain failed: %s\n", dev,
-                cudaGetErrorString(cudaGetLastError()));
-      ok = false;
-    }
-  }
-  if (rs.pool) {
-    size_t reserved = 0, used = 0;
-    cudaMemPoolGetAttribute(rs.pool, cudaMemPoolAttrReservedMemCurrent, &reserved);
-    cudaMemPoolGetAttribute(rs.pool, cudaMemPoolAttrUsedMemCurrent, &used);
-    if (gate && (reserved != 0 || used != 0)) {
-      GLINK_LOG("[gpu_link] shutdown: dev %d: pool not empty after trim (reserved=%zu, used=%zu) - LEAK\n",
-                dev, reserved, used);
-      ok = false;
-    }
-    if (cudaMemPoolDestroy(rs.pool) != cudaSuccess) {
-      GLINK_LOG("[gpu_link] shutdown: dev %d: cudaMemPoolDestroy failed: %s\n", dev,
+  if (rs.scratch) {
+    // The caller has drained every stream it posted ops on (shutdown's documented contract).
+    if (cudaFree(rs.scratch) != cudaSuccess) {
+      GLINK_LOG("[gpu_link] shutdown: dev %d: cudaFree(scratch) failed: %s\n", dev,
                 cudaGetErrorString(cudaGetLastError()));
       ok = false;
     }
@@ -264,8 +218,7 @@ struct GpuLink::Impl {
   struct Rank {
     cudaEvent_t event = nullptr;
     void* pinned = nullptr;
-    cudaMemPool_t pool = nullptr;
-    void* scratch = nullptr;
+      void* scratch = nullptr;
   };
   Rank ranks[2];  // [0] = dev_a, [1] = dev_b
 
@@ -306,14 +259,14 @@ GpuLink::GpuLink() : impl_(std::make_unique<Impl>()) {}
 GpuLink::~GpuLink() {
   if (!impl_) return;
   if (impl_->ready) {
-    // Full gated shutdown: the pool leak gate runs (a leak is reported, not hidden).
+    // Full gated shutdown: a failed free is reported, not hidden.
     shutdown();
   } else {
     // Best-effort release of whatever a previously failed init left behind.
     for (int r = 0; r < 2; r++) {
       const int dev = (r == 0) ? impl_->dev_a : impl_->dev_b;
       const auto& rk = impl_->ranks[r];
-      const RankResources rs{rk.event, rk.pinned, rk.pool, rk.scratch};
+      const RankResources rs{rk.event, rk.pinned, rk.scratch};
       if (dev >= 0) release_rank_resources(dev, rs, /*gate=*/false);
       impl_->ranks[r] = Impl::Rank{};
     }
@@ -419,7 +372,7 @@ bool GpuLink::init(int dev_a, int dev_b, GpuLink::Transport transport, size_t ma
       for (int q = 0; q < 2; q++) {
         const int qdev = (q == 0) ? dev_a : dev_b;
         const auto& rk = impl_->ranks[q];
-        const RankResources qrs{rk.event, rk.pinned, rk.pool, rk.scratch};
+        const RankResources qrs{rk.event, rk.pinned, rk.scratch};
         release_rank_resources(qdev, qrs, /*gate=*/false);
         impl_->ranks[q] = Impl::Rank{};
       }
@@ -429,7 +382,6 @@ bool GpuLink::init(int dev_a, int dev_b, GpuLink::Transport transport, size_t ma
     // Commit this rank's resources into the impl.
     impl_->ranks[r].event = rs.event;
     impl_->ranks[r].pinned = rs.pinned;
-    impl_->ranks[r].pool = rs.pool;
     impl_->ranks[r].scratch = rs.scratch;
   }
 
@@ -451,7 +403,7 @@ bool GpuLink::shutdown() {
     for (int r = 0; r < 2; r++) {
       const int dev = (r == 0) ? impl_->dev_a : impl_->dev_b;
       const auto& rk = impl_->ranks[r];
-      const RankResources rs{rk.event, rk.pinned, rk.pool, rk.scratch};
+      const RankResources rs{rk.event, rk.pinned, rk.scratch};
       if (dev >= 0) release_rank_resources(dev, rs, /*gate=*/false);
       impl_->ranks[r] = Impl::Rank{};
     }
@@ -459,19 +411,19 @@ bool GpuLink::shutdown() {
     return true;
   }
   // Contract: the caller has drained every stream it posted ops on. This call may (and
-  // must) block: it is where the per-init pool leak gate runs.
+  // must) block: it is where a failed free is reported.
   bool ok = true;
   for (int r = 0; r < 2; r++) {
     const int dev = (r == 0) ? impl_->dev_a : impl_->dev_b;
     const auto& rk = impl_->ranks[r];
-    const RankResources rs{rk.event, rk.pinned, rk.pool, rk.scratch};
+    const RankResources rs{rk.event, rk.pinned, rk.scratch};
     if (!release_rank_resources(dev, rs, /*gate=*/true)) ok = false;
     impl_->ranks[r] = Impl::Rank{};
   }
   impl_->ready = false;
   impl_->max_bytes = 0;
   if (!ok)
-    GLINK_LOG("[gpu_link] shutdown: FAIL - per-init pool leak gate tripped (see lines above)\n");
+    GLINK_LOG("[gpu_link] shutdown: FAIL - a resource free failed (see lines above)\n");
   return ok;
 }
 

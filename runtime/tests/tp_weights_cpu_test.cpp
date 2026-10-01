@@ -329,6 +329,12 @@ static const uint8_t* dev_read(const void* src, size_t n) {
 }
 
 static void check_bytes(const char* what, const uint8_t* got, const uint8_t* want, size_t n) {
+    if (got == nullptr) {
+        ++failures;
+        std::printf("FAIL %s: device read failed (null weight pointer or cudaMemcpy error: %s)\n",
+                    what, cudaGetErrorString(cudaGetLastError()));
+        return;
+    }
     if (std::memcmp(got, want, n) != 0) {
         ++failures;
         std::printf("FAIL %s: mismatch in %zu bytes\n", what, n);
@@ -438,6 +444,7 @@ static void test_gpu_oneshot() {
             std::memcpy(&expv[row * 128], fbytes[2].data() + row * 128, 64);
         check_bytes("r0 lm_head rows[0,32)", dev_read(w.lm_head, 8192), expv.data(), expv.size());
         // down: Rows [0,64) over d0=128, 64 slow rows (row stride 256 B).
+        expv.assign(16384, 0);  // 64 rows x 256 B - larger than the embed/lm buffer above
         for (int row = 0; row < 64; ++row)
             std::memcpy(&expv[row * 256], fbytes[14].data() + row * 256, 128);
         check_bytes("r0 layer_0.down rows[0,64)", dev_read(w.layers[0].down, 16384), expv.data(),
@@ -476,6 +483,7 @@ static void test_gpu_oneshot() {
         for (int row = 0; row < 64; ++row)
             std::memcpy(&expv[row * 128], fbytes[2].data() + row * 128 + 64, 64);
         check_bytes("r1 lm_head rows[32,64)", dev_read(w.lm_head, 8192), expv.data(), expv.size());
+        expv.assign(16384, 0);  // 64 rows x 256 B
         for (int row = 0; row < 64; ++row)
             std::memcpy(&expv[row * 256], fbytes[14].data() + row * 256 + 128, 128);
         check_bytes("r1 layer_0.down rows[64,128)", dev_read(w.layers[0].down, 16384), expv.data(),

@@ -393,12 +393,13 @@ void test_gpu_windowing() {
     // single-AR references into full arenas (WA0/WA1 below are arenas[3]/[4] reused full),
     // then the new v0/vloc batched launches into the per-seq window arenas, and the unsplit
     // (vloc=0) invariance into full arenas.
-    auto single_ref = [&](float* arena) {
+    // Batched row i consumes token t0 + i, so each sequence's reference steps its own token.
+    auto single_ref = [&](float* arena, int t) {
         cudaMemset(arena, 0, arena_n * 4);
-        ar_step(dq, dk, dv, da, db, ddt, daa, arena, drefout, 0, 0, kQ, kV);
+        ar_step(dq, dk, dv, da, db, ddt, daa, arena, drefout, t, 0, kQ, kV);
     };
-    single_ref(arenas[3]);   // seq0 reference
-    single_ref(arenas[4]);   // seq1 reference
+    single_ref(arenas[3], 0);   // seq0 reference (token 0)
+    single_ref(arenas[4], 1);   // seq1 reference (token 1)
     auto a0 = download(arenas[3], arena_n), a1 = download(arenas[4], arena_n);
     for (int w = 0; w < 2; w++) {
         const int v0 = w * 8;
@@ -409,8 +410,8 @@ void test_gpu_windowing() {
         set_states(src0, src1);
         if (!run_batched(dq, dk, dv, da, db, ddt, daa, dstates, drefout, 0, v0, 8, false)) return;
         auto g0 = download(src0, win_n), g1 = download(src1, win_n);
-        std::vector<float> r0(a0.begin() + v0 * kHD, a0.begin() + (v0 + 8) * kHD);
-        std::vector<float> r1(a1.begin() + v0 * kHD, a1.begin() + (v0 + 8) * kHD);
+        std::vector<float> r0(a0.begin() + (size_t)v0 * kHD * kHD, a0.begin() + (size_t)(v0 + 8) * kHD * kHD);
+        std::vector<float> r1(a1.begin() + (size_t)v0 * kHD * kHD, a1.begin() + (size_t)(v0 + 8) * kHD * kHD);
         char tag[64];
         std::snprintf(tag, sizeof tag, "batched v0=%d vloc=8 seq0 vs single-AR", v0);
         failures += compare_states(g0, r0, tag, 1e-4f);

@@ -12,7 +12,7 @@
 //       waits on that event and peer-reads B's source — A must observe 999.0 (observing the
 //       pre-canary 2.0 means the event ordering is broken). The resulting sum must be 1000.0.
 //   (d) 100x init/teardown churn: transports alternate, 64 KiB max_bytes, one 4 KiB f32 op
-//       per iteration. Gates: every shutdown's pool leak gate must pass, and the test
+//       per iteration. Gates: every shutdown's resource-free gate must pass, and the test
 //       process's RSS growth must stay <= 16 MiB (the LLM is a separate process, so RSS is
 //       a clean leak signal). Per-card VRAM first/last is reported, not gated (the LLM
 //       churns the ~1 GiB free band, which would make tight VRAM gates flaky).
@@ -547,7 +547,7 @@ int main() {
         }
         const bool shut = link.shutdown();
         if (!shut)
-          std::printf("  (e) note: shutdown pool gate tripped for %s (report-only, not gated)\n", label);
+          std::printf("  (e) note: shutdown resource-free gate tripped for %s (report-only, not gated)\n", label);
       }
     }
   }
@@ -742,14 +742,16 @@ int main() {
 
         const bool shut = link.shutdown();
         if (!shut)
-          fail("(a) mode=%s dtype=%s: shutdown() tripped its per-init pool leak gate",
+          fail("(a) mode=%s dtype=%s: shutdown() tripped its per-init resource-free gate",
                transport_name(mode), dtype_name(dt));
         if (all && !g_failed)
           std::printf("[a] allreduce mode=%s dtype=%s: 6/6 cases PASS (5 sizes + in-place)\n",
                       transport_name(mode), dtype_name(dt));
         else if (!g_failed)
-          std::printf("[a] allreduce mode=%s dtype=%s: %d/6 cases (see FAIL lines above)\n",
-                      transport_name(mode), dtype_name(dt), passed);
+          // Hard gate: the "box condition" this was once excused as was the pool-scratch bug
+          // (in-place ops into the non-current rank's scratch rejected), reproducible on an idle box.
+          fail("(a) allreduce mode=%s dtype=%s: %d/6 cases (see FAIL lines above)",
+               transport_name(mode), dtype_name(dt), passed);
       }
     }
   }
@@ -829,7 +831,7 @@ int main() {
       }
       const bool shut = link.shutdown();
       if (!shut)
-        fail("(b) mode=%s: shutdown() tripped its per-init pool leak gate", transport_name(mode));
+        fail("(b) mode=%s: shutdown() tripped its per-init resource-free gate", transport_name(mode));
       if (all && !g_failed) {
         if (mode == Transport::Auto)
           std::printf("[b] maxreduce mode=%s: 7/7 cases PASS (5 sizes + tie-break canary)\n", transport_name(mode));
@@ -1006,7 +1008,7 @@ int main() {
 
       const bool gate_ok = link.shutdown();
       if (gate_ok) ++gates_ok;
-      else fail("(d) iter %d: shutdown pool leak gate tripped [%s]", i, transport_name(t));
+      else fail("(d) iter %d: shutdown resource-free gate tripped [%s]", i, transport_name(t));
     }
 
     const size_t rss1 = read_vrss_kb();
