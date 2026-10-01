@@ -69,6 +69,11 @@ public:
                             int vocab,
                             int hidden);
 
+    // (dual-GPU tp=2) The shared embedding is vocab-split: set_shared_weights' table holds only
+    // rows [0, local_rows) and the rest are rows [0, vocab - local_rows) of `hi_table` on device
+    // `hi_device`. local_rows = 0 (the default) means the shared table is whole.
+    void set_embed_split(int local_rows, const void* hi_table, int hi_device);
+
     // Reset draft KV length to 0.
     void reset();
 

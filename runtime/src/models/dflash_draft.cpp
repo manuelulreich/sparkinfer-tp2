@@ -335,6 +335,14 @@ struct DFlashDraftModel::Impl {
 
     // Shared target pointers
     const void* embed = nullptr;
+    // (dual-GPU) Vocab-split embedding: `embed` holds only rows [0, embed_rows) (the tp=2 leader's
+    // half); rows at or above it live in `embed_hi` on device `embed_hi_dev`, indexed from
+    // embed_rows. 0 = `embed` is the whole table (tp=1). Rows fetched from the peer are cached
+    // here -- the mask token is in every block and sits in the upper half on Qwen3.8.
+    int embed_rows = 0;
+    const void* embed_hi = nullptr;
+    int embed_hi_dev = -1;
+    std::unordered_map<int, bf16*> embed_hi_cache;
     const void* lm_head = nullptr;
     int lm_head_type = 0;
     int vocab = 0;
@@ -598,6 +606,14 @@ DFlashDraftModel::~DFlashDraftModel() {
 }
 
 const DFlashDraftConfig& DFlashDraftModel::config() const { return p_->cfg; }
+
+void DFlashDraftModel::set_embed_split(int local_rows, const void* hi_table, int hi_device) {
+    p_->embed_rows = (local_rows > 0 && hi_table) ? local_rows : 0;
+    p_->embed_hi = p_->embed_rows ? hi_table : nullptr;
+    p_->embed_hi_dev = p_->embed_rows ? hi_device : -1;
+    // The cached rows came from the previous table; they are owned allocations, so only forget them.
+    p_->embed_hi_cache.clear();
+}
 
 void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head,
                                          int lm_head_type, int vocab, int hidden) {
@@ -1163,7 +1179,36 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     } else {
         cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
     }
-    kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
+    if (s.embed_rows > 0) {
+        // Split table: gather the rows this device owns (zeros elsewhere), then copy each upper-
+        // half row in from the peer's half -- the same bytes, so the embedding is bit-identical.
+        kernels::launch_embedding_vocab_window(s.d_ids, s.embed, s.noise, BW, H, 0, s.embed_rows, st);
+        int dev = 0;
+        cu(cudaGetDevice(&dev), "embed split device");
+        for (int i = 0; i < BW; i++) {
+            const int id = noise_ids[i];
+            if (id < s.embed_rows) continue;
+            const bf16* src = static_cast<const bf16*>(s.embed_hi) + (size_t)(id - s.embed_rows) * H;
+            bf16* dst = s.noise + (size_t)i * H;
+            auto it = s.embed_hi_cache.find(id);
+            if (it == s.embed_hi_cache.end() && s.embed_hi_cache.size() < 4096) {
+                bf16* row = s.alloc<bf16>((size_t)H);
+                if (row) {
+                    cu(cudaMemcpyPeer(row, dev, src, s.embed_hi_dev, (size_t)H * sizeof(bf16)),
+                       "embed split fetch");
+                    it = s.embed_hi_cache.emplace(id, row).first;
+                }
+            }
+            if (it != s.embed_hi_cache.end())
+                cu(cudaMemcpyAsync(dst, it->second, (size_t)H * sizeof(bf16),
+                                   cudaMemcpyDeviceToDevice, st), "embed split row");
+            else
+                cu(cudaMemcpyPeerAsync(dst, dev, src, s.embed_hi_dev, (size_t)H * sizeof(bf16), st),
+                   "embed split peer row");
+        }
+    } else {
+        kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
+    }
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
     // fc.weight is [H, n_cap*H] (out, in). Loop gemv per row.

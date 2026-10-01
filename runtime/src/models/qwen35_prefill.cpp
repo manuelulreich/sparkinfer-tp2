@@ -406,7 +406,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // that starts at zero. Both Muse kernels now take q_pos0 and mask on the absolute
         // position, so a windowed ingest is exact -- and above prefill_single_pass_max_tokens()
         // that is the difference between the batched path and the token loop for the WHOLE prompt.
-        if (s.capture_dst && s.capture_layers && s.n_capture > 0) return -1;  // DSpark capture rows
+        // DSpark capture rows used to refuse here; the capture now offsets by pos0 (see the layer
+        // loop), and a refusal would be leader-only at tp=2 (the peer never captures), leaving the
+        // peer's pass waiting on a rendezvous the leader never joins.
     }
 
     // A pass that starts at position zero must start its recurrent GDN state from zero,
@@ -943,6 +945,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             while ((FC >> 1) >= kMinFfnChunk &&
                    (size_t)2 * (size_t)FC * (size_t)ffn * sizeof(bf16) > avail)
                 FC >>= 1;
+            // tp: FC came from this card's free memory, and the FFN all-reduces once per chunk
+            // (and the decline below depends on FC), so both ranks must take the same value.
+            if (tp_active) FC = tp_prefill_agree_min(FC);
             if (FC != fc_before)
                 fprintf(stderr, "[prefill] ffn chunk %d -> %d (ctx=%d, free=%zu MB) to keep the "
                                 "batched pass\n", fc_before, FC, N, fb >> 20);
@@ -976,6 +981,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
     pf_vram("after dense arena");
+    if (tp_active) a.ok = tp_prefill_agree_min(a.ok ? 1 : 0) != 0;   // both ranks fall back, or neither
     if (!a.ok) {
         // Report the numbers, not just the fact: this fallback costs ~50x at long context and the
         // old message gave no way to tell a genuinely-too-small card from a chunk set too large.
@@ -1154,6 +1160,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return !(e && e[0] == '0');
     }();
     int* sk_p = want_sk ? a8.alloc<int>((size_t)N * maxNO) : nullptr;
+    if (tp_active && need_i8) a8.ok = tp_prefill_agree_min(a8.ok ? 1 : 0) != 0;
     if (need_i8 && !a8.ok) {
         a8.free_all();
         A_i8p = nullptr;
@@ -1176,6 +1183,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         lm_q8 = a8.alloc<signed char>((size_t)H + 32);
         lm_ad = a8.alloc<float>((size_t)(H >> 5) + 1);
         lm_as = a8.alloc<float>((size_t)(H >> 5) + 1);
+        if (tp_active) a8.ok = tp_prefill_agree_min(a8.ok ? 1 : 0) != 0;
         if (!a8.ok) {
             a.free_all(); a8.free_all();
             fprintf(stderr, "[prefill] lm-head seed scratch alloc failed (ctx=%d) -> fallback\n", N);
@@ -3932,10 +3940,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (capture_dflash) {
             for (int slot = 0; slot < s.n_capture; ++slot) {
                 if (s.capture_layers[slot] != L) continue;
-                const int first = std::max(0, s.capture_start);
+                // Row i is absolute position pos0 + i, and capture row 0 is position
+                // capture_start -- so a windowed pass (pos0 > 0) lands at its own offset.
+                const int first = std::max(0, s.capture_start - pos0);
                 if (first >= N) continue;
                 char* dst = static_cast<char*>(s.capture_dst) +
-                            (size_t)slot * H * sizeof(bf16);
+                            ((size_t)(pos0 + first - s.capture_start) * s.n_capture + slot) *
+                                H * sizeof(bf16);
                 dflash_kernels::launch_capture_rows(
                     x + (size_t)first * H, dst, N - first, H, s.n_capture * H, st);
             }

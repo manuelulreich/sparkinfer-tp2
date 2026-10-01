@@ -821,6 +821,10 @@ private:
     // (dual-GPU) Decode epilogue: in-place f32 sum all-reduce of the [vocab] logits row (each
     // rank holds its vocab half, zeros elsewhere), leaving the full row on both ranks.
     void tp_allreduce_logits();
+    // (dual-GPU WP-12) DSpark batched verify at tp=2: n consecutive rows of the active sequence,
+    // per-row argmax bit-identical to forward_token_tp; returns the accepted-prefix length after
+    // committing exactly those rows' GDN state, or -1 when declined (nothing changed).
+    int verify_rows_tp(const int* ids, int n, int start_pos, void* capture_dst, int* out_argmax);
     // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or
     // null when this is not the attached group leader or the call is nested inside an already
     // mirrored one (only the outermost call mirrors; see TpMirrorScope in qwen35.cpp).
@@ -838,6 +842,9 @@ private:
 // for that post before enqueuing anything that consumes the sum. No attached link
 // (a tp=1 process) makes this a no-op, exactly like tp_allreduce_row for a peer rank.
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems);
+// (dual-GPU) Both ranks of a mirrored pass pass their own value at the same point; both get the
+// minimum (tp=1: v). For rank-local, memory-driven choices that must not diverge.
+int tp_prefill_agree_min(int v);
 
 // f32 twin of tp_prefill_allreduce_bf16 (same rendezvous): the prefill seed's zero-padded
 // [vocab] logits row, summed in place so both ranks hold the full row.

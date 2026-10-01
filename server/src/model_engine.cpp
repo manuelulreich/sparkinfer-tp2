@@ -740,7 +740,12 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     // Vision tower. Absence is NOT an error -- a text-only checkpoint has no vision_config and
     // has_vision() stays false -- but a tower that is present and fails to load is reported here
     // rather than left to surface as a confusing per-request failure much later.
-    if (is_dir) {
+    // SPARKINFER_VISION=0 skips the tower: it sits on the first card (~1 GB), which at tp=2 with a
+    // DSpark draft is the card that runs out of room first.
+    const char* vision_env = getenv("SPARKINFER_VISION");
+    const bool vision_off = vision_env && vision_env[0] == '0';
+    if (vision_off) fprintf(stderr, "[sparkinfer-server] vision tower: off (SPARKINFER_VISION=0)\n");
+    if (is_dir && !vision_off) {
         std::string verr;
         if (!qwen_vision_config_from_hf_json(gguf_path, impl_->vcfg, verr)) {
             fprintf(stderr, "[sparkinfer-server] vision config malformed: %s\n", verr.c_str());
