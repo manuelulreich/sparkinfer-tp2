@@ -1254,7 +1254,80 @@ static GpuLink* g_tp_prefill_link = nullptr;
 static int g_tp_prefill_dev[2] = {-1, -1};
 static cudaStream_t g_tp_prefill_stream[2] = {nullptr, nullptr};
 static void* g_tp_prefill_buf[2] = {nullptr, nullptr};
-static std::atomic<unsigned long long> g_tp_prefill_calls[2] = {0, 0};
+
+// (dual-GPU) Host rendezvous for the leader-issued link ops (decode AR rows, the epilogue
+// maxreduces, the prefill o_proj AR). One GpuLink call posts the reduce on BOTH ranks' streams,
+// so the leader may post only once the peer has enqueued the producers of its input, and the
+// peer may enqueue the consumers of the result only once the leader has posted onto its stream
+// -- otherwise the reduce lands at an arbitrary point of the peer's stream. Both ranks run the
+// identical sequence of link ops, so the n-th peer arrival pairs with the n-th leader post. A
+// rank that falls out of step (a branch taken on one rank only) times out loudly instead of
+// hanging the server.
+static std::atomic<unsigned long long> g_tp_peer_arrived{0};
+static std::atomic<unsigned long long> g_tp_leader_seq{0};
+static std::atomic<unsigned long long> g_tp_leader_posted{0};
+
+static bool tp_spin_until(const std::atomic<unsigned long long>& v, unsigned long long target,
+                          const char* what) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (v.load(std::memory_order_acquire) < target) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) {
+            fprintf(stderr, "[tp] rendezvous timeout (%s, op %llu): the ranks are out of step\n",
+                    what, target);
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+// Peer side: "my producers are enqueued", then hold until the leader has posted the op.
+static void tp_peer_rendezvous(const char* what) {
+    const unsigned long long n = g_tp_peer_arrived.fetch_add(1, std::memory_order_acq_rel) + 1;
+    tp_spin_until(g_tp_leader_posted, n, what);
+}
+
+// Leader side: wait for the peer's arrival, post the op, then release the peer.
+template <class F>
+static void tp_leader_rendezvous(const char* what, F&& post) {
+    const unsigned long long n = g_tp_leader_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (tp_spin_until(g_tp_peer_arrived, n, what)) post();
+    g_tp_leader_posted.store(n, std::memory_order_release);
+}
+
+// (dual-GPU) Rank-1 mirroring. The serving engine drives only the rank-0 model; every
+// state-changing public call (sessions, penalties, prompt ingest, decode) is replayed on the
+// rank-1 model by TpMirrorScope: the peer's call runs on a one-shot worker thread (bound once to
+// the peer's device -- the op path itself never setDevice) concurrently with the leader's own
+// body, which the rendezvous above needs, and is joined before the leader returns. The
+// thread-local depth makes only the OUTERMOST call mirror (ingest -> prefill -> ... must not
+// replay twice); a null peer just holds the depth, which is also how a leader-only call is made.
+static thread_local int t_tp_mirror_depth = 0;
+
+struct TpMirrorScope {
+    std::thread worker;
+    template <class F>
+    TpMirrorScope(Qwen35Model* peer, F&& fn) {
+        ++t_tp_mirror_depth;
+        if (!peer) return;
+        worker = std::thread([peer, fn = std::forward<F>(fn)]() mutable {
+            const int dev = peer->tp_rank_view().device;
+            if (dev >= 0) cu(cudaSetDevice(dev), "tp mirror setDevice");
+            t_tp_mirror_depth = 1;
+            fn(*peer);
+        });
+    }
+    ~TpMirrorScope() {
+        if (worker.joinable()) worker.join();
+        --t_tp_mirror_depth;
+    }
+    TpMirrorScope(const TpMirrorScope&) = delete;
+    TpMirrorScope& operator=(const TpMirrorScope&) = delete;
+};
+
+// Replays `call` (a member call expression) on the peer for the rest of the enclosing scope.
+#define TP_MIRROR(...) \
+    TpMirrorScope tp_mirror_scope_(tp_mirror_peer(), [&](Qwen35Model& tp_peer_) { (void)tp_peer_.__VA_ARGS__; })
 
 Qwen35Model::~Qwen35Model() {
     // Mirror the ctor's one-time bind: cudaFree is device-bound, so a split instance must free
@@ -1512,6 +1585,7 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
 std::recursive_mutex& Qwen35Model::device_mutex() { return p_->device_mu; }
 
 bool Qwen35Model::set_pending_vision(const float* emb, const int* positions, int n_img, int hidden) {
+    TP_MIRROR(set_pending_vision(emb, positions, n_img, hidden));
     Impl& s = *p_;
     clear_pending_vision();
     if (!emb || !positions || n_img <= 0) return false;
@@ -1532,6 +1606,7 @@ bool Qwen35Model::set_pending_vision(const float* emb, const int* positions, int
 }
 
 void Qwen35Model::clear_pending_vision() {
+    TP_MIRROR(clear_pending_vision());
     Impl& s = *p_;
     if (s.d_vision_emb) cudaFree(s.d_vision_emb);
     if (s.d_vision_pos) cudaFree(s.d_vision_pos);
@@ -1539,6 +1614,7 @@ void Qwen35Model::clear_pending_vision() {
 }
 
 bool Qwen35Model::set_pending_mrope(const int* positions, int n_tokens, int decode_offset) {
+    TP_MIRROR(set_pending_mrope(positions, n_tokens, decode_offset));
     Impl& s = *p_;
     clear_pending_mrope();
     if (!positions || n_tokens <= 0) return false;
@@ -1556,13 +1632,17 @@ bool Qwen35Model::set_pending_mrope(const int* positions, int n_tokens, int deco
 }
 
 void Qwen35Model::clear_pending_mrope() {
+    TP_MIRROR(clear_pending_mrope());
     Impl& s = *p_;
     if (s.d_mrope_pos) cudaFree(s.d_mrope_pos);
     s.d_mrope_pos = nullptr;
     s.mrope_n = 0;
 }
 
-void Qwen35Model::reset_mrope_offset() { p_->mrope_pos_offset = 0; }
+void Qwen35Model::reset_mrope_offset() {
+    TP_MIRROR(reset_mrope_offset());
+    p_->mrope_pos_offset = 0;
+}
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
                                unsigned long long seed, unsigned long long sample_step,
@@ -1570,9 +1650,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                float presence_penalty, float frequency_penalty) {
     // (dual-GPU WP-9) tp=2: the weights are split across the GpuLink pair, so the step runs
     // on the per-rank twin instead; this guard is the ONLY tp>1 delta on the tp=1 path.
-    if (tp_active())
+    if (tp_active()) {
+        TP_MIRROR(forward_token(token_id, position, sample, temperature, seed, sample_step,
+                                top_k, top_p, presence_penalty, frequency_penalty));
         return forward_token_tp(token_id, position, sample, temperature, seed, sample_step,
                                  top_k, top_p, presence_penalty, frequency_penalty);
+    }
     // Held for the whole call, not just the capture window. The window has four exits
     // (three EndCapture sites plus the replay-instead-of-capture early path), and a lock that
     // has to be released on every one of them is a lock that will eventually be leaked by an
@@ -3109,6 +3192,12 @@ bool Qwen35Model::tp_active() const {
 
 int Qwen35Model::tp_rank() const { return p_->tp_rank; }
 
+Qwen35Model* Qwen35Model::tp_mirror_peer() const {
+    const Impl& s = *p_;
+    if (t_tp_mirror_depth != 0 || s.tp_rank != 0 || !s.tp_link || s.tp_peers.size() != 2) return nullptr;
+    return s.tp_peers[1];
+}
+
 Qwen35Model::TpRankView Qwen35Model::tp_rank_view() const {
     const Impl& s = *p_;
     TpRankView v;
@@ -3246,22 +3335,8 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
         }
     }
 
-    // The group leader (rank 0) mirrors this call onto the peer rank on a one-shot worker thread;
-    // the peer runs this same body on its own device and never spawns (it is not rank 0), so there
-    // is exactly one mirror per op. The leader joins the worker before returning.
-    std::thread peer_worker;
-    if (s.tp_rank == 0 && s.tp_peers.size() == 2 && s.tp_peers[1]) {
-        Qwen35Model* peer = s.tp_peers[1];
-        peer_worker = std::thread([peer, token_id, position, sample, temperature, seed, sample_step,
-                                    top_k, top_p, presence_penalty, frequency_penalty]() {
-            // One-time device bind for this worker (lifecycle only): the peer model was built on
-            // its own card, but this thread has never touched it. No setDevice on the op path.
-            const int dev = peer->tp_rank_view().device;
-            if (dev >= 0) cu(cudaSetDevice(dev), "tp worker setDevice");
-            peer->forward_token_tp(token_id, position, sample, temperature, seed, sample_step,
-                                    top_k, top_p, presence_penalty, frequency_penalty);
-        });
-    }
+    // The peer rank runs this same body concurrently: forward_token / decode_packed replay the
+    // public call on it (TpMirrorScope), and the link ops below rendezvous the two.
 
     // -- op entry: exchange the embedding row (design item 3) --
     // The embedding table is row-split on the vocab axis, each rank holding V/2 CONSECUTIVE rows
@@ -3327,11 +3402,10 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
     const int off = (int)s.tp_rank * Vr;      // global base of this rank's window
     float* logits_h = s.tp_logits + off;     // this rank's half of the arena
 
-    // !sample: the tp=1 body never runs lm_head on this path either -- sync, join, return the
+    // !sample: the tp=1 body never runs lm_head on this path either -- sync and return the
     // input token (no logits needed).
     if (!sample) {
         cu(cudaStreamSynchronize(st), "tp noprobs sync");
-        if (peer_worker.joinable()) peer_worker.join();
         return token_id;
     }
 
@@ -3471,7 +3545,6 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
     cu(cudaMemcpyAsync(s.d_chosen_logit, s.h_exch, sizeof(float), cudaMemcpyHostToDevice, st), "tp chosen logit");
 
     cu(cudaStreamSynchronize(st), "tp final sync");
-    if (peer_worker.joinable()) peer_worker.join();
     return token;
 }
 
@@ -4035,9 +4108,10 @@ void Qwen35Model::tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow) {
     Impl& s = *p_;
     // Only the group leader (rank 0) issues the all-reduce: a single GpuLink::allreduce posts
     // the reduce on BOTH ranks' streams (see reduce_impl in gpu_link.cpp), so the peer must not
-    // issue a second one. The peer's call is therefore a deliberate no-op.
-    if (s.tp_rank != 0) return;
-    if (!s.tp_link || s.tp_peers.size() != 2 || !s.tp_peers[1]) return;
+    // issue a second one. The peer's call only takes part in the rendezvous.
+    if (!s.tp_link || s.tp_peers.size() != 2) return;
+    if (s.tp_rank != 0) { tp_peer_rendezvous("decode allreduce"); return; }
+    if (!s.tp_peers[1]) return;
     const TpRankView pv = s.tp_peers[1]->tp_rank_view();
     uint16_t* p_row = is_xrow ? pv.xrow : pv.ar;
     GpuLink::RankRef self_ref{s.device, s.stream, row, row};
@@ -4046,19 +4120,19 @@ void Qwen35Model::tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow) {
     // match the link's (dev_a, dev_b) regardless of which physical rank this instance is.
     GpuLink::RankRef a = self_ref, b = peer_ref;
     if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
-    if (!s.tp_link->allreduce(a, b, elems * sizeof(uint16_t), GpuLink::Dtype::BFloat16))
-        cu(cudaErrorUnknown, "tp allreduce");
+    tp_leader_rendezvous("decode allreduce", [&] {
+        if (!s.tp_link->allreduce(a, b, elems * sizeof(uint16_t), GpuLink::Dtype::BFloat16))
+            cu(cudaErrorUnknown, "tp allreduce");
+    });
 }
 
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
     // Prefill o_proj partial (S7a-1): each rank's pass calls this with its per-pass [N][H] buffer
     // right after enqueuing its K-compact o_proj GEMM. The call registers the buffer in the
-    // caller's process-static slot; the peer's call is registration-only, because one link call
-    // posts on BOTH ranks' streams, so only the leader may issue the reduce (as in
-    // tp_allreduce_row). The leader spin-waits for the peer's registration before posting, which
-    // at least guarantees both GEMMs are enqueued. The P2P read of the peer buffer carries no
-    // cross-context event wait -- the same pre-existing race profile as the decode AR rows,
-    // recorded here, never fixed.
+    // caller's process-static slot. One link call posts on BOTH ranks' streams, so only the
+    // leader issues the reduce (as in tp_allreduce_row), inside the two-way host rendezvous: it
+    // posts after the peer has enqueued its GEMM, and the peer enqueues nothing further until the
+    // post has landed on its stream (GpuLink's entry events then order the copy after the GEMM).
     if (!g_tp_prefill_link || !in_out || elems == 0) return;
     if (g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return;
     int dev = -1;
@@ -4067,17 +4141,15 @@ void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
         return;
     const int r = (dev == g_tp_prefill_dev[0]) ? 0 : 1;
     g_tp_prefill_buf[r] = in_out;
-    g_tp_prefill_calls[r].fetch_add(1, std::memory_order_seq_cst);
-    if (r != 0) return;  // peer: registration only
-    const unsigned long long mine = g_tp_prefill_calls[0].load(std::memory_order_seq_cst);
-    while (g_tp_prefill_calls[1].load(std::memory_order_seq_cst) < mine)
-        std::this_thread::yield();
-    GpuLink::RankRef a{g_tp_prefill_dev[0], g_tp_prefill_stream[0], g_tp_prefill_buf[0],
-                       g_tp_prefill_buf[0]};
-    GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_prefill_stream[1], g_tp_prefill_buf[1],
-                       g_tp_prefill_buf[1]};
-    if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
-        cu(cudaErrorUnknown, "tp prefill allreduce");
+    if (r != 0) { tp_peer_rendezvous("prefill allreduce"); return; }
+    tp_leader_rendezvous("prefill allreduce", [&] {
+        GpuLink::RankRef a{g_tp_prefill_dev[0], g_tp_prefill_stream[0], g_tp_prefill_buf[0],
+                           g_tp_prefill_buf[0]};
+        GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_prefill_stream[1], g_tp_prefill_buf[1],
+                           g_tp_prefill_buf[1]};
+        if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
+            cu(cudaErrorUnknown, "tp prefill allreduce");
+    });
 }
 
 void Qwen35Model::tp_maxreduce_f32(int kind, size_t elems) {
@@ -4086,11 +4158,11 @@ void Qwen35Model::tp_maxreduce_f32(int kind, size_t elems) {
     // reduce on BOTH ranks' streams, so the peer's call is a deliberate no-op (same as
     // tp_allreduce_row). Ranks' f32 buffers: kind 0 in==out==tp_exch on both ranks (the
     // disjoint pack makes the elementwise max exact); kind 1 in=tp_exch2[0..256) and
-    // out=tp_exch2[256..512) on both ranks. The P2P transport reads the peer's per-step
-    // written buffer with no cross-context event wait (pinned staging does) -- the same
-    // pre-existing profile as the AR-A/AR-B rows, recorded here, never fixed.
-    if (s.tp_rank != 0) return;
-    if (!s.tp_link || s.tp_peers.size() != 2 || !s.tp_peers[1]) return;
+    // out=tp_exch2[256..512) on both ranks. Ordered against both ranks' producers and consumers
+    // by the same host rendezvous as tp_allreduce_row.
+    if (!s.tp_link || s.tp_peers.size() != 2) return;
+    if (s.tp_rank != 0) { tp_peer_rendezvous("maxreduce"); return; }
+    if (!s.tp_peers[1]) return;
     const TpRankView pv = s.tp_peers[1]->tp_rank_view();
     GpuLink::RankRef self_ref, peer_ref;
     if (kind == 0) {
@@ -4104,8 +4176,10 @@ void Qwen35Model::tp_maxreduce_f32(int kind, size_t elems) {
     // match the link's (dev_a, dev_b) regardless of which physical rank this instance is.
     GpuLink::RankRef a = self_ref, b = peer_ref;
     if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
-    if (!s.tp_link->maxreduce(a, b, elems * sizeof(float), GpuLink::Dtype::Float32))
-        cu(cudaErrorUnknown, "tp maxreduce");
+    tp_leader_rendezvous("maxreduce", [&] {
+        if (!s.tp_link->maxreduce(a, b, elems * sizeof(float), GpuLink::Dtype::Float32))
+            cu(cudaErrorUnknown, "tp maxreduce");
+    });
 }
 
 namespace {
@@ -4504,6 +4578,9 @@ bool Qwen35Model::prompt_matches_prefix(const std::vector<int>& prompt) const {
 int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chunk_limit,
                                      int* out_pos, bool want_seed_logprob,
                                      bool allow_batched_resume) {
+    int tp_peer_pos = 0;
+    TP_MIRROR(ingest_prompt_range(ids, start, end, chunk_limit, out_pos ? &tp_peer_pos : nullptr,
+                                  want_seed_logprob, allow_batched_resume));
     Impl& s = *p_;
     if (!ids || end <= start) {
         if (out_pos) *out_pos = start;
@@ -4599,6 +4676,7 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
 }
 
 bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
+    TP_MIRROR(cache_prefix(tokens));
     // Runs on the HTTP thread while the continuous-batch worker may be mid-forward_token.
     // Everything below touches the device -- and invalidate_decode_graph() calls
     // cudaGraphExecDestroy/cudaGraphDestroy, which would free the very graph the worker is
@@ -4647,6 +4725,7 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
 }
 
 bool Qwen35Model::restore_prefix_state() {
+    TP_MIRROR(restore_prefix_state());
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!s.prefix_active) return false;
@@ -4672,6 +4751,7 @@ int Qwen35Model::prefix_block_count() const {
 }
 
 void Qwen35Model::clear_prefix_cache() {
+    TP_MIRROR(clear_prefix_cache());
     // Runs on the HTTP thread while the continuous-batch worker may be mid-forward_token.
     // Everything below touches the device -- and invalidate_decode_graph() calls
     // cudaGraphExecDestroy/cudaGraphDestroy, which would free the very graph the worker is
@@ -4697,6 +4777,7 @@ void Qwen35Model::clear_prefix_cache() {
 }
 
 void Qwen35Model::release_prefix_session() {
+    TP_MIRROR(release_prefix_session());
     // Runs on the HTTP thread while the continuous-batch worker may be mid-forward_token.
     // Everything below touches the device -- and invalidate_decode_graph() calls
     // cudaGraphExecDestroy/cudaGraphDestroy, which would free the very graph the worker is
@@ -4806,6 +4887,7 @@ void Qwen35Model::release_lm_head_fp4() {
 
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
                                  int pos0) {
+    TP_MIRROR(prefill_batched(prompt_ids, n, want_seed_logprob, pos0));
     Impl& s = *p_;
     // A long batched prefill needs the scratch arena more than a wide decode needs the head, and
     // on a 32-GB card the two do not both fit: measured at ctx=32768 the arena wants 3.6 GB and
@@ -4933,6 +5015,9 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
 
 bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts,
                                         const int* lens, int n_prompts, int* seeds) {
+    std::vector<int> tp_peer_seeds(n_prompts > 0 ? n_prompts : 0);
+    TP_MIRROR(ingest_prompts_packed(seq_ids, prompts, lens, n_prompts,
+                                    seeds ? tp_peer_seeds.data() : nullptr));
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!seq_ids || !prompts || !lens || !seeds || n_prompts < 2) return false;
@@ -4996,6 +5081,9 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
 
 int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want_seed_logprob,
                                          int* out_done) {
+    int tp_peer_done = 0;
+    TP_MIRROR(prefill_batched_chunked(prompt_ids, n, want_seed_logprob,
+                                      out_done ? &tp_peer_done : nullptr));
     if (out_done) *out_done = 0;
     if (!prompt_ids || n <= 0) return -1;
     Impl& s = *p_;
@@ -5058,6 +5146,31 @@ int Qwen35Model::session_token_budget(size_t prompt_len, int max_new, int max_se
 
 uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
                                    const std::vector<int>* shared_prefix_blocks) {
+    // (dual-GPU) Both ranks open the session; their per-model id counters advance in lockstep, so
+    // the ids agree. If one rank could not open (its pool differs) or the ids diverge, undo the
+    // side that did open -- leader-only, since the other rank does not know that id -- and fail.
+    if (Qwen35Model* peer = tp_mirror_peer()) {
+        uint64_t peer_id = 0, id = 0;
+        bool peer_alloc_failed = false;
+        {
+            TpMirrorScope m(peer, [&](Qwen35Model& pm) {
+                peer_id = pm.open_session(num_tokens, &peer_alloc_failed, shared_prefix_blocks);
+            });
+            id = open_session(num_tokens, alloc_failed, shared_prefix_blocks);
+        }
+        if (id == peer_id) return id;
+        fprintf(stderr, "[tp] open_session: ranks disagree (rank0 id %llu, rank1 id %llu); undoing\n",
+                (unsigned long long)id, (unsigned long long)peer_id);
+        if (id) {
+            TpMirrorScope solo(nullptr, [](Qwen35Model&) {});
+            close_session(id);
+        }
+        if (peer_id) {
+            TpMirrorScope m(peer, [&](Qwen35Model& pm) { pm.close_session(peer_id); });
+        }
+        if (alloc_failed && peer_alloc_failed) *alloc_failed = true;
+        return 0;
+    }
     // cudaMalloc + kv->allocate (block-table copy on the legacy stream). submit_locked already
     // holds this lock around its call, but guard here too so a future caller cannot miss it --
     // the mutex is recursive, so the nested acquisition is free.
@@ -5135,6 +5248,9 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
 
 int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int end,
                                         bool want_seed_logprob, int* out_done) {
+    int tp_peer_done = 0;
+    TP_MIRROR(prefill_batched_resume(prompt_ids, start, end, want_seed_logprob,
+                                     out_done ? &tp_peer_done : nullptr));
     if (out_done) *out_done = 0;
     if (!prompt_ids || start <= 0 || end <= start) return -1;
     Impl& s = *p_;
@@ -5176,6 +5292,8 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
 }
 
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
+    // (dual-GPU) A snapshot holds one rank's state only; prefix-cache snapshots are not tp-aware yet.
+    if (tp_active()) return false;
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!needs_linear_state(s.cfg)) {
@@ -5209,6 +5327,7 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
 }
 
 bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap) {
+    if (tp_active()) return false;   // see snapshot_recurrent_state
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!needs_linear_state(s.cfg)) return true;
@@ -5236,6 +5355,7 @@ bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateS
 void Qwen35Model::set_lmcache_bridge(BridgeClient* bridge) { p_->lmcache_bridge = bridge; }
 
 void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_tokens) {
+    TP_MIRROR(close_session(seq_id, nullptr));   // the LMCache store is leader-only
     // Device work (lmcache store reads KV, kv->free, buffer frees) reachable from the worker
     // while the HTTP thread may be in clear_prefix_cache()/cache_prefix(). Same lock as capture;
     // see device_mutex(). Recursive, so nesting under an already-held lock is fine.
@@ -5306,8 +5426,11 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                                 const uint64_t* seq_ids, int n, int* out_sampled) {
     // (dual-GPU WP-9) tp=2: same split-weights story as forward_token above -- the step runs on
     // the per-rank twin instead; this guard is the ONLY tp>1 delta on the tp=1 packed path.
-    if (tp_active())
+    if (tp_active()) {
+        std::vector<int> tp_peer_out(n > 0 ? n : 0);
+        TP_MIRROR(decode_packed(tokens, positions, seq_ids, n, tp_peer_out.data()));
         return decode_packed_tp(tokens, positions, seq_ids, n, out_sampled);
+    }
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled) return false;
     if (n < 1 || n > kQwen35MaxPackedRows) return false;
@@ -5466,6 +5589,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
 }
 
 void Qwen35Model::activate_session(uint64_t seq_id) {
+    TP_MIRROR(activate_session(seq_id));
     Impl& s = *p_;
     if (s.active_seq_id == seq_id) return;
     // Guards parked_graphs, which close_session() also mutates. The pre-existing code only
@@ -5558,6 +5682,7 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
 uint64_t Qwen35Model::active_session() const { return p_->active_seq_id; }
 
 void Qwen35Model::reset_penalty_counts(uint64_t seq_id) {
+    TP_MIRROR(reset_penalty_counts(seq_id));
     Impl& s = *p_;
     // Looked up via the sessions map directly, NOT s.penalty_counts (the "currently active"
     // pointer, which belongs to whatever the WORKER thread last swapped in via activate_session()
@@ -5571,6 +5696,7 @@ void Qwen35Model::reset_penalty_counts(uint64_t seq_id) {
 }
 
 void Qwen35Model::set_logit_bias_dense(uint64_t seq_id, const float* bias) {
+    TP_MIRROR(set_logit_bias_dense(seq_id, bias));
     Impl& s = *p_;
     std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
     auto it = s.sessions.find(seq_id);
@@ -5588,6 +5714,7 @@ void Qwen35Model::set_logit_bias_dense(uint64_t seq_id, const float* bias) {
 }
 
 void Qwen35Model::set_logit_bias(uint64_t seq_id, const std::vector<std::pair<int, float>>& bias) {
+    TP_MIRROR(set_logit_bias(seq_id, bias));
     Impl& s = *p_;
     // Looked up via the sessions map directly, same "HTTP-facing thread, not the worker's currently
     // active session" reasoning as reset_penalty_counts.
@@ -9855,6 +9982,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // on whole units; the result is a valid reduced [rows', cols'] tensor in
     // the source layout).
     auto nvfp4_units = [&](const TpSlice& sl, long div) {
+        // Only a Cols split runs along the packed axis; a Rows split selects whole rows of both
+        // streams, so its ranges are row indices and must not be rescaled (doing so gathered 1/2
+        // of the packed rows and 1/16 of the scale rows of every row-split NVFP4 weight).
+        if (sl.axis != tp::Axis::Cols) return sl.ranges;
         std::vector<tp::Range> u;
         for (const tp::Range& r : sl.ranges) u.push_back({r.begin / div, r.len / div});
         return u;
@@ -10054,8 +10185,12 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                 void* bf = ct_dequant_slice(prefix, rows, cols, sl);
                 return requant_q4k(bf, tp_owned_rc(rows, cols, sl), qtype);
             }
-            return ct_nvfp4_slice(prefix, rows, cols, sl, /*always_own=*/true,
-                                   gdn_prefill_fp4, fp4, fp4_sf, fp4_alpha);
+            // Tag the rank blob as NVFP4, exactly as the whole path (keep_nvfp4_native) does:
+            // left at its default 0, every consumer read the SI_NVFP4 payload as dense bf16.
+            const void* pay = ct_nvfp4_slice(prefix, rows, cols, sl, /*always_own=*/true,
+                                             gdn_prefill_fp4, fp4, fp4_sf, fp4_alpha);
+            if (pay) qtype = kernels::SI_QTYPE_NVFP4;
+            return pay;
         }
         const STTensor* w = st.tensor(prefix + ".weight");
         if (w && w->dtype == STDType::F8_E4M3) return ct_fp8_slice(prefix, rows, cols, sl, qtype);

@@ -712,7 +712,11 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         };
         const char* on = getenv("SPARKINFER_PREFIX_CACHE");
         const bool wanted = !(on && on[0] == '0');
-        if (wanted && sparkinfer::deterministic_mode()) {
+        if (wanted && impl_->tp_link) {
+            // The cache shares rank 0's KV blocks and snapshots one rank's recurrent state; neither
+            // is mirrored onto rank 1 yet (snapshot/restore refuse under tp).
+            fprintf(stderr, "[sparkinfer-server] prefix cache: off (tp=2: not tp-aware yet)\n");
+        } else if (wanted && sparkinfer::deterministic_mode()) {
             fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_DETERMINISTIC=1 -- a "
                             "request's output may not depend on what earlier requests cached)\n");
         } else if (wanted) {
@@ -1089,6 +1093,12 @@ bool ModelEngine::is_qwen38() const {
 }
 
 void ModelEngine::set_prefix_tokens(const std::vector<int>& tokens) {
+    if (impl_->tp_link && !tokens.empty()) {
+        // Session 0's prefix is reused through rank 0's KV manager directly (truncate_blocks / free
+        // in the batch engine), which rank 1 never sees.
+        fprintf(stderr, "[sparkinfer-server] shared prefix ignored: not supported at tp=2 yet\n");
+        return;
+    }
     std::lock_guard<std::mutex> lock(mu_);
     impl_->prefix_tokens = tokens;
 }

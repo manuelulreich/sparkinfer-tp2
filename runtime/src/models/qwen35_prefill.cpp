@@ -3038,7 +3038,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             auto rows_i8_direct = [](int t, int cols) {
                 return (t == 12 || t == 13 || t == 14) && (cols & 255) == 0;
             };
-            const bool ffn_i8 = (use_i8_ffn ||
+            // tp=2: this rank holds only its F/ffn_ranks slice of gate/up/down, and every arm below
+            // except the rank-width tp arm (tp_ffn) works on the full ffn width, so a split rank must
+            // take none of them (the 27B checkpoint loads native NVFP4 prefill FFN weights, which
+            // would otherwise route to the full-width FP4 arm and read past the rank's blobs).
+            const bool tp_ffn_split = tp_active && c.linear_v_heads / s.gdn_window.v_count > 1;
+            const bool ffn_i8 = !tp_ffn_split && (use_i8_ffn ||
                                  (ffn_wcache && rows_i8_direct(gate_pf_type, H) &&
                                   rows_i8_direct(up_pf_type, H) &&
                                   rows_i8_direct(down_pf_type, ffn))) &&
@@ -3052,7 +3057,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             };
             // Only where a full chunk fits the fused GEMM's M limit: past it every chunk declines
             // and re-materializes, and the down projection loses its fused residual add.
-            const bool ffn_qi8 = use_i8 && ffn_i8_stage && w.gate_rs && w.up_rs &&
+            const bool ffn_qi8 = !tp_ffn_split && use_i8 && ffn_i8_stage && w.gate_rs && w.up_rs &&
                 (!qb_dense_pass || FC <= kernels::pf_dense_gemm_qi8_max_m()) &&
                 kernels::pf_dense_gemm_qi8_supported(gate_pf_type);
             if (ffn_i8 && !ffn_qi8) {
@@ -3082,9 +3087,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // otherwise mix fused and unfused within one layer and a single post-loop add could not
             // be right for both. With this false the non-FP4 chunks write `ao` too, so one add at
             // the end covers every chunk.
-            const bool ffn_fp4_possible = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
+            const bool ffn_fp4_possible = !tp_ffn_split && gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
                                           w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
-            const bool ffn_fused = !c.muse_glimmer && !ffn_fp4_possible &&
+            const bool ffn_fused = !tp_ffn_split && !c.muse_glimmer && !ffn_fp4_possible &&
                                    resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
             // The FP4 down projection accumulates the residual in its own epilogue (see the GDN
             // out_proj above). Decided per LAYER, not per chunk, so the whole layer takes one
@@ -3114,7 +3119,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_norm_then_add(x + (size_t)fo * H, ao + (size_t)fo * H,
                                                   w.post_attn_norm, h + (size_t)fo * H, fn, H,
                                                   1e-8f, st);
-                const bool layer_fp4 = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
+                const bool layer_fp4 = !tp_ffn_split && gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
                     w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
                     (muse_ffn_norm_fp4
@@ -3253,7 +3258,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     // Set by the grouped launcher when it folded the SwiGLU + int8 quantize into
                     // its split-K epilogue, so gate/up were never written out as bf16.
                     int ffn_fused_swiglu = 0;
-                    if (muse_ffn_group && muse_qb && use_i8 && ffn_i8_stage &&
+                    if (!tp_ffn_split && muse_ffn_group && muse_qb && use_i8 && ffn_i8_stage &&
                         w.gate_rs && w.up_rs &&
                         gate_pf_type == up_pf_type &&
                         kernels::pf_dense_gemm_qi8_supported(gate_pf_type)) {
@@ -3284,7 +3289,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         return !(e && e[0] == '0');
                     }();
                     bool h_ready = false;
-                    if (!ffn_grouped && gu_swiglu_on && use_i8 && ffn_i8_stage &&
+                    if (!tp_ffn_split && !ffn_grouped && gu_swiglu_on && use_i8 && ffn_i8_stage &&
                         fn > kernels::pf_dense_gemm_qi8_max_m() && fn % 128 == 0 &&
                         gate_pf_type == up_pf_type &&
                         (gate_pf_type == 12 || gate_pf_type == 13 || gate_pf_type == 14) &&
@@ -3313,14 +3318,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     // tp=2 FFN: rank-width gate/up (row-split) + rank-width down (K-split) GEMMs, in-place rank
                     // SwiGLU, then allreduce this rank's down output into ao (mirrors the full-attn o_proj tp
                     // idiom: rank GEMM -> local buffer -> tp_prefill_allreduce_bf16, as at the o_proj site).
-                    // Excludes every non-bf16 arm (fused-residual / qi8 / fp4 / grouped / i8-stage / partial-h).
+                    // Every other arm is full-width and kept off split ranks by tp_ffn_split.
                     const int ffn_ranks = tp_active ? c.linear_v_heads / s.gdn_window.v_count : 1; // G-b idiom
                     const int ffn_r = ffn / ffn_ranks; // 8704 for 27B
-                    const bool tp_ffn = tp_active && ffn_ranks > 1 && (ffn % ffn_ranks == 0) &&
-                                       !ffn_fused && !ffn_qi8 && !layer_fp4 && !(use_i8 && ffn_i8_stage) &&
-                                       !ffn_grouped && !h_ready;
+                    // tp_ffn_split already kept every full-width arm off this rank (see its definition).
+                    const bool tp_ffn = tp_ffn_split && (ffn % ffn_ranks == 0);
                     if (tp_ffn) {
-                        // tp prefill: rank-SwiGLU + rank-K down + allreduce; i8/fp4/fused-residual paths are tp-inert (27B prefill = bf16).
+                        // tp prefill: rank-SwiGLU + rank-K down + allreduce; the projections still pick int8/NVFP4 per weight inside proj_fused/proj.
                         // rank-dense scratch: lazy per-chunk arena alloc (this block is per-chunk, fn rows); freed with the arena at pass end.
                         bf16* tp_ffg = a.alloc<bf16>((size_t)fn * ffn_r);
                         bf16* tp_ffu = a.alloc<bf16>((size_t)fn * ffn_r);

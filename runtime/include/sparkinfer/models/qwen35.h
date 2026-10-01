@@ -783,7 +783,8 @@ private:
     // Tensor-parallel twin of forward_token: the group leader (rank 0) drives its own copy and
     // mirrors the call onto the other rank's model on a one-shot worker thread; every rank runs
     // the same code against its own (sliced) weights on its own device/stream and combines the
-    // per-rank partials through the GpuLink. Eager-only -- no CUDA-graph capture here. The
+    // per-rank partials through the GpuLink (the mirroring itself lives in forward_token, via
+    // TpMirrorScope). Eager-only -- no CUDA-graph capture here. The
     // per-rank scratch (tp_xrow/tp_drow/tp_ar/tp_logits/tp_exch, see the Impl in qwen35.cpp) is
     // allocated by tp_attach on each rank's own device.
     int forward_token_tp(int token_id, int position, bool sample, float temperature,
@@ -796,8 +797,8 @@ private:
     // throughput a split tp>1 rank cannot use is the accepted perf regression (M2 gate is
     // code-complete + in-regime unit test). The leader activates each row's session before its
     // call (the single-row path keys its per-rank state off the model's active session); the
-    // peer rank's active session is mirrored by the engine (S8), so a direct caller must keep
-    // it in step. Plain greedy only, exactly like decode_packed: out_sampled holds the argmax.
+    // peer replays the whole decode_packed call (mirrored in decode_packed), so it activates the
+    // same sessions in the same order. Plain greedy only, exactly like decode_packed: out_sampled holds the argmax.
     bool decode_packed_tp(const int* tokens, const int* positions, const uint64_t* seq_ids,
                           int n, int* out_sampled);
 
@@ -822,6 +823,10 @@ private:
     // pack keeps [m0,t0,m1,t1] intact through the elementwise max). kind 1: the 256-slot
     // survivor list (in tp_exch2[0..256) -> out tp_exch2[256..512) on both ranks).
     void tp_maxreduce_f32(int kind, size_t elems);
+    // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or
+    // null when this is not the attached group leader or the call is nested inside an already
+    // mirrored one (only the outermost call mirrors; see TpMirrorScope in qwen35.cpp).
+    Qwen35Model* tp_mirror_peer() const;
 
     struct Impl;
     Impl* p_;
@@ -831,7 +836,8 @@ private:
 // is the prefill translation unit, which hands over its per-pass partial buffer). After the
 // K-compact o_proj GEMM each rank's prefill pass calls this with its [N][H] bf16 partial; the
 // rank on the link's device_a end (the leader) waits for the peer's registration, then posts the
-// single GpuLink::allreduce that sums in place (in==out) on both ranks' streams. No attached link
+// single GpuLink::allreduce that sums in place (in==out) on both ranks' streams; the peer waits
+// for that post before enqueuing anything that consumes the sum. No attached link
 // (a tp=1 process) makes this a no-op, exactly like tp_allreduce_row for a peer rank.
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems);
 
