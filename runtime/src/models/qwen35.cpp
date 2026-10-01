@@ -7486,13 +7486,19 @@ bool Qwen35Model::load_weights(const std::string& dir) {
     // byte-identical to the pre-split loader (the tp=1 invariance).
     {
         const tp::Table& tt = tp::get_process_table();
-        if (tt.set() && tt.n_ranks() > 1)
+        if (tt.set() && tt.n_ranks() > 1 && tt.conv() != tp::Conv::Flat)
             fprintf(stderr, "[tp-weights] flat .bin on rank %d of %d: names unknown to the "
                             "Gguf/Hf-convention table load whole (replicated); a "
                             "Flat-convention table would slice them (best-effort reads)\n",
                     s.rank, tt.n_ranks());
     }
-    auto Lt = [&](const std::string& n, long d0, long d1) -> void* {
+    // d0/d1 are the table-orientation dims (d0 = the Rows axis, d1 = Cols); rows_fast says
+    // which of them is the file's fast axis (tpl_gather2d). A Slice read is validated against
+    // the file before any gather: raw bf16 of exactly d0*d1 elements, the split axis' extent
+    // equal to the table's denom, and every range inside it -- a mismatch fails the load
+    // loudly instead of reading past the host buffer (tp_bad).
+    bool tp_bad = false;
+    auto Lt = [&](const std::string& n, long d0, long d1, bool rows_fast = true) -> void* {
         TpSlice sl{};
         switch (tp_decide(n, s.rank, &sl)) {
             case TpDec::Whole:
@@ -7500,15 +7506,35 @@ bool Qwen35Model::load_weights(const std::string& dir) {
             case TpDec::Skip:
                 return nullptr;
             case TpDec::Slice: {
-                // Best-effort reduced read: the flat file is ggml [in,out] row-major
-                // (d0 fast) raw bf16; read the whole file to host and gather the
-                // owned sub-blocks (1-D tensors: d1 = 1, axis OneD).
+                // Reduced read: the flat file is raw bf16; read it whole to host and
+                // gather the owned sub-blocks (1-D tensors: d1 = 1, axis OneD).
                 std::ifstream f(dir + "/" + n + ".bin", std::ios::binary | std::ios::ate);
-                if (!f) return nullptr;
+                if (!f) {
+                    fprintf(stderr, "[qwen35] missing weight: %s/%s.bin\n", dir.c_str(), n.c_str());
+                    tp_bad = true;
+                    return nullptr;
+                }
                 std::vector<char> host((size_t)f.tellg());
                 f.seekg(0);
                 f.read(host.data(), host.size());
-                return tpl_read2d(host.data(), d0, d1, 2, true, sl.axis, sl.ranges, s.owned);
+                const long ext = sl.axis == tp::Axis::Cols ? d1 : d0;
+                bool ok = host.size() == (size_t)d0 * (size_t)d1 * 2 && (size_t)ext == sl.denom;
+                size_t owned_len = 0;
+                for (const tp::Range& r : sl.ranges) {
+                    ok = ok && r.begin + r.len <= (size_t)ext;
+                    owned_len += r.len;
+                }
+                if (!ok) {
+                    fprintf(stderr, "[tp-weights] %s: file %zu B / split extent %ld do not match "
+                            "the table (shape %ldx%ld bf16, denom %zu) -- refusing the slice\n",
+                            n.c_str(), host.size(), ext, d0, d1, sl.denom);
+                    tp_bad = true;
+                    return nullptr;
+                }
+                if (owned_len == 0) return nullptr;   // an empty window (e.g. 1 KV head, 2 ranks)
+                void* p = tpl_read2d(host.data(), d0, d1, 2, rows_fast, sl.axis, sl.ranges, s.owned);
+                if (!p) tp_bad = true;
+                return p;
             }
         }
         return nullptr;
@@ -7517,9 +7543,12 @@ bool Qwen35Model::load_weights(const std::string& dir) {
         return !p && tp_decide(n, s.rank, nullptr) != TpDec::Skip;
     };
     const long H = s.cfg.hidden, V = s.cfg.vocab;
-    s.w.embed_tokens = Lt("embed_tokens", H, V);
+    // embed/lm_head are [V][H] row-major on disk (H fast); the table splits them on the vocab
+    // axis (Rows, denom V), so in table orientation d0 = V is the SLOW axis: each rank gets its
+    // contiguous block of vocab rows -- the layout the vocab-split forward indexes.
+    s.w.embed_tokens = Lt("embed_tokens", V, H, false);
     s.w.final_norm   = Lt("final_norm", H, 1);
-    s.w.lm_head      = Lt("lm_head", H, V);
+    s.w.lm_head      = Lt("lm_head", V, H, false);
     if (miss("embed_tokens", s.w.embed_tokens) ||
         miss("final_norm", s.w.final_norm) ||
         miss("lm_head", s.w.lm_head)) {
@@ -7552,7 +7581,7 @@ bool Qwen35Model::load_weights(const std::string& dir) {
             miss(pfx + "router_w", w.router_w))
             return false;
     }
-    return true;
+    return !tp_bad;
 }
 
 // ----- native GGUF load: dense -> bf16 (dequant + transpose), experts kept quantized -----
