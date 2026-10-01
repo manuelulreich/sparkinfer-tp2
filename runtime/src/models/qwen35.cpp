@@ -886,19 +886,17 @@ struct Qwen35Model::Impl {
 
     // (dual-GPU WP-9) tp=2 scratch, allocated per-model by tp_attach on this model's OWN
     // device (never shared across ranks). tp_xrow is the op-entry embedding-exchange row;
-    // tp_ar is the per-layer AR-A/AR-B staging (both all-reduces reuse row 0); tp_logits
-    // and tp_exch are the (later-session) lm_head/sampling exchange arena. All null until
+    // tp_ar is the per-layer AR-A/AR-B staging (both all-reduces reuse row 0); the decode
+    // epilogue all-reduces the ordinary s.logits row (tp_allreduce_logits). All null until
     // tp_attach, so the tp=1 path never allocates or touches any of them.
     GpuLink* tp_link = nullptr;
     int tp_rank = 0;
     std::vector<Qwen35Model*> tp_peers;   // rank-ordered 2-slot world ([my_rank]=this)
     bf16* tp_xrow = nullptr;   // [hidden]
     bf16* tp_ar   = nullptr;   // [32][2*hidden]
-    float* tp_logits = nullptr; // [vocab]
-    float* tp_exch   = nullptr; // [16]
     // GDN tp staging: one N-windowed qkv GEMV (rows [ql q | ql k | vloc v] of the rank's
     // compact weight blob) lands here, then three D2D copies scatter the q/k/v windows into
-    // the full-width lin_q/lin_k/lin_v. Null unless tp_attach allocated it (hybrid models).
+    // the full-width packed lin_qkv. Null unless tp_attach allocated it (hybrid models).
     bf16* tp_qkv = nullptr;
     // Dense-FFN tp staging (dense_ffn models): one N-windowed gate GEMV and one N-windowed up
     // GEMV (each fl = moe_ffn/2 rows on 27B) land in the first two quarters, the swiglu over
@@ -915,21 +913,6 @@ struct Qwen35Model::Impl {
     bf16* tp_qraw = nullptr;
     int* tp_pos = nullptr;
     int* h_tp_pos = nullptr;
-    // (dual-GPU S4c-2) lm_head/sampling epilogue scratch, all on this rank's own device:
-    //   tp_exch2 : 2x256-f32 survivor-list arena for the sampling-only maxreduce (each rank H2D's
-    //              its own 256-slot canonical list into [0..256); the maxreduce lands the merged
-    //              -- byte-identical-on-both-ranks -- list in [256..512); [512..1024) unused
-    //   tp_gumb  : full-vocab f32 row for launch_temperature_sample; the owned half is a per-step
-    //              D2D of the post-masked arena half, the peer half keeps the one-time-filled -inf
-    //              (never 0xFF-byte NaN) so the curand index 0*V+token maps to the GLOBAL token
-    //              identically on both ranks
-    //   h_half   : host VR/2 staging for the per-step blocking readback of the owned logits half
-    //   h_exch   : host 16-f32 (m,t) pack staging; h_exch2: host 256-f32 survivor-list staging
-    float* tp_exch2 = nullptr; // [1024]
-    float* tp_gumb  = nullptr; // [vocab]
-    float* h_half   = nullptr; // [vocab/2]
-    float* h_exch   = nullptr; // [16]
-    float* h_exch2  = nullptr; // [256]
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -1368,14 +1351,21 @@ static TpWorker& tp_worker_for(int dev) {
     return *w;
 }
 
+// Lock order, for every mirrored op: the LEADER's device_mu, then the peer worker's scope_mu
+// (then, inside the job, the peer's own device_mu). The leader's lock is taken first so a thread
+// already holding it (e.g. an HTTP thread inside submit_locked -> open_session) can never wait
+// for scope_mu while the scope_mu holder waits for that same device_mu -- the deadlock a
+// concurrent decode + session open hit when scope_mu was taken first.
 struct TpMirrorScope {
     TpWorker* worker = nullptr;
+    std::unique_lock<std::recursive_mutex> leader_hold;
     std::unique_lock<std::mutex> hold;
     std::function<void()> job;
     template <class F>
-    TpMirrorScope(Qwen35Model* peer, F&& fn) {
+    TpMirrorScope(std::recursive_mutex* leader_mu, Qwen35Model* peer, F&& fn) {
         ++t_tp_mirror_depth;
         if (!peer) return;
+        if (leader_mu) leader_hold = std::unique_lock<std::recursive_mutex>(*leader_mu);
         job = [peer, f = std::forward<F>(fn)]() mutable { f(*peer); };
         worker = &tp_worker_for(peer->tp_rank_view().device);
         hold = std::unique_lock<std::mutex>(worker->scope_mu);
@@ -1391,7 +1381,8 @@ struct TpMirrorScope {
 
 // Replays `call` (a member call expression) on the peer for the rest of the enclosing scope.
 #define TP_MIRROR(...) \
-    TpMirrorScope tp_mirror_scope_(tp_mirror_peer(), [&](Qwen35Model& tp_peer_) { (void)tp_peer_.__VA_ARGS__; })
+    TpMirrorScope tp_mirror_scope_(&p_->device_mu, tp_mirror_peer(), \
+                                   [&](Qwen35Model& tp_peer_) { (void)tp_peer_.__VA_ARGS__; })
 
 Qwen35Model::~Qwen35Model() {
     // Mirror the ctor's one-time bind: cudaFree is device-bound, so a split instance must free
@@ -1434,17 +1425,15 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->lin_z); cudaFree(p_->lin_alpha); cudaFree(p_->lin_beta);
     cudaFree(p_->lin_gdn); cudaFree(p_->lin_norm); cudaFree(p_->lin_conv_state); cudaFree(p_->lin_state);
     cudaFree(p_->gdn_scratch);
-    cudaFree(p_->tp_xrow); cudaFree(p_->tp_ar); cudaFree(p_->tp_logits); cudaFree(p_->tp_exch);
+    cudaFree(p_->tp_xrow); cudaFree(p_->tp_ar);
     cudaFree(p_->tp_qkv); cudaFree(p_->tp_qraw); cudaFree(p_->tp_pos); free(p_->h_tp_pos);
     cudaFree(p_->tp_ffn); cudaFree(p_->tp_fq81);
     cudaFree(p_->tp_fq8); cudaFree(p_->tp_fq8_d); cudaFree(p_->tp_fq8_s);
-    cudaFree(p_->tp_exch2); cudaFree(p_->tp_gumb);
     // (S7a-1) Unpublish this instance from the process-scope prefill AR slots.
     g_tp_prefill_link = nullptr;
     g_tp_prefill_dev[0] = -1; g_tp_prefill_dev[1] = -1;
     g_tp_prefill_stream[0] = nullptr; g_tp_prefill_stream[1] = nullptr;
     g_tp_prefill_buf[0] = nullptr; g_tp_prefill_buf[1] = nullptr;
-    free(p_->h_half); free(p_->h_exch); free(p_->h_exch2);
     cudaFree(p_->shared_gate_tmp);
     cudaFree(p_->nvfp4_g); cudaFree(p_->nvfp4_u); cudaFree(p_->nvfp4_h);
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
@@ -3270,8 +3259,7 @@ Qwen35Model::TpRankView Qwen35Model::tp_rank_view() const {
     v.stream = s.stream;
     v.xrow   = s.tp_xrow;
     v.ar     = s.tp_ar;
-    v.exch   = s.tp_exch;
-    v.exch2  = s.tp_exch2;
+    v.logits = s.logits;
     return v;
 }
 
@@ -3318,22 +3306,6 @@ void Qwen35Model::tp_attach(GpuLink* link, int my_rank, const std::vector<Qwen35
     const int H = c.hidden;
     s.tp_xrow   = s.alloc<bf16>((size_t)H);
     s.tp_ar     = s.alloc<bf16>((size_t)32 * 2 * H);
-    s.tp_logits = s.alloc<float>((size_t)c.vocab);
-    s.tp_exch   = s.alloc<float>(16);
-    s.tp_exch2  = s.alloc<float>(2 * 512);
-    s.tp_gumb   = s.alloc<float>((size_t)c.vocab);
-    s.h_half    = (float*)malloc((size_t)(c.vocab / 2) * sizeof(float));
-    s.h_exch    = (float*)malloc(16 * sizeof(float));
-    s.h_exch2   = (float*)malloc(256 * sizeof(float));
-    // tp_gumb's peer half must be REAL -inf (a 0xFF-byte memset would be NaN, not -inf): a
-    // one-time H2D fill of the whole row from a throwaway host buffer; each step then only
-    // overwrites the owned half with the post-masked arena half.
-    {
-        std::vector<float> neg_inf_row((size_t)c.vocab, -INFINITY);
-        cu(cudaMemcpyAsync(s.tp_gumb, neg_inf_row.data(), (size_t)c.vocab * sizeof(float),
-                           cudaMemcpyHostToDevice, s.stream), "tp_gumb -inf fill");
-        cu(cudaStreamSynchronize(s.stream), "tp_gumb -inf fill sync");
-    }
     // GDN qkv staging, sized from this model's own GDN window (the ctor already normalized it):
     // rank r owns q/k heads [ql*r, ql*(r+1)) and v heads [vloc*r, vloc*(r+1)) with ql =
     // vloc/g in block mode, so the one qkv GEMV writes 2*ql*HD + vloc*HD rows.
@@ -3488,25 +3460,20 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
         fprintf(stderr, "[tp-debug] dumped xn for step=%d -> %s\n", position, ps.c_str());
     }
 
-    // -- epilogue (design item 4, S4c-2): vocab-split lm_head GEMV + (m,t) combine --
-    // Each rank GEMVs the final normed row against its own consecutive half of the compact lm_head
-    // blob (N window: global rows [rank*Vr, (rank+1)*Vr)) into its half of the f32[V] tp_logits
-    // arena. bias/penalty run over the FULL arena (both arrays are full-vocab replicated, so both
-    // ranks apply the identical full-vocab transform), and top_k/top_p mask the OWNED half only
-    // (the V-sized CUB scratch is still valid; d_vocab_iota's prefix is exactly the local index
-    // set). The two halves then combine through GpuLink maxreduces: the 16-f32 (m,t) pack carries
-    // each half's max value + its GLOBAL token in a disjoint pack (rank r owns slots 2r,2r+1;
-    // all other slots -inf on BOTH ranks), so the elementwise max leaves [m0,t0,m1,t1] intact in
-    // tp_exch on both ranks and the winner (max m, rank-0 tie-break) plus the exact token come
-    // back to both. Sampling (temperature>0) additionally runs a 2x256-f32 maxreduce of
-    // -inf-padded survivor lists (the "identical union" carrier; per-vocab-half-normalized
-    // nucleus is a documented approximation). The 27B decode lm_head is Q4_K in BOTH variants
-    // (the ModelOpt loader requants it; the native NVFP4 payload is prefill-GEMM-only), so the
-    // arm chain mirrors the tp=1 one exactly with N=Vr and no FP8/NVFP4 arm (tp=1 has none);
-    // the bonsai/ptq1 arms are 27B-unreachable and skipped.
+    // -- epilogue: vocab-split lm_head GEMV, then ONE f32 all-reduce that hands both ranks the
+    // full logits row, then the tp=1 sampling sequence verbatim. Each rank GEMVs the final normed
+    // row against its own consecutive half of the lm_head (global rows [rank*Vr, (rank+1)*Vr))
+    // into its half of s.logits, the other half zeroed; the sum all-reduce (x + 0 is exact) leaves
+    // a bit-identical [V] row on both ranks. Every kernel after it is the tp=1 one on identical
+    // inputs and identical device params (same seed/step), so both ranks pick the same token and
+    // keep their replicated penalty counts in lockstep -- and top_k/top_p, temperature sampling
+    // and logprobs (last_token_logprobs reads this rank's d_topk_exp/d_chosen_logit) are EXACTLY
+    // tp=1's, with no per-vocab-half approximation. Cost: one 1 MB f32 reduce per sampled token
+    // (~0.15 ms over P2P on the PCIe pair, vs ~30 ms per decode step). The 27B decode lm_head is
+    // Q4_K in both variants, so the arm chain mirrors tp=1's with N=Vr.
     const int Vr  = c.vocab / 2;              // rows this rank owns (27B: 124160)
     const int off = (int)s.tp_rank * Vr;      // global base of this rank's window
-    float* logits_h = s.tp_logits + off;     // this rank's half of the arena
+    float* logits_h = s.logits + off;         // this rank's half of the row
 
     // !sample: the tp=1 body never runs lm_head on this path either -- sync and return the
     // input token (no logits needed).
@@ -3532,6 +3499,7 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
     cu(cudaMemcpyAsync(s.d_sample_presence_penalty, s.h_sample_presence_penalty, sizeof(float), cudaMemcpyHostToDevice, st), "tp presence");
     cu(cudaMemcpyAsync(s.d_sample_frequency_penalty, s.h_sample_frequency_penalty, sizeof(float), cudaMemcpyHostToDevice, st), "tp frequency");
 
+    cu(cudaMemsetAsync(s.logits, 0, (size_t)c.vocab * sizeof(float), st), "tp logits zero");
     // lm_head N-window GEMV into the arena half (mirror of the tp=1 arm chain, out=arena half).
     if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
         kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
@@ -3548,110 +3516,42 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
     else
         kernels::launch_linear_f32(s.xn, s.w.lm_head, logits_h, 1, Vr, H, st);
 
-    // bias + penalty over the FULL arena (the peer half is stale here but never read).
-    kernels::launch_logit_bias(s.tp_logits, s.logit_bias, c.vocab, st);
-    kernels::launch_presence_frequency_penalty(s.tp_logits, s.penalty_counts, c.vocab,
+    tp_allreduce_logits();
+
+    kernels::launch_logit_bias(s.logits, s.logit_bias, c.vocab, st);
+    kernels::launch_presence_frequency_penalty(s.logits, s.penalty_counts, c.vocab,
                                                s.d_sample_presence_penalty, s.d_sample_frequency_penalty, st);
-    // top_k/top_p mask over the OWNED half only (vocab=Vr; the V-sized scratch stays valid).
-    kernels::launch_topk_topp_mask(logits_h, Vr, s.d_vocab_iota, s.d_sorted_logits, s.d_sorted_idx,
+    kernels::launch_topk_topp_mask(s.logits, c.vocab, s.d_vocab_iota, s.d_sorted_logits, s.d_sorted_idx,
                                    s.d_topk_exp, s.d_topk_cumsum, s.d_sort_temp, s.sort_temp_bytes,
                                    s.d_scan_temp, s.scan_temp_bytes,
                                    s.d_sample_top_k, s.d_sample_top_p, s.d_rank_by_id, st);
-
-    // Gumbel row: D2D the post-masked arena half into tp_gumb (the peer half keeps the one-time
-    // -inf); the curand index 0*V+token is GLOBAL, so both ranks draw identical noise per token,
-    // and -inf stays -inf (a -inf slot can never win). The arena itself is left untouched.
-    cu(cudaMemcpyAsync(s.tp_gumb + off, logits_h, (size_t)Vr * sizeof(float), cudaMemcpyDeviceToDevice, st),
-       "tp gumb half");
-    kernels::launch_temperature_sample(s.tp_gumb, 1, c.vocab, s.d_sample_temp, s.d_sample_seed,
+    kernels::launch_temperature_sample(s.logits, 1, c.vocab, s.d_sample_temp, s.d_sample_seed,
                                        s.d_sample_step, st);
-    kernels::launch_argmax(s.tp_gumb, s.d_out_id, 1, c.vocab, st);
-
-    // Local (m,t): t from the Gumbel row (always in this rank's OWN half -- the peer half is
-    // -inf and never wins); m = that slot's (post-Gumbel) value. The winner's OWNER rank reports
-    // the real value, the other reports -inf, which the 16B maxreduce below filters out.
-    cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "tp t");
-    cu(cudaStreamSynchronize(st), "tp t sync");
-    const int local_tok = *s.h_out_id;
-    cu(cudaMemcpyAsync(s.h_exch, s.tp_gumb + local_tok, sizeof(float), cudaMemcpyDeviceToHost, st), "tp m");
-    cu(cudaStreamSynchronize(st), "tp m sync");
-    const float local_m = s.h_exch[0];
-
-    // 16-f32 (m,t) pack into tp_exch (rank r owns slots 2r,2r+1; the other 12 are -inf on both).
-    for (int i = 0; i < 16; i++) s.h_exch[i] = -INFINITY;
-    s.h_exch[2 * s.tp_rank] = local_m;
-    s.h_exch[2 * s.tp_rank + 1] = (float)local_tok;
-    cu(cudaMemcpyAsync(s.tp_exch, s.h_exch, 16 * sizeof(float), cudaMemcpyHostToDevice, st), "tp exch pack");
-
-    // Read the owned (post-masked, PRE-Gumbel -- the Gumbel only touched tp_gumb) half back:
-    // both for the 2x256 survivor union below (sampling only) and for the chosen token's raw
-    // (post-bias/penalty) logit, which is h_half[token - winner_off] in every sub-case (the
-    // temperature<=0 "greedy" sub-case's Gumbel step is a no-op, so its post- value == pre-).
-    cu(cudaMemcpyAsync(s.h_half, logits_h, (size_t)Vr * sizeof(float), cudaMemcpyDeviceToHost, st), "tp h_half");
-    cu(cudaStreamSynchronize(st), "tp h_half sync");
-
-    if (temperature > 0.f) {
-        // 2x256 survivor union: pack this rank's survivors (finite entries of h_half) into the
-        // canonical 256-slot list in ascending global-token order (-inf pad; if a rank has more
-        // than 256 survivors keep its 256 highest, then re-sort by token). Both ranks' lists
-        // share the slot<->token map, so the 256-f32 maxreduce leaves a byte-identical merged
-        // list in tp_exch2[256..512) on both ranks.
-        for (int i = 0; i < 256; i++) s.h_exch2[i] = -INFINITY;
-        {
-            std::vector<int> idx;
-            std::vector<float> val;
-            for (int i = 0; i < Vr; i++)
-                if (s.h_half[i] > -INFINITY) { idx.push_back(i); val.push_back(s.h_half[i]); }
-            if (idx.size() <= 256) {
-                for (size_t k = 0; k < idx.size(); k++) s.h_exch2[idx[k]] = val[k];
-            } else {
-                // The 256 highest by value: a 256-slot descending top list, linear insert (only
-                // the degenerate >256-survivors case pays this cost).
-                std::vector<float> tv;
-                std::vector<int> ti;
-                for (size_t k = 0; k < val.size(); k++) {
-                    size_t pos = tv.size();
-                    for (size_t j = 0; j < tv.size(); j++)
-                        if (val[k] > tv[j]) { pos = j; break; }
-                    if (pos < 256) {
-                        tv.insert(tv.begin() + pos, val[k]);
-                        ti.insert(ti.begin() + pos, idx[k]);
-                    }
-                    if (tv.size() > 256) { tv.pop_back(); ti.pop_back(); }
-                }
-                // Re-sort the kept 256 by (global) token: plain selection sort over <=256.
-                std::vector<int> ord(ti.size());
-                for (size_t a = 0; a < ord.size(); a++) ord[a] = (int)a;
-                for (size_t a = 0; a < ord.size(); a++)
-                    for (size_t b = a + 1; b < ord.size(); b++)
-                        if (ti[ord[b]] < ti[ord[a]]) { int q = ord[a]; ord[a] = ord[b]; ord[b] = q; }
-                for (size_t a = 0; a < ord.size(); a++) s.h_exch2[ti[ord[a]]] = tv[ord[a]];
-            }
-        }
-        cu(cudaMemcpyAsync(s.tp_exch2, s.h_exch2, 256 * sizeof(float), cudaMemcpyHostToDevice, st), "tp exch2 pack");
-        tp_maxreduce_f32(1, 256);
-    }
-
-    // 16B (m,t) maxreduce (leader-issued; the peer's call is a no-op), then both ranks read
-    // [m0,t0,m1,t1] back from tp_exch (the disjoint pack survives the elementwise max intact).
-    tp_maxreduce_f32(0, 16);
-    cu(cudaMemcpyAsync(s.h_exch, s.tp_exch, 16 * sizeof(float), cudaMemcpyDeviceToHost, st), "tp exch back");
-    cu(cudaStreamSynchronize(st), "tp exch sync");
-    const float m0 = s.h_exch[0], t0 = s.h_exch[1], m1 = s.h_exch[2], t1 = s.h_exch[3];
-    const int winner_rank = (m0 >= m1) ? 0 : 1;
-    const int token = (int)((winner_rank ? t1 : t0));   // t is exact as a float (token < 2^24)
-
-    // Finalize d_out_id on BOTH ranks to the global winner (the replicated penalty_counts are
-    // then incremented identically and stay in lockstep), and stage the chosen token's raw logit.
-    *s.h_out_id = token;
-    cu(cudaMemcpyAsync(s.d_out_id, s.h_out_id, sizeof(int), cudaMemcpyHostToDevice, st), "tp out_id");
+    kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+    kernels::launch_extract_chosen_logit(s.d_out_id, s.d_rank_by_id, s.d_sorted_logits,
+                                         s.d_chosen_logit, st);
     kernels::launch_increment_penalty_count(s.penalty_counts, s.d_out_id, st);
-    const float chosen_logit = s.h_half[token - winner_rank * Vr];
-    s.h_exch[0] = chosen_logit;
-    cu(cudaMemcpyAsync(s.d_chosen_logit, s.h_exch, sizeof(float), cudaMemcpyHostToDevice, st), "tp chosen logit");
-
+    cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "tp out_id");
     cu(cudaStreamSynchronize(st), "tp final sync");
-    return token;
+    return *s.h_out_id;
+}
+
+void Qwen35Model::tp_allreduce_logits() {
+    Impl& s = *p_;
+    // Leader-issued like tp_allreduce_row: one GpuLink::allreduce posts the in-place f32 sum of
+    // s.logits on BOTH ranks' streams; the peer only takes part in the rendezvous.
+    if (!s.tp_link || s.tp_peers.size() != 2) return;
+    if (s.tp_rank != 0) { tp_peer_rendezvous("logits allreduce"); return; }
+    if (!s.tp_peers[1]) return;
+    const TpRankView pv = s.tp_peers[1]->tp_rank_view();
+    GpuLink::RankRef self_ref{s.device, s.stream, s.logits, s.logits};
+    GpuLink::RankRef peer_ref{pv.device, pv.stream, pv.logits, pv.logits};
+    GpuLink::RankRef a = self_ref, b = peer_ref;
+    if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
+    tp_leader_rendezvous("logits allreduce", [&] {
+        if (!s.tp_link->allreduce(a, b, (size_t)s.cfg.vocab * sizeof(float), GpuLink::Dtype::Float32))
+            cu(cudaErrorUnknown, "tp logits allreduce");
+    });
 }
 
 bool Qwen35Model::decode_packed_tp(const int* tokens, const int* positions,
@@ -4285,36 +4185,6 @@ void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
                            g_tp_prefill_buf[1]};
         if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
             { cu(cudaErrorUnknown, "tp prefill allreduce"); note_tp_fatal("GpuLink prefill allreduce failed"); }
-    });
-}
-
-void Qwen35Model::tp_maxreduce_f32(int kind, size_t elems) {
-    Impl& s = *p_;
-    // Only the group leader (rank 0) issues the maxreduce: one GpuLink::maxreduce posts the
-    // reduce on BOTH ranks' streams, so the peer's call is a deliberate no-op (same as
-    // tp_allreduce_row). Ranks' f32 buffers: kind 0 in==out==tp_exch on both ranks (the
-    // disjoint pack makes the elementwise max exact); kind 1 in=tp_exch2[0..256) and
-    // out=tp_exch2[256..512) on both ranks. Ordered against both ranks' producers and consumers
-    // by the same host rendezvous as tp_allreduce_row.
-    if (!s.tp_link || s.tp_peers.size() != 2) return;
-    if (s.tp_rank != 0) { tp_peer_rendezvous("maxreduce"); return; }
-    if (!s.tp_peers[1]) return;
-    const TpRankView pv = s.tp_peers[1]->tp_rank_view();
-    GpuLink::RankRef self_ref, peer_ref;
-    if (kind == 0) {
-        self_ref  = GpuLink::RankRef{s.device, s.stream, s.tp_exch, s.tp_exch};
-        peer_ref  = GpuLink::RankRef{pv.device, pv.stream, pv.exch, pv.exch};
-    } else {
-        self_ref  = GpuLink::RankRef{s.device, s.stream, s.tp_exch2, s.tp_exch2 + 256};
-        peer_ref  = GpuLink::RankRef{pv.device, pv.stream, pv.exch2, pv.exch2 + 256};
-    }
-    // reduce_impl requires ref a on the link's device_a and ref b on device_b; order ours to
-    // match the link's (dev_a, dev_b) regardless of which physical rank this instance is.
-    GpuLink::RankRef a = self_ref, b = peer_ref;
-    if (s.tp_link->device_a() != s.device) { a = peer_ref; b = self_ref; }
-    tp_leader_rendezvous("maxreduce", [&] {
-        if (!s.tp_link->maxreduce(a, b, elems * sizeof(float), GpuLink::Dtype::Float32))
-            { cu(cudaErrorUnknown, "tp maxreduce"); note_tp_fatal("GpuLink maxreduce failed"); }
     });
 }
 
@@ -5289,7 +5159,7 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         uint64_t peer_id = 0, id = 0;
         bool peer_alloc_failed = false;
         {
-            TpMirrorScope m(peer, [&](Qwen35Model& pm) {
+            TpMirrorScope m(&p_->device_mu, peer, [&](Qwen35Model& pm) {
                 peer_id = pm.open_session(num_tokens, &peer_alloc_failed, shared_prefix_blocks);
             });
             id = open_session(num_tokens, alloc_failed, shared_prefix_blocks);
@@ -5298,11 +5168,11 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         fprintf(stderr, "[tp] open_session: ranks disagree (rank0 id %llu, rank1 id %llu); undoing\n",
                 (unsigned long long)id, (unsigned long long)peer_id);
         if (id) {
-            TpMirrorScope solo(nullptr, [](Qwen35Model&) {});
+            TpMirrorScope solo(nullptr, nullptr, [](Qwen35Model&) {});
             close_session(id);
         }
         if (peer_id) {
-            TpMirrorScope m(peer, [&](Qwen35Model& pm) { pm.close_session(peer_id); });
+            TpMirrorScope m(&p_->device_mu, peer, [&](Qwen35Model& pm) { pm.close_session(peer_id); });
         }
         if (alloc_failed && peer_alloc_failed) *alloc_failed = true;
         return 0;
@@ -10387,7 +10257,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // lm_head: FP8 in the compressed-tensors checkpoint, plain bf16 in the ModelOpt one (which
     // lists it under quantization_config.ignore). Either way it ends up Q4_K, as in load_gguf().
     // Split on the vocab (row) axis: the Q4_K requant runs over this rank's [vocab', H] window.
-    s.w.lm_head = tp_pick("lm_head",
+    // tp table key is the full tensor name ("lm_head.weight", tp_layout Conv::Hf); the bare
+    // "lm_head" prefix is unknown to the table and resolves to Whole -- both ranks then held the
+    // ENTIRE head and computed only its first V/2 rows (the upper vocab half never scored).
+    s.w.lm_head = tp_pick("lm_head.weight",
         [&]{ return requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
                                   s.w.lm_head_type); },
         [&](const TpSlice& sl) {
@@ -10396,7 +10269,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         });
     if (tp_missing("model.language_model.embed_tokens.weight", s.w.embed_tokens) ||
         tp_missing("model.language_model.norm.weight", s.w.final_norm) ||
-        tp_missing("lm_head", s.w.lm_head))
+        tp_missing("lm_head.weight", s.w.lm_head))
         return false;
     // ...and, when the checkpoint ships the head as NVFP4, keep its own bytes as well, in the
     // block-scaled GEMM's operand layout. Every other big tensor already went this way (the FFN
@@ -10422,7 +10295,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     }();
     if (head_fp4_on) {
         TpSlice head_sl{};
-        const TpDec head_dec = tp_decide("lm_head", tp_rank, &head_sl);
+        const TpDec head_dec = tp_decide("lm_head.weight", tp_rank, &head_sl);
         // The rank's owned vocab window (the full vocab at tp=1 / whole). A Skip is not
         // expected (the head splits on every rank that owns any of it) but is tolerated.
         const long head_rows =

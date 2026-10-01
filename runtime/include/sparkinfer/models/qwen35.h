@@ -303,8 +303,7 @@ public:
         cudaStream_t stream = nullptr;
         uint16_t* xrow = nullptr;   // bf16[hidden] op-entry embedding-exchange row
         uint16_t* ar   = nullptr;   // bf16[32][2*hidden] per-layer AR-A/B staging (row 0 in use)
-        float* exch    = nullptr;   // f32[16] (m,t) pack, S4c-2 epilogue 16B maxreduce
-        float* exch2   = nullptr;   // f32[1024] 2x256 survivor lists, S4c-2 epilogue maxreduce
+        float* logits  = nullptr;   // f32[vocab] the decode logits row (epilogue all-reduce)
     };
     TpRankView tp_rank_view() const;
 
@@ -781,11 +780,11 @@ private:
 
     // (dual-GPU WP-9, tp>1 only; the tp=1 path never enters either of these.)
     // Tensor-parallel twin of forward_token: the group leader (rank 0) drives its own copy and
-    // mirrors the call onto the other rank's model on a one-shot worker thread; every rank runs
+    // mirrors the call onto the other rank's model on its persistent worker thread; every rank runs
     // the same code against its own (sliced) weights on its own device/stream and combines the
     // per-rank partials through the GpuLink (the mirroring itself lives in forward_token, via
     // TpMirrorScope). Eager-only -- no CUDA-graph capture here. The
-    // per-rank scratch (tp_xrow/tp_drow/tp_ar/tp_logits/tp_exch, see the Impl in qwen35.cpp) is
+    // per-rank scratch (tp_xrow/tp_ar/..., see the Impl in qwen35.cpp) is
     // allocated by tp_attach on each rank's own device.
     int forward_token_tp(int token_id, int position, bool sample, float temperature,
                          unsigned long long seed, unsigned long long sample_step,
@@ -816,13 +815,9 @@ private:
     // not issue a second one (this helper is a no-op on the peer). `is_xrow` selects which
     // peer row to name (xrow for the op-entry exchange, ar for the per-layer AR-A/AR-B).
     void tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow);
-    // (dual-GPU S4c-2) one 2-rank elementwise f32 MAX for the epilogue's (m,t) exchange. Issued
-    // only by the group leader (rank 0); the peer's call is a deliberate no-op, exactly like
-    // tp_allreduce_row, because a single GpuLink::maxreduce posts the reduce on BOTH ranks'
-    // streams. kind 0: the 16-slot (m,t) pack (in==out==tp_exch on both ranks -- the disjoint
-    // pack keeps [m0,t0,m1,t1] intact through the elementwise max). kind 1: the 256-slot
-    // survivor list (in tp_exch2[0..256) -> out tp_exch2[256..512) on both ranks).
-    void tp_maxreduce_f32(int kind, size_t elems);
+    // (dual-GPU) Decode epilogue: in-place f32 sum all-reduce of the [vocab] logits row (each
+    // rank holds its vocab half, zeros elsewhere), leaving the full row on both ranks.
+    void tp_allreduce_logits();
     // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or
     // null when this is not the attached group leader or the call is nested inside an already
     // mirrored one (only the outermost call mirrors; see TpMirrorScope in qwen35.cpp).
