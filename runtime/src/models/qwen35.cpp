@@ -8501,8 +8501,8 @@ bool Qwen35Model::spec_group_supported() const {
 // way dflash_generate fills it, so the engine resumes any unfinished job with ordinary decode.
 //
 // Policy is deliberately simple next to dflash_generate's single-session planner: every session
-// of a step verifies the same depth, min(SPARKINFER_SPEC_GROUP_DEPTH (default 6), rows / S - 1),
-// so the step's rows fit the tp rows pass.
+// of a step verifies the same depth (see depth_for), capped at rows / S - 1 so the step's rows fit
+// the tp rows pass.
 void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                                         const SpecGroupHooks& hooks) {
     Impl& s = *p_;
@@ -8510,10 +8510,15 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         const char* e = getenv("SPARKINFER_BENCH_IGNORE_EOS");
         return e && e[0] == '1';
     }();
-    static const int kDepthMax = [] {
+    // Depth: 6 for a lone session, 4 once sessions share a step. Measured (HyperQwen cohort,
+    // 512 tokens, e2e tok/s, depth 4 / 5 / 6 / 7): C1 94.3 / 94.7 / 92.7 / 93.4 (flat), C2
+    // 150.4 / 138.8 / 136.0 / 133.3, C4 211.0 / 202.5 / 188.4 / 178.5 -- with several sessions
+    // a deep row costs a verify row per session and lands less often than it costs.
+    // SPARKINFER_SPEC_GROUP_DEPTH fixes one depth for every group size.
+    static const int kDepthEnv = [] {
         const char* e = getenv("SPARKINFER_SPEC_GROUP_DEPTH");
-        const int v = e ? atoi(e) : 6;
-        return v < 1 ? 1 : v;
+        const int v = e ? atoi(e) : 0;
+        return v < 0 ? 0 : v;
     }();
     static const bool kTiming = getenv("SPARKINFER_DSPARK_TIMING") != nullptr;
     DFlashDraftModel& draft = *s.dflash_draft;
@@ -8648,7 +8653,10 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         return true;
     };
 
-    auto depth_for = [&](int S) { return std::max(0, std::min(kDepthMax, std::min(B, R / std::max(S, 1) - 1))); };
+    auto depth_for = [&](int S) {
+        const int want = kDepthEnv > 0 ? kDepthEnv : (S <= 1 ? 6 : 4);
+        return std::max(0, std::min(want, std::min(B, R / std::max(S, 1) - 1)));
+    };
     for (SpecGroupJob* j : jobs) {
         if (!join(j, depth_for((int)jobs.size()))) {
             // Not engaged: the engine re-prefills it; stop here so it is not left waiting.
