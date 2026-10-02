@@ -4590,7 +4590,86 @@ void Qwen35Model::tp_allreduce_row(uint16_t* row, size_t elems, bool is_xrow) {
     });
 }
 
+// (dual-GPU B1) Asynchronous twin of tp_prefill_allreduce_bf16. The reduce is posted on a per-rank
+// SIDE stream instead of the compute stream, ordered after the compute stream's producers by an
+// event, so the copy engines move this partial while the compute stream runs on. Rows the op
+// covers must not be touched by the compute stream until tp_prefill_allreduce_join(). The side
+// stream is in order, so several async ops queue behind each other (GpuLink's landing scratch is
+// then never shared by two ops in flight); the synchronous form joins first for the same reason.
+// The result is bit-identical to the synchronous form: the same GpuLink op, only another stream.
+struct TpArSide {
+    static constexpr int kRing = 64;   // per-op completion events; a wrapped slot is re-recorded
+                                       // by a LATER op of the same in-order stream, so waiting on
+                                       // it can only over-wait, never under-wait
+    cudaStream_t side = nullptr;
+    cudaEvent_t ready = nullptr;
+    cudaEvent_t done[kRing] = {};
+    int seq = 0;
+    bool pending = false;
+};
+static TpArSide g_tp_ar_side[2];
+
+static int tp_prefill_rank() {
+    if (!g_tp_prefill_link || g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return -1;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        (dev != g_tp_prefill_dev[0] && dev != g_tp_prefill_dev[1]))
+        return -1;
+    return (dev == g_tp_prefill_dev[0]) ? 0 : 1;
+}
+
+void tp_prefill_allreduce_join() {
+    const int r = tp_prefill_rank();
+    if (r < 0) return;
+    TpArSide& sd = g_tp_ar_side[r];
+    if (!sd.pending) return;
+    cu(cudaStreamWaitEvent(g_tp_prefill_stream[r], sd.done[(sd.seq - 1) % TpArSide::kRing], 0),
+       "tp prefill ar join");
+    sd.pending = false;
+}
+
+void tp_prefill_allreduce_wait(int ticket) {
+    const int r = tp_prefill_rank();
+    if (r < 0 || ticket < 0) return;
+    TpArSide& sd = g_tp_ar_side[r];
+    if (!sd.pending || ticket >= sd.seq) return;
+    cu(cudaStreamWaitEvent(g_tp_prefill_stream[r], sd.done[ticket % TpArSide::kRing], 0),
+       "tp prefill ar wait");
+}
+
+int tp_prefill_allreduce_bf16_async(void* in_out, size_t elems) {
+    if (!in_out || elems == 0) return -1;
+    const int r = tp_prefill_rank();
+    if (r < 0) return -1;
+    TpArSide& sd = g_tp_ar_side[r];
+    if (!sd.side) {   // created by the rank's own thread, on its own (current) device
+        cu(cudaStreamCreateWithFlags(&sd.side, cudaStreamNonBlocking), "tp ar side stream");
+        cu(cudaEventCreateWithFlags(&sd.ready, cudaEventDisableTiming), "tp ar ready event");
+        for (cudaEvent_t& e : sd.done)
+            cu(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "tp ar done event");
+    }
+    cu(cudaEventRecord(sd.ready, g_tp_prefill_stream[r]), "tp ar ready record");
+    cu(cudaStreamWaitEvent(sd.side, sd.ready, 0), "tp ar side wait");
+    g_tp_prefill_buf[r] = in_out;
+    auto post = [&] {
+        GpuLink::RankRef a{g_tp_prefill_dev[0], g_tp_ar_side[0].side, g_tp_prefill_buf[0],
+                           g_tp_prefill_buf[0]};
+        GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_ar_side[1].side, g_tp_prefill_buf[1],
+                           g_tp_prefill_buf[1]};
+        if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
+            { cu(cudaErrorUnknown, "tp prefill allreduce async"); note_tp_fatal("GpuLink prefill allreduce failed"); }
+    };
+    if (r != 0) tp_peer_rendezvous("prefill allreduce async");
+    else tp_leader_rendezvous("prefill allreduce async", post);
+    // After the rendezvous the op is on both side streams; `done` marks everything posted so far.
+    const int ticket = sd.seq++;
+    cu(cudaEventRecord(sd.done[ticket % TpArSide::kRing], sd.side), "tp ar done record");
+    sd.pending = true;
+    return ticket;
+}
+
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
+    tp_prefill_allreduce_join();   // the link's landing scratch may still be in use by an async op
     // Prefill o_proj partial (S7a-1): each rank's pass calls this with its per-pass [N][H] buffer
     // right after enqueuing its K-compact o_proj GEMM. The call registers the buffer in the
     // caller's process-static slot. One link call posts on BOTH ranks' streams, so only the
@@ -4623,7 +4702,7 @@ void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
 // next collective fails. Agreeing first keeps them on one path. Not tp: returns v unchanged.
 static std::atomic<int> g_tp_agree_in[2];
 static std::atomic<int> g_tp_agree_out{0};
-int tp_prefill_agree_min(int v) {
+static int tp_prefill_agree(int v, int (*op)(int, int)) {
     if (!g_tp_prefill_link || g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return v;
     int dev = -1;
     if (cudaGetDevice(&dev) != cudaSuccess ||
@@ -4637,10 +4716,16 @@ int tp_prefill_agree_min(int v) {
     }
     int out = v;
     tp_leader_rendezvous("prefill agree", [&] {
-        out = std::min(v, g_tp_agree_in[1].load(std::memory_order_acquire));
+        out = op(v, g_tp_agree_in[1].load(std::memory_order_acquire));
         g_tp_agree_out.store(out, std::memory_order_release);
     });
     return out;
+}
+int tp_prefill_agree_min(int v) {
+    return tp_prefill_agree(v, [](int a, int b) { return std::min(a, b); });
+}
+int tp_prefill_agree_and(int v) {
+    return tp_prefill_agree(v, [](int a, int b) { return a & b; });
 }
 
 void tp_prefill_allreduce_f32(float* in_out, size_t elems) {

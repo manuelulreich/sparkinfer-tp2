@@ -13,6 +13,26 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   decode. It now divides by the decode window (`generation_ms - ttft_ms`), as the runtime's own
   per-request figure always did.
 
+- **tp=2 prefill could run different kernels on the two cards.** The FP4 staging buffers were
+  taken from each card's own free memory after the cross-card agreement, so one card could run a
+  projection on FP4 while the other ran int8 (seen at 16k), and a server with a draft model loaded
+  could prefill differently from one without. The two cards now agree on the set of FP4 paths.
+- **tp=2 prefill of 16k+ token prompts read a stale normalized input.** Past 16,384 tokens the
+  input norm is folded into the FP4 quantize, but the two-card GDN and FFN paths read the plain
+  normalized buffer, which then still held an earlier layer's value.
+- **tp=2 DSpark verify shared one GDN conv-weight cache between the two cards**, so each card kept
+  overwriting the other's copy. It is now per card.
+
+### Performance
+
+- **tp=2 prefill: ~2,200 → ~3,500 tok/s** (2× RTX 5060 Ti, 1k–4k tokens; 3,400 at 8k–16k).
+  The GDN and FFN projections now run on the FP4 tensor cores at tp=2 as they do on one card
+  (they were converted to int8 on every pass), the GDN conv weights are prepared once instead of
+  per pass, and the cross-card all-reduces run on a copy stream in row chunks overlapped with the
+  next chunk's compute (`SPARKINFER_TP_AR_OVERLAP=0`, `SPARKINFER_TP_FFN_NVFP4=0`,
+  `SPARKINFER_TP_GDN_NVFP4=0` restore the old paths for A/B). DSpark on the counting prompt
+  186 → 231 tok/s. The `tp2_gates.py` baseline is re-recorded.
+
 ### Benchmarks
 
 - **`bench/scripts/run_benchmarks.sh`**: a prefill and decode ladder against a running server

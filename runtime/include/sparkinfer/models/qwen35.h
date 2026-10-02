@@ -848,9 +848,19 @@ private:
 // for that post before enqueuing anything that consumes the sum. No attached link
 // (a tp=1 process) makes this a no-op, exactly like tp_allreduce_row for a peer rank.
 void tp_prefill_allreduce_bf16(void* in_out, size_t elems);
+// (dual-GPU B1) The same all-reduce posted on a per-rank side stream (copy engines run while the
+// compute stream continues); the covered rows are valid on the compute stream only after
+// tp_prefill_allreduce_join(). Not tp: no-op.
+// Returns a ticket (-1 when not tp): tp_prefill_allreduce_wait(ticket) orders the compute stream
+// after that op (and every op posted before it); join waits for all of them.
+int tp_prefill_allreduce_bf16_async(void* in_out, size_t elems);
+void tp_prefill_allreduce_wait(int ticket);
+void tp_prefill_allreduce_join();
 // (dual-GPU) Both ranks of a mirrored pass pass their own value at the same point; both get the
 // minimum (tp=1: v). For rank-local, memory-driven choices that must not diverge.
 int tp_prefill_agree_min(int v);
+// Bitwise-AND twin: each bit is an arm a rank can run; both get the set BOTH can run (tp=1: v).
+int tp_prefill_agree_and(int v);
 
 // f32 twin of tp_prefill_allreduce_bf16 (same rendezvous): the prefill seed's zero-padded
 // [vocab] logits row, summed in place so both ranks hold the full row.
