@@ -1054,6 +1054,211 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
         q_heads, v_heads, head_dim, conv_kernel, eps, q0, ql, k0, kl, v0, vl);
 }
 
+// ---------------------------------------------------------------------------
+// MULTI-STEP twins of the two batched kernels above, for a speculative verify of B sessions x
+// T consecutive positions (rows STEP-major: row t * B + b is session b's step t). Each block
+// walks its session's steps in order with the recurrent state held on chip, so a layer is ONE
+// launch instead of T, and the state is read once instead of T times.
+//
+// Two modes, so a verify needs no snapshot of the state:
+//   forward (write_state = false): every step's output, the state in memory untouched;
+//   commit  (write_state = true):  advance the state in memory by nsteps[b] steps (the accepted
+//                                  prefix), outputs optional.
+// Per step the arithmetic is the single-step kernel's, operation for operation (the state
+// value carried to step t + 1 is the fp32 / bf16 value the single-step kernel would have stored
+// and re-read), so the outputs and the committed state are bit-identical to T single steps.
+__global__ void conv_split_l2norm_steps_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* const* __restrict__ conv_states,
+    size_t conv_off,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ v,
+    int nb, int steps, const int* __restrict__ nsteps, bool write_state, bool write_out,
+    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps,
+    int q0, int ql, int k0, int kl, int v0, int vl)
+{
+    constexpr int KMAX = 8;
+    const int h  = blockIdx.x;
+    const int b  = blockIdx.y;
+    const int t  = threadIdx.x;
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int qkv_dim = 2 * q_dim + v_dim;
+    __nv_bfloat16* conv_state = conv_states[b] + conv_off;
+    const int ns = nsteps ? nsteps[b] : steps;
+
+    const int q0e = q0 > 0 ? q0 : 0;
+    const int qle = ql > 0 ? ql : q_heads;
+    const int k0e = k0 > 0 ? k0 : 0;
+    const int kle = kl > 0 ? kl : q_heads;
+    const int v0e = v0 > 0 ? v0 : 0;
+    const int vle = vl > 0 ? vl : v_heads;
+    int wrow = -1;
+    bool do_norm = false;
+    int d;
+    __nv_bfloat16* outb;
+    size_t out_stride;
+    if (h < q_heads) {
+        const int hq = h - q0e;
+        d = h * head_dim + t;  outb = q + d;  out_stride = q_dim;  do_norm = true;
+        if (hq >= 0 && hq < qle) wrow = hq * head_dim + t;
+    } else if (h < 2 * q_heads) {
+        const int hk = h - q_heads - k0e;
+        d = q_dim + (h - q_heads) * head_dim + t;
+        outb = k + d - q_dim;  out_stride = q_dim;  do_norm = true;
+        if (hk >= 0 && hk < kle) wrow = (qle + hk) * head_dim + t;
+    } else {
+        const int hv = h - 2 * q_heads - v0e;
+        d = 2 * q_dim + (h - 2 * q_heads) * head_dim + t;
+        outb = v + d - 2 * q_dim;  out_stride = v_dim;
+        if (hv >= 0 && hv < vle) wrow = (qle + kle + hv) * head_dim + t;
+    }
+    if (d >= qkv_dim || wrow < 0 || conv_kernel > KMAX + 1) return;
+
+    __nv_bfloat16 win[KMAX];
+    for (int p = 0; p < conv_kernel - 1; p++) win[p] = conv_state[(size_t)p * qkv_dim + d];
+    __shared__ float sw[32];
+    for (int st = 0; st < ns; st++) {
+        const size_t row = (size_t)st * nb + b;
+        const __nv_bfloat16 xin = qkv[row * qkv_dim + d];
+        float y = 0.f;
+        for (int p = 0; p < conv_kernel - 1; p++)
+            y += q36_to_f(win[p]) * q36_to_f(conv_w[(size_t)wrow * conv_kernel + p]);
+        y += q36_to_f(xin) * q36_to_f(conv_w[(size_t)wrow * conv_kernel + (conv_kernel - 1)]);
+        for (int p = 0; p < conv_kernel - 2; p++) win[p] = win[p + 1];
+        if (conv_kernel > 1) win[conv_kernel - 2] = xin;
+        if (!write_out) continue;
+        const float oy = q36_silu(y);
+        if (do_norm) {
+            const float ss = q36_wsum(oy * oy);
+            if ((t & 31) == 0) sw[t >> 5] = ss;
+            __syncthreads();
+            if (t < 32) {
+                float vv = (t < (head_dim + 31) / 32) ? sw[t] : 0.f;
+                vv = q36_wsum(vv);
+                if (t == 0) sw[0] = rsqrtf(vv + eps);
+            }
+            __syncthreads();
+            outb[row * out_stride] = __float2bfloat16(oy * sw[0]);
+            __syncthreads();   // sw is reused by the next step
+        } else {
+            outb[row * out_stride] = __float2bfloat16(oy);
+        }
+    }
+    if (write_state)
+        for (int p = 0; p < conv_kernel - 1; p++) conv_state[(size_t)p * qkv_dim + d] = win[p];
+}
+
+template <int COLS, int HEAD_DIM>
+__global__ void gdn_ar_steps_kernel(const __nv_bfloat16* __restrict__ q,
+                                    const __nv_bfloat16* __restrict__ k,
+                                    const __nv_bfloat16* __restrict__ v,
+                                    const __nv_bfloat16* __restrict__ alpha,
+                                    const __nv_bfloat16* __restrict__ beta,
+                                    const __nv_bfloat16* __restrict__ dt,
+                                    const __nv_bfloat16* __restrict__ a,
+                                    float* const* __restrict__ states,
+                                    size_t state_off,
+                                    __nv_bfloat16* __restrict__ out,
+                                    int nb, int steps, const int* __restrict__ nsteps,
+                                    bool write_state, bool write_out,
+                                    int q_heads, int v_heads, bool qh_block, int v0, int vloc) {
+    constexpr int NROW = HEAD_DIM / 32;
+    const int vh   = blockIdx.x;
+    const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int b    = blockIdx.z;
+    const int lane = threadIdx.x & 31;
+    const int vhl  = vloc > 0 ? vloc : v_heads;
+    if (vh >= vhl || j >= HEAD_DIM) return;
+    const int vhg  = vh + v0;
+    const int qh   = qh_block ? (vhg / (v_heads / q_heads)) : (vhg % q_heads);
+    const float scale = rsqrtf((float)HEAD_DIM);
+    const int qdim = q_heads * HEAD_DIM, vdim = v_heads * HEAD_DIM;
+    const int ns = nsteps ? nsteps[b] : steps;
+    const size_t col_off = state_off + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    float* col = states[b] + col_off;
+
+    float sloc[NROW];
+    #pragma unroll
+    for (int r = 0; r < NROW; r++) sloc[r] = col[lane + r * 32];
+    for (int st = 0; st < ns; st++) {
+        const size_t row = (size_t)st * nb + b;
+        const __nv_bfloat16* qhptr = q + row * qdim + (size_t)qh * HEAD_DIM;
+        const __nv_bfloat16* khptr = k + row * qdim + (size_t)qh * HEAD_DIM;
+        const __nv_bfloat16* vhptr = v + row * vdim + (size_t)vhg * HEAD_DIM;
+        const float bb = q36_sigmoid(q36_to_f(beta[row * v_heads + vhg]));
+        const float g  = __expf(q36_softplus(q36_to_f(alpha[row * v_heads + vhg]) + q36_to_f(dt[vhg])) *
+                                q36_to_f(a[vhg]));
+        float part_sk = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) part_sk += sloc[r] * q36_to_f(khptr[lane + r * 32]);
+        const float sk = g * q36_wsum(part_sk);
+        const float delta = (q36_to_f(vhptr[j]) - sk) * bb;
+        float part_y = 0.f;
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            const float s_new = sloc[r] * g + q36_to_f(khptr[i]) * delta;
+            sloc[r] = s_new;
+            part_y += s_new * q36_to_f(qhptr[i]) * scale;
+        }
+        if (write_out) {
+            const float y = q36_wsum(part_y);
+            if (lane == 0) out[row * vdim + (size_t)vhg * HEAD_DIM + j] = __float2bfloat16(y);
+        }
+    }
+    if (write_state) {
+        #pragma unroll
+        for (int r = 0; r < NROW; r++) col[lane + r * 32] = sloc[r];
+    }
+}
+
+void launch_qwen36_conv_split_l2norm_steps(
+    const void* qkv_bf16, const void* conv_w_bf16,
+    void* const* conv_states_bf16, size_t conv_off, void* q_bf16, void* k_bf16,
+    void* v_bf16, int batch, int steps, const int* nsteps, bool write_state, bool write_out,
+    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps, cudaStream_t stream,
+    int q0, int ql, int k0, int kl, int v0, int vl)
+{
+    if (batch < 1 || (steps < 1 && !nsteps)) return;
+    conv_split_l2norm_steps_kernel<<<dim3(2 * q_heads + v_heads, batch), head_dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
+        reinterpret_cast<__nv_bfloat16* const*>(conv_states_bf16), conv_off,
+        reinterpret_cast<__nv_bfloat16*>(q_bf16),
+        reinterpret_cast<__nv_bfloat16*>(k_bf16),
+        reinterpret_cast<__nv_bfloat16*>(v_bf16),
+        batch, steps, nsteps, write_state, write_out,
+        q_heads, v_heads, head_dim, conv_kernel, eps, q0, ql, k0, kl, v0, vl);
+}
+
+bool launch_qwen36_gdn_ar_steps(const void* q_bf16, const void* k_bf16, const void* v_bf16,
+                                const void* alpha_bf16, const void* beta_bf16,
+                                const void* dt_bf16, const void* a_bf16,
+                                float* const* states, size_t state_off, void* out_bf16,
+                                int batch, int steps, const int* nsteps, bool write_state,
+                                bool write_out, int q_heads, int v_heads, int head_dim,
+                                bool qh_block, cudaStream_t stream, int v0, int vloc) {
+    if (batch < 1 || head_dim != 128 || (steps < 1 && !nsteps)) return false;
+    constexpr int HD = 128;
+    const int veff = vloc > 0 ? vloc : v_heads;
+    constexpr int C = 4;
+    dim3 grid(veff, HD / C, batch);
+    gdn_ar_steps_kernel<C, HD><<<grid, C * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+        states, state_off, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+        batch, steps, nsteps, write_state, write_out, q_heads, v_heads, qh_block, v0, vloc);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 void launch_qwen36_conv_split_l2norm_fused(
     const void* qkv_bf16, const void* conv_w_bf16,
     void* conv_state_bf16, void* q_bf16, void* k_bf16,

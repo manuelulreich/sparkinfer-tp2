@@ -399,6 +399,23 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
     // tp>1 rank window, as in launch_qwen36_conv_split_l2norm_fused (all 0 = full width).
     int q0 = 0, int ql = 0, int k0 = 0, int kl = 0, int v0 = 0, int vl = 0);
 
+// Multi-step twins (see qwen36.cu): `batch` sessions x `steps` (or nsteps[b], device) consecutive
+// steps, rows step-major (row t * batch + b). write_state = false leaves the state untouched
+// (verify forward); write_state = true commits that many steps (outputs optional).
+void launch_qwen36_conv_split_l2norm_steps(
+    const void* qkv_bf16, const void* conv_w_bf16,
+    void* const* conv_states_bf16, size_t conv_off, void* q_bf16, void* k_bf16,
+    void* v_bf16, int batch, int steps, const int* nsteps, bool write_state, bool write_out,
+    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps, cudaStream_t stream,
+    int q0, int ql, int k0, int kl, int v0, int vl);
+bool launch_qwen36_gdn_ar_steps(const void* q_bf16, const void* k_bf16, const void* v_bf16,
+                                const void* alpha_bf16, const void* beta_bf16,
+                                const void* dt_bf16, const void* a_bf16,
+                                float* const* states, size_t state_off, void* out_bf16,
+                                int batch, int steps, const int* nsteps, bool write_state,
+                                bool write_out, int q_heads, int v_heads, int head_dim,
+                                bool qh_block, cudaStream_t stream, int v0, int vloc);
+
 // `state_f32` is the sequence's whole GDN state allocation and `state_off` is the layer's slot
 // within it, counted in state elements -- the same split launch_qwen36_gdn_ar_batched takes, and
 // required for the same reason: with state_compact_b16 the slot offset is a bf16-element offset,

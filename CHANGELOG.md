@@ -42,6 +42,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **Multi-step GDN kernels for the speculative group verify**: the conv and the recurrence walk
+  all of a session's verify positions in ONE launch per layer with the state on chip, read-only;
+  after acceptance a commit pass advances each session by exactly its accepted steps. No GDN
+  snapshot, restore or replay any more (and no 75 MB-per-session snapshot buffers); per step the
+  arithmetic is the single-step kernels', so deterministic mode stays lossless. Group verify at
+  ~3.3 sessions 38.6 → 32.2 ms; cohort e2e C2 122.5 → 136.0, C4 173 → 188 (per-request sum
+  207 → 256). `SPARKINFER_TP_SEG_MULTISTEP=0` restores the per-step path.
 - **tp=2 speculative decoding of concurrent requests together** (DSpark group): every step drafts
   each request on its own draft KV state, then verifies all of their blocks in ONE segmented
   tensor-core pass (rows step-major, per-session GDN snapshot/replay, per-session capture), so the

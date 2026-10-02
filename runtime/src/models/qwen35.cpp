@@ -954,6 +954,14 @@ struct Qwen35Model::Impl {
     // grown on demand, agreed across the ranks, released when the group run ends.
     std::vector<float*> vr_seg_snap_lin;
     std::vector<bf16*> vr_seg_snap_conv;
+    // ...or, with the multi-step GDN kernels, no snapshot at all: a read-only forward over every
+    // step and a commit of the accepted steps. Per linear layer: the full-width q|k|v conv input
+    // rows, the conv outputs and alpha/beta, kept from the forward for the commit.
+    int vr_ms_state = 0;            // 0 untried, 1 ready, -1 declined (agreed)
+    bf16 *vr_ms_full = nullptr, *vr_ms_q = nullptr, *vr_ms_k = nullptr, *vr_ms_v = nullptr,
+         *vr_ms_a = nullptr, *vr_ms_b = nullptr;
+    int* vr_ms_keep = nullptr;      // device [R]
+    int* h_vr_ms_keep = nullptr;    // pinned [R]
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -3881,7 +3889,33 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     }
     cu(cudaMemcpyAsync(s.vr_ids, s.h_vr, (size_t)3 * R * sizeof(int), cudaMemcpyHostToDevice, st),
        "tp verify ids");
-    if (seg && T > 1) {
+    // (dual-GPU C2) Segmented rows on the multi-step kernels: one conv + one recurrence launch per
+    // layer for all sessions and steps, the state read-only until the accepted steps commit.
+    // SPARKINFER_TP_SEG_MULTISTEP=0 keeps the per-step launches + snapshot/replay (A/B).
+    static const bool ms_env = [] {
+        const char* e = getenv("SPARKINFER_TP_SEG_MULTISTEP"); return !(e && e[0] == '0');
+    }();
+    std::vector<int> lin_ord(c.n_layers, -1);
+    int n_lin = 0;
+    for (int L = 0; L < c.n_layers; L++) if (is_linear_layer(c, L)) lin_ord[L] = n_lin++;
+    bool ms = seg && ms_env && c.linear_head_dim == 128 && s.vr_ms_state >= 0;
+    if (ms && s.vr_ms_state == 0) {
+        const size_t rl = (size_t)n_lin * R;
+        bool ok = cudaMalloc(&s.vr_ms_full, rl * lqkv * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ms_q, rl * lqdim * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ms_k, rl * lqdim * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ms_v, rl * c.linear_v_heads * lhd * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ms_a, rl * c.linear_v_heads * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ms_b, rl * c.linear_v_heads * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ms_keep, (size_t)R * sizeof(int)) == cudaSuccess &&
+                  cudaHostAlloc(&s.h_vr_ms_keep, (size_t)R * sizeof(int), cudaHostAllocDefault) == cudaSuccess;
+        if (ok) ok = cudaMemsetAsync(s.vr_ms_full, 0, rl * lqkv * sizeof(bf16), st) == cudaSuccess;
+        cudaGetLastError();
+        ok = tp_prefill_agree_min(ok ? 1 : 0) != 0;
+        s.vr_ms_state = ok ? 1 : -1;
+        if (!ok) ms = false;
+    }
+    if (seg && T > 1 && !ms) {
         if ((int)s.vr_seg_snap_lin.size() < S) {
             bool ok = true;
             while (ok && (int)s.vr_seg_snap_lin.size() < S) {
@@ -3954,9 +3988,10 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         }
     };
     // q|k|v windows of the recorded rank rows -> the full-width packed qkv rows the conv reads.
-    auto scatter_qkv = [&](const bf16* rec, int rows) {
+    auto scatter_qkv = [&](const bf16* rec, int rows, bf16* dst = nullptr) {
+        bf16* full = dst ? dst : s.vr_full;
         auto cp = [&](size_t dst_off, size_t src_off, int width) {
-            cu(cudaMemcpy2DAsync(s.vr_full + dst_off, (size_t)lqkv * sizeof(bf16),
+            cu(cudaMemcpy2DAsync(full + dst_off, (size_t)lqkv * sizeof(bf16),
                                  rec + src_off, (size_t)wq * sizeof(bf16),
                                  (size_t)width * sizeof(bf16), rows, cudaMemcpyDeviceToDevice, st),
                "tp verify qkv scatter");
@@ -3996,6 +4031,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         const char* e = getenv("SPARKINFER_TP_ROWS_GDN_BATCHED"); return !(e && e[0] == '0');
     }();
     bool mb = multi && mb_env && (seg ? S > 1 : n > 1) && c.linear_head_dim == 128;
+    if (ms) mb = true;   // the pointer arrays below
     const int lvdim_full = c.linear_v_heads * lhd;
     if (mb && !s.vr_mb_ready) {
         bool ok = cudaMalloc(&s.vr_mb_ptrs, (size_t)2 * R * sizeof(void*)) == cudaSuccess &&
@@ -4056,6 +4092,29 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         const char* e = getenv("SPARKINFER_TP_ROWS_ATTN_BATCHED"); return !(e && e[0] == '0');
     }();
     bool ma = tc && (mb || !multi || seg) && ma_env;
+    auto ms_full = [&](int L) { return s.vr_ms_full + (size_t)lin_ord[L] * R * lqkv; };
+    auto ms_q = [&](int L) { return s.vr_ms_q + (size_t)lin_ord[L] * R * lqdim; };
+    auto ms_k = [&](int L) { return s.vr_ms_k + (size_t)lin_ord[L] * R * lqdim; };
+    auto ms_v = [&](int L) { return s.vr_ms_v + (size_t)lin_ord[L] * R * lvdim_full; };
+    auto ms_a = [&](int L) { return s.vr_ms_a + (size_t)lin_ord[L] * R * c.linear_v_heads; };
+    auto ms_b = [&](int L) { return s.vr_ms_b + (size_t)lin_ord[L] * R * c.linear_v_heads; };
+    // One multi-step conv + recurrence pass of layer L over all S sessions (forward: nsteps
+    // null, T steps, outputs, state untouched; commit: nsteps = accepted steps, state written).
+    auto ms_pass = [&](int L, const int* nsteps, bool commit) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+        const size_t state_off = (size_t)gdn_state_slot(c, L) * vloc * lhd * lhd;
+        kernels::launch_qwen36_conv_split_l2norm_steps(
+            ms_full(L), w.ssm_conv, s.vr_mb_ptrs, conv_off, ms_q(L), ms_k(L), ms_v(L), S, T,
+            nsteps, commit, !commit, c.linear_q_heads, c.linear_v_heads, lhd,
+            c.linear_conv_kernel, c.rms_eps, st, q0, ql, q0, ql, v0, vloc);
+        if (!kernels::launch_qwen36_gdn_ar_steps(
+                ms_q(L), ms_k(L), ms_v(L), ms_a(L), ms_b(L), w.ssm_dt, w.ssm_a,
+                reinterpret_cast<float* const*>(s.vr_mb_ptrs + R), state_off, s.vr_mb_o, S, T,
+                nsteps, commit, !commit, c.linear_q_heads, c.linear_v_heads, lhd, c.gdn_qh_block,
+                st, v0, vloc))
+            cu(cudaErrorInvalidValue, "tp seg gdn steps");
+    };
     const int mbs = s.kv->max_blocks_per_seq();
     if (ma && s.vr_ma_state == 0) {
         const size_t fa = (size_t)R * n_q * Impl::MAX_NSPLITS;
@@ -4103,14 +4162,22 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                 proj_rows(w.ssm_alpha, w.ssm_alpha_type, s.vr_xn, H, rec_a, vloc);
                 proj_rows(w.ssm_beta, w.ssm_beta_type, s.vr_xn, H, rec_b, vloc);
             }
-            scatter_qkv(rec, n);
-            if (mb) {
+            if (ms) {
+                scatter_qkv(rec, n, ms_full(L));
+                kernels::launch_gather_rows(ms_a(L) + v0, c.linear_v_heads, rec_a, vloc, vloc, n, st);
+                kernels::launch_gather_rows(ms_b(L) + v0, c.linear_v_heads, rec_b, vloc, vloc, n, st);
+                ms_pass(L, nullptr, false);
+                kernels::launch_gather_rows(s.vr_gdn, Kw, s.vr_mb_o + (size_t)v0 * lhd, lvdim_full,
+                                            Kw, n, st);
+            } else if (mb) {
+                scatter_qkv(rec, n);
                 kernels::launch_gather_rows(s.vr_mb_a + v0, c.linear_v_heads, rec_a, vloc, vloc, n, st);
                 kernels::launch_gather_rows(s.vr_mb_b + v0, c.linear_v_heads, rec_b, vloc, vloc, n, st);
                 gdn_batched_steps(L, T);
                 kernels::launch_gather_rows(s.vr_gdn, Kw, s.vr_mb_o + (size_t)v0 * lhd, lvdim_full,
                                             Kw, n, st);
             } else {
+                scatter_qkv(rec, n);
                 for (int r = 0; r < n; r++) gdn_step(L, r, s.vr_gdn + (size_t)r * Kw);
             }
             kernels::launch_qwen36_gated_norm(s.vr_gdn, s.vr_z, w.ssm_norm, s.vr_ln, n * vloc, lhd,
@@ -4339,6 +4406,20 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         // pointed at the (otherwise unused) single-verify snapshot as scratch.
         int max_keep = 0;
         bool any_partial = false;
+        if (ms) {
+            for (int j = 0; j < S; j++) {
+                int k = 1;
+                while (k < T && ids[(size_t)k * S + j] == out_argmax[(size_t)(k - 1) * S + j]) ++k;
+                seg_keep[j] = k;
+                s.h_vr_ms_keep[j] = k;
+            }
+            cu(cudaMemcpyAsync(s.vr_ms_keep, s.h_vr_ms_keep, (size_t)S * sizeof(int),
+                               cudaMemcpyHostToDevice, st), "tp seg keep");
+            for (int L = 0; L < c.n_layers; L++)
+                if (is_linear_layer(c, L)) ms_pass(L, s.vr_ms_keep, true);
+            cu(cudaStreamSynchronize(st), "tp seg commit");
+            return n;
+        }
         for (int j = 0; j < S; j++) {
             int k = 1;
             while (k < T && ids[(size_t)k * S + j] == out_argmax[(size_t)(k - 1) * S + j]) ++k;
