@@ -895,6 +895,17 @@ int tp_prefill_agree_and(int v);
 // index per row (n <= 64); both get the global vocab index (ties to rank 0, the lower half).
 void tp_exchange_argmax(const float* val, const int* idx, int n, int rows_per_rank, int* out);
 
+// (dual-GPU) Sum a bf16 buffer across the two ranks in place, posted on the caller's `stream`
+// (both ranks call it at the same point of a mirrored pass, each with its own buffer and stream;
+// the same rendezvous as tp_prefill_allreduce_bf16). Used by the split draft model. Not tp: no-op.
+void tp_allreduce_bf16_on(void* in_out, size_t elems, cudaStream_t stream);
+// (dual-GPU) Run `peer_fn` on the persistent tp worker thread of `peer_device` (the one the rank-1
+// model's mirrored ops run on, bound to that device) while the caller runs `leader_fn`; returns
+// once both have. Either may be empty. Lock order as for every mirrored op: hold the leader
+// model's device mutex, if any, before calling.
+void tp_run_with_peer(int peer_device, const std::function<void()>& peer_fn,
+                      const std::function<void()>& leader_fn);
+
 // f32 twin of tp_prefill_allreduce_bf16 (same rendezvous): the prefill seed's zero-padded
 // [vocab] logits row, summed in place so both ranks hold the full row.
 void tp_prefill_allreduce_f32(float* in_out, size_t elems);

@@ -5283,6 +5283,41 @@ void tp_exchange_argmax(const float* val, const int* idx, int n, int rows_per_ra
     tp_prefill_agree_min(0);
 }
 
+// Slots for tp_allreduce_bf16_on: each rank publishes its buffer and stream before arriving, the
+// leader reads both inside its post. A rank cannot republish before the leader has posted the
+// op it arrived for (the peer spins until then), so a slot is never overwritten under the read.
+static void* g_tp_on_buf[2] = {nullptr, nullptr};
+static cudaStream_t g_tp_on_stream[2] = {nullptr, nullptr};
+void tp_allreduce_bf16_on(void* in_out, size_t elems, cudaStream_t stream) {
+    if (!in_out || elems == 0 || !stream) return;
+    const int r = tp_prefill_rank();
+    if (r < 0) return;
+    tp_prefill_allreduce_join();   // an async prefill op may still own the link's landing scratch
+    g_tp_on_buf[r] = in_out;
+    g_tp_on_stream[r] = stream;
+    if (r != 0) { tp_peer_rendezvous("draft allreduce"); return; }
+    tp_leader_rendezvous("draft allreduce", [&] {
+        GpuLink::RankRef a{g_tp_prefill_dev[0], g_tp_on_stream[0], g_tp_on_buf[0], g_tp_on_buf[0]};
+        GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_on_stream[1], g_tp_on_buf[1], g_tp_on_buf[1]};
+        if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
+            { cu(cudaErrorUnknown, "tp draft allreduce"); note_tp_fatal("GpuLink draft allreduce failed"); }
+    });
+}
+
+void tp_run_with_peer(int peer_device, const std::function<void()>& peer_fn,
+                      const std::function<void()>& leader_fn) {
+    if (!peer_fn) {
+        if (leader_fn) leader_fn();
+        return;
+    }
+    TpWorker& w = tp_worker_for(peer_device);
+    std::unique_lock<std::mutex> hold(w.scope_mu);
+    std::function<void()> job = peer_fn;
+    w.post(&job);
+    if (leader_fn) leader_fn();
+    w.wait();
+}
+
 void tp_prefill_allreduce_f32(float* in_out, size_t elems) {
     // Same registration + two-way rendezvous as tp_prefill_allreduce_bf16, for an f32 buffer
     // (the prefill seed's zero-padded [vocab] logits row).
@@ -8655,8 +8690,24 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         activate_session(job->seq_id);
         reset_mrope_offset();
         int next = -1, batched_done = 0;
-        if (batched_prefill_windowed_enabled(s.gguf, s.cfg, g.n, s.kv))
-            next = prefill_batched_chunked(prompt.data(), g.n, false, &batched_done);
+        const bool batched = batched_prefill_windowed_enabled(s.gguf, s.cfg, g.n, s.kv);
+        if (batched) next = prefill_batched_chunked(prompt.data(), g.n, false, &batched_done);
+        if (next < 0 && batched) {
+            // The batched prefill did not fit beside this join's capture rows and draft state (it
+            // already narrowed its window as far as it goes). Finishing it token by token takes
+            // minutes at 12k (measured: four concurrent 12k joins, ~700 s each), so give the
+            // speculative state back and let the engine prefill the request ordinarily, without
+            // them. Its session is reused as it is: an ordinary prefill starts again at 0.
+            fprintf(stderr, "[spec-group] join declined: the batched prefill does not fit beside "
+                            "the draft (n=%d); prefilling it ordinarily\n", g.n);
+            if (s.dflash_context) {
+                cudaFree(s.dflash_context);
+                s.dflash_context = nullptr;
+                s.dflash_ctx_cap = 0;
+            }
+            drop(g);
+            return false;
+        }
         if (next < 0) {
             for (int i = batched_done; i < g.n; i++) {
                 set_dflash_capture_row(0);
@@ -8675,8 +8726,19 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         draft.reset();
         std::vector<int> draft_ids(B + 1, 0);
         auto _td = std::chrono::steady_clock::now();
-        if (!draft.forward_block(dflash_context_buffer(), g.n, g.block.data(), g.start,
-                                 draft_ids.data(), nullptr, D, nullptr, s.dflash_ctx_start)) {
+        const bool first_ok = draft.forward_block(dflash_context_buffer(), g.n, g.block.data(),
+                                                  g.start, draft_ids.data(), nullptr, D, nullptr,
+                                                  s.dflash_ctx_start);
+        // The prompt's capture rows (51 KB a row, ~0.6 GB at 12k) fed only this first draft;
+        // every later step drafts from the session's own `cap`. Give them back now rather than
+        // when the group ends, for the prefills of whatever runs meanwhile. The draft has read
+        // them: forward_block synchronises its stream (this model's) before it returns.
+        if (s.dflash_context) {
+            cudaFree(s.dflash_context);
+            s.dflash_context = nullptr;
+            s.dflash_ctx_cap = 0;
+        }
+        if (!first_ok) {
             // The prompt is prefilled: hand the job back engaged at its first token.
             fprintf(stderr, "[spec-group] first draft failed (n=%d)\n", g.n);
             drop(g);

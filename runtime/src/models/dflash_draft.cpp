@@ -3,6 +3,7 @@
 #include "sparkinfer/device_health.h"
 #include <atomic>
 #include "sparkinfer/models/dflash_kernels.h"
+#include "sparkinfer/models/qwen35.h"   // tp_allreduce_bf16_on, tp_run_with_peer (split draft)
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
@@ -323,6 +324,15 @@ inline bool q8_on() { return draft_w_bits() != 0; }
 
 struct DFlashDraftModel::Impl {
     DFlashDraftConfig cfg;
+    int device = 0;               // the card this instance allocated on (set at construction)
+    // (dual-GPU) Split draft. On the rank-0 instance: the rank-1 slice and its device, run beside
+    // every forward / KV-state call. On both: the target's stream on this card (the draft runs on
+    // it, see tp_attach). tp_split: this instance computes half of each layer and sums through the
+    // link (true on both ranks once attached).
+    DFlashDraftModel* tp_peer = nullptr;
+    int tp_peer_dev = -1;
+    cudaStream_t tp_stream = nullptr;
+    bool tp_split = false;
     std::vector<LayerWeights> layers;
     bf16* fc = nullptr;           // [H, n_cap * H] as [out, in] for gemv
     // YaRN rotary table (null unless the checkpoint configures rope_type "yarn").
@@ -463,7 +473,7 @@ struct DFlashDraftModel::Impl {
         const int H = cfg.hidden, I = cfg.intermediate;
         const int qdim = cfg.n_q_heads * cfg.head_dim, kvdim = cfg.n_kv_heads * cfg.head_dim;
         const int n_cap = (int)cfg.target_layer_ids.size();
-        const int V = std::max(cfg.vocab, 1);
+        const int V = cfg.tp_rank == 0 ? std::max(cfg.vocab, 1) : 1;   // the head runs on rank 0
         int kmax = std::max(I, H);
         kmax = std::max(kmax, n_cap * H);
         kmax = std::max(kmax, qdim);
@@ -518,6 +528,76 @@ struct DFlashDraftModel::Impl {
     std::vector<KvState> kv_states;
     KvState kv_default;
     int kv_cur = -1;
+    // Make state `id` (-1 = the built-in cache) the one k_cache/v_cache/seq_len/kv_cap describe.
+    // This rank only (DFlashDraftModel::kv_state_select also selects on the peer).
+    bool select(int id) {
+        if (id == kv_cur) return true;
+        if (id >= 0 && (id >= (int)kv_states.size() || !kv_states[id].live)) return false;
+        KvState& out = kv_cur < 0 ? kv_default : kv_states[kv_cur];
+        out.k.swap(k_cache);
+        out.v.swap(v_cache);
+        out.seq_len = seq_len;
+        out.ctx_lo = ctx_lo;
+        out.cap = kv_cap;
+        KvState& in = id < 0 ? kv_default : kv_states[id];
+        k_cache.swap(in.k);
+        v_cache.swap(in.v);
+        seq_len = in.seq_len;
+        ctx_lo = in.ctx_lo;
+        kv_cap = in.cap;
+        kv_cur = id;
+        return true;
+    }
+    // Whether forward_blocks can take the batched path for these sessions (steady-state blocks on
+    // the dp4a/Q4 tiers, unwindowed, within kMultiRows), filling each session's cache length and
+    // context-row offset. Does not allocate (see multi_alloc).
+    bool multi_plan(int n, const DFlashDraftModel::DraftSeg* seg, int proposals,
+                    std::vector<int>& past, std::vector<int>& ctx_off, int& ctx_total) {
+        static const bool multi_env = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_MULTI"); return !(e && e[0] == '0');
+        }();
+        static const int kDp4a = []{ const char* e = getenv("SPARKINFER_DFLASH_DP4A");
+                                     return e ? atoi(e) : 15; }();
+        static const int kRowShift = []{
+            const char* e = getenv("SPARKINFER_DFLASH_ROW_SHIFT"); return (e && e[0] == '0') ? 0 : 1;
+        }();
+        static const int kFullWindowEnv = []{ const char* e = getenv("SPARKINFER_DFLASH_FULL_WINDOW");
+                                              return e ? atoi(e) : -1; }();
+        const auto& c = cfg;
+        const int depth = std::min(c.block_size, proposals > 0 ? std::min(proposals, 15) : 5);
+        const int BW = width_for(depth);
+        const int R = kMultiRows;
+        const int rows = n * BW;
+        const bool fast_w = (BW == 16 || BW == 8 || BW == 7 || BW == 6 || BW == 5 || BW == 4 || BW == 2);
+        bool ok = multi_env && n >= 2 && rows <= R && n * depth <= R && fast_w && kDp4a == 15 &&
+                  kRowShift == 1 && xq81 && q8_fc.q4 && head_q8 && lm_head_type == 12 &&
+                  kFullWindowEnv < 0 && 3 * c.sliding_window <= 0 && !lm_head_i4 &&
+                  !lm_head_i8 && markov_w1 && markov_w2_q;
+        for (int L = 0; ok && L < c.n_layers; L++) {
+            const auto& w = layers[L];
+            ok = w.q8_wq.q4 && w.q8_wk.q4 && w.q8_wv.q4 && w.q8_wo.q4 && w.q8_gate.q4 &&
+                 w.q8_up.q4 && w.q8_down.q4;
+        }
+        ctx_total = 0;
+        for (int j = 0; ok && j < n; j++) {
+            const DFlashDraftModel::DraftSeg& g = seg[j];
+            ok = g.state >= 0 && g.state < (int)kv_states.size() && kv_states[g.state].live &&
+                 g.ctx_len >= 1 && g.ctx_len <= 8 && g.target_hidden_start == 0 && g.target_hidden &&
+                 g.ids && g.out_argmax;
+            if (!ok) break;
+            const bool cur = g.state == kv_cur;
+            past[j] = cur ? seq_len : kv_states[g.state].seq_len;
+            ctx_off[j] = ctx_total;
+            ctx_total += g.ctx_len;
+            // Unwindowed contexts only: past 12288, or after a truncated capture (ctx_lo), the full
+            // layer attends a window, which forward_block applies and this pass does not.
+            const int lo = cur ? ctx_lo : kv_states[g.state].ctx_lo;
+            const int cap = cur ? kv_cap : kv_states[g.state].cap;
+            ok = past[j] + g.ctx_len == g.pos0 && past[j] + g.ctx_len + BW <= cap &&
+                 past[j] + g.ctx_len < 12288 && lo == 0;
+        }
+        return ok && ctx_total <= R;
+    }
 
     // The draft's quantized weight copies are built on first use, not at load. Constructing them
     // is what makes merely loading the draft tax the TARGET's decode: measured on RTX 5090 with
@@ -658,7 +738,7 @@ struct DFlashDraftModel::Impl {
         gate = alloc<bf16>((size_t)B * I);
         up = alloc<bf16>((size_t)B * I);
         down = alloc<bf16>((size_t)B * H);
-        logits = alloc<float>((size_t)B * std::max(cfg.vocab, 1));
+        logits = alloc<float>((size_t)B * (cfg.tp_rank == 0 ? std::max(cfg.vocab, 1) : 1));
         head_q8 = alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
         d_ids = alloc<int>(B);
         // Proposal-indexed, not row-indexed. Under the row-shift mapping the chain writes
@@ -687,14 +767,52 @@ struct DFlashDraftModel::Impl {
                "h_confidence");
         }
 
+        seq_len = 0;
+        // (dual-GPU) A split draft serves the group path, which drafts every session on its own
+        // kv_state; the built-in cache (max_seq positions, 168 MB per card for DSpark at 16k) is
+        // then only taken if a forward actually runs on it (ensure_builtin_kv).
+        if (cfg.tp_size > 1) {
+            kv_cap = 0;
+            return;
+        }
         k_cache.resize(cfg.n_layers);
         v_cache.resize(cfg.n_layers);
         for (int L = 0; L < cfg.n_layers; L++) {
             k_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
             v_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
         }
-        seq_len = 0;
         kv_cap = cfg.max_seq;
+    }
+
+    // The built-in cache, allocated now if it is not yet (see alloc_scratch). false: no memory.
+    bool ensure_builtin_kv() {
+        std::vector<bf16*>& bk = kv_cur == -1 ? k_cache : kv_default.k;
+        std::vector<bf16*>& bv = kv_cur == -1 ? v_cache : kv_default.v;
+        if (!bk.empty()) return true;
+        const size_t bytes = (size_t)cfg.max_seq * cfg.n_kv_heads * cfg.head_dim * sizeof(bf16);
+        std::vector<bf16*> k, v;
+        bool ok = true;
+        for (int L = 0; L < cfg.n_layers && ok; L++) {
+            void* a = nullptr;
+            void* b = nullptr;
+            ok = cudaMalloc(&a, bytes) == cudaSuccess;
+            if (ok) k.push_back((bf16*)a);
+            ok = ok && cudaMalloc(&b, bytes) == cudaSuccess;
+            if (ok) v.push_back((bf16*)b);
+        }
+        if (!ok) {
+            cudaGetLastError();
+            for (bf16* x : k) cudaFree(x);
+            for (bf16* x : v) cudaFree(x);
+            return false;
+        }
+        for (bf16* x : k) owned.push_back(x);
+        for (bf16* x : v) owned.push_back(x);
+        bk = std::move(k);
+        bv = std::move(v);
+        if (kv_cur == -1) kv_cap = cfg.max_seq;
+        else kv_default.cap = cfg.max_seq;
+        return true;
     }
 
     // NVFP4 -> BF16 at load, decoded on the host.
@@ -745,6 +863,47 @@ struct DFlashDraftModel::Impl {
         return out;
     }
 
+    // (dual-GPU) One rank's slice of a stored [rows, cols] projection, decoded on the host exactly
+    // as upload() / upload_nvfp4() decode the whole tensor: by_rows takes rows
+    // [part * rows/parts, ...), otherwise columns [part * cols/parts, ...). nullptr (logged) when
+    // the dimension does not divide.
+    bf16* upload_part(const TensorView& w, const TensorView* sc, float gs, bool by_rows, int part,
+                      int parts) {
+        const bool fp4 = w.dtype == "U8";
+        if (w.shape.size() != 2 || (fp4 && !sc)) return nullptr;
+        const int rows = (int)w.shape[0];
+        const int cols = (int)w.shape[1] * (fp4 ? 2 : 1);
+        if ((by_rows ? rows : cols) % parts != 0) {
+            fprintf(stderr, "[dflash] cannot split a [%d, %d] projection %d ways by %s\n", rows, cols,
+                    parts, by_rows ? "rows" : "columns");
+            return nullptr;
+        }
+        const int r0 = by_rows ? part * (rows / parts) : 0, nr = by_rows ? rows / parts : rows;
+        const int c0 = by_rows ? 0 : part * (cols / parts), nc = by_rows ? cols : cols / parts;
+        std::vector<bf16> host((size_t)nr * nc);
+        for (int r = 0; r < nr; r++) {
+            const size_t src_r = (size_t)(r0 + r);
+            for (int c = 0; c < nc; c++) {
+                const int col = c0 + c;
+                float v;
+                if (fp4) {
+                    const unsigned char byte = ((const unsigned char*)w.data)[src_r * (cols / 2) + (col >> 1)];
+                    const unsigned char sb = ((const unsigned char*)sc->data)[src_r * (cols / 16) + (col >> 4)];
+                    v = decode_e2m1((col & 1) ? (byte >> 4) : (byte & 0x0F)) * (decode_e4m3(sb) * gs);
+                    host[(size_t)r * nc + c] = __float2bfloat16(v);
+                } else if (w.dtype == "F32") {
+                    host[(size_t)r * nc + c] = __float2bfloat16(((const float*)w.data)[src_r * cols + col]);
+                } else {
+                    host[(size_t)r * nc + c] = ((const bf16*)w.data)[src_r * cols + col];
+                }
+            }
+        }
+        bf16* out = alloc<bf16>(host.size());
+        cu(cudaMemcpy(out, host.data(), host.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+           "upload part");
+        return out;
+    }
+
     bf16* upload(const TensorView& tv) {
         bf16* d = alloc<bf16>(tv.nbytes / sizeof(bf16));
         if (tv.nbytes % sizeof(bf16) == 0) {
@@ -769,11 +928,18 @@ DFlashDraftModel::DFlashDraftModel(const DFlashDraftConfig& cfg) : p_(new Impl()
     }
     // Non-blocking, for the same reason as Qwen35Model's stream: see qwen35.cpp.
     cudaStreamCreateWithFlags(&p_->stream, cudaStreamNonBlocking);
+    cudaGetDevice(&p_->device);
 }
 
 DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
-    if (!p_->kv_states.empty()) kv_state_select(-1);
+    // Free on the card the buffers came from (the rank-1 slice is destroyed from the leader's
+    // thread).
+    int prev = -1;
+    cudaGetDevice(&prev);
+    if (prev != p_->device) cudaSetDevice(p_->device);
+    p_->tp_peer = nullptr;   // the peer is its own object, destroyed on its own
+    if (!p_->kv_states.empty()) p_->select(-1);
     for (auto& st : p_->kv_states) {
         for (bf16* b : st.k) cudaFree(b);
         for (bf16* b : st.v) cudaFree(b);
@@ -782,7 +948,10 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (p_->h_out) cudaFreeHost(p_->h_out);
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
     if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
+    if (p_->m_h_ids) cudaFreeHost(p_->m_h_ids);
+    if (p_->m_h_out) cudaFreeHost(p_->m_h_out);
     if (p_->stream) cudaStreamDestroy(p_->stream);
+    if (prev >= 0 && prev != p_->device) cudaSetDevice(prev);
     delete p_;
     p_ = nullptr;
 }
@@ -860,18 +1029,41 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
     }
 }
 
-void DFlashDraftModel::reset() { p_->seq_len = 0; p_->ctx_lo = 0; }
+void DFlashDraftModel::reset() {
+    p_->seq_len = 0;
+    p_->ctx_lo = 0;
+    if (p_->tp_peer) p_->tp_peer->reset();   // host state only
+}
 
 
 void DFlashDraftModel::crop(int keep) {
     if (keep < 0) keep = 0;
     if (keep > p_->seq_len) keep = p_->seq_len;
     p_->seq_len = keep;
+    if (p_->tp_peer) p_->tp_peer->crop(keep);
 }
 
 int DFlashDraftModel::seq_len() const { return p_->seq_len; }
 
 int DFlashDraftModel::kv_state_create(int capacity) {
+    Impl& s = *p_;
+    if (!s.tp_peer) return kv_state_create_local(capacity);
+    // Both ranks hold one slot per state (each its own KV heads), under the same id: the slot
+    // vectors only ever change together, so a free slot on one is free on the other.
+    int id = -1, peer_id = -1;
+    tp_run_with_peer(s.tp_peer_dev, [&] { peer_id = s.tp_peer->kv_state_create_local(capacity); },
+                     [&] { id = kv_state_create_local(capacity); });
+    if (id >= 0 && id == peer_id) return id;
+    if (id >= 0 || peer_id >= 0)
+        fprintf(stderr, "[dflash] kv_state_create: ranks disagree (rank0 %d, rank1 %d); undoing\n",
+                id, peer_id);
+    if (id >= 0) kv_state_free_local(id);
+    if (peer_id >= 0)
+        tp_run_with_peer(s.tp_peer_dev, [&] { s.tp_peer->kv_state_free_local(peer_id); }, nullptr);
+    return -1;
+}
+
+int DFlashDraftModel::kv_state_create_local(int capacity) {
     Impl& s = *p_;
     if (capacity <= 0) return -1;
     if (capacity > s.cfg.max_seq) capacity = s.cfg.max_seq;
@@ -902,29 +1094,25 @@ int DFlashDraftModel::kv_state_create(int capacity) {
 
 bool DFlashDraftModel::kv_state_select(int id) {
     Impl& s = *p_;
-    if (id == s.kv_cur) return true;
-    if (id >= 0 && (id >= (int)s.kv_states.size() || !s.kv_states[id].live)) return false;
-    Impl::KvState& out = s.kv_cur < 0 ? s.kv_default : s.kv_states[s.kv_cur];
-    out.k.swap(s.k_cache);
-    out.v.swap(s.v_cache);
-    out.seq_len = s.seq_len;
-    out.ctx_lo = s.ctx_lo;
-    out.cap = s.kv_cap;
-    Impl::KvState& in = id < 0 ? s.kv_default : s.kv_states[id];
-    s.k_cache.swap(in.k);
-    s.v_cache.swap(in.v);
-    s.seq_len = in.seq_len;
-    s.ctx_lo = in.ctx_lo;
-    s.kv_cap = in.cap;
-    s.kv_cur = id;
-    return true;
+    if (s.tp_peer && !s.tp_peer->p_->select(id)) return false;   // host state only
+    return s.select(id);
 }
 
 void DFlashDraftModel::kv_state_free(int id) {
     Impl& s = *p_;
+    if (s.tp_peer)
+        tp_run_with_peer(s.tp_peer_dev, [&] { s.tp_peer->kv_state_free_local(id); },
+                         [&] { kv_state_free_local(id); });
+    else
+        kv_state_free_local(id);
+}
+
+void DFlashDraftModel::kv_state_free_local(int id) {
+    Impl& s = *p_;
     if (id < 0 || id >= (int)s.kv_states.size() || !s.kv_states[id].live) return;
-    if (s.kv_cur == id) kv_state_select(-1);
+    if (s.kv_cur == id) s.select(-1);
     cudaStreamSynchronize(s.stream);
+    if (s.tp_stream) cudaStreamSynchronize(s.tp_stream);
     Impl::KvState& st = s.kv_states[id];
     for (bf16* b : st.k) cudaFree(b);
     for (bf16* b : st.v) cudaFree(b);
@@ -977,6 +1165,24 @@ bool DFlashDraftModel::load(const std::string& dir) {
     const std::string cfg_path = dir + "/config.json";
     const std::string st_path = dir + "/model.safetensors";
     parse_config_json(cfg_path, s.cfg);
+    // (dual-GPU) A split rank keeps a contiguous share of the query heads (and with them, GQA
+    // being grouped, of the KV heads) and of the FFN columns; from here on cfg holds this rank's
+    // counts, so every buffer and kernel below sizes itself for the slice.
+    const int tp_n = s.cfg.tp_size > 1 ? s.cfg.tp_size : 1;
+    const int tp_r = tp_n > 1 ? s.cfg.tp_rank : 0;
+    if (tp_n > 1) {
+        const auto& c = s.cfg;
+        if (tp_n != 2 || tp_r < 0 || tp_r >= tp_n || c.n_q_heads % tp_n || c.n_kv_heads % tp_n ||
+            c.intermediate % (tp_n * 32) || ((c.n_q_heads / tp_n) * c.head_dim) % 32) {
+            fprintf(stderr, "[dflash] cannot split this draft %d ways (%d query heads, %d KV heads, "
+                            "FFN %d)\n", tp_n, c.n_q_heads, c.n_kv_heads, c.intermediate);
+            return false;
+        }
+        s.cfg.n_q_heads /= tp_n;
+        s.cfg.n_kv_heads /= tp_n;
+        s.cfg.intermediate /= tp_n;
+    }
+    const bool lead = tp_r == 0;
     SafeTensorsFile st;
     if (!st.load(st_path)) {
         fprintf(stderr, "[dflash] failed to load %s\n", st_path.c_str());
@@ -999,19 +1205,23 @@ bool DFlashDraftModel::load(const std::string& dir) {
     // <name>.weight (U8), <name>.weight_scale (ue4m3) and <name>.weight_scale_2 (F32 global);
     // a mixed-precision export leaves untouched projections as plain BF16, so both must work
     // within the same checkpoint.
-    auto load_weight = [&](const std::string& name) -> bf16* {
+    // split: 0 = whole, 1 = this rank's rows (output features), 2 = its columns (input features).
+    auto load_weight = [&](const std::string& name, int split = 0) -> bf16* {
         TensorView* w = require(name);
         if (!w) return nullptr;
-        if (w->dtype != "U8") return s.upload(*w);
-        TensorView* sc = optional(name + "_scale");
-        TensorView* g2 = optional(name + "_scale_2");
-        if (!sc) {
+        TensorView* sc = w->dtype == "U8" ? optional(name + "_scale") : nullptr;
+        if (w->dtype == "U8" && !sc) {
             fprintf(stderr, "[dflash] %s is NVFP4-packed but %s_scale is missing\n",
                     name.c_str(), name.c_str());
             return nullptr;
         }
         float gs = 1.0f;
-        if (g2 && g2->nbytes >= sizeof(float)) gs = *(const float*)g2->data;
+        if (sc) {
+            TensorView* g2 = optional(name + "_scale_2");
+            if (g2 && g2->nbytes >= sizeof(float)) gs = *(const float*)g2->data;
+        }
+        if (tp_n > 1 && split != 0) return s.upload_part(*w, sc, gs, split == 1, tp_r, tp_n);
+        if (w->dtype != "U8") return s.upload(*w);
         return s.upload_nvfp4(*w, *sc, gs);
     };
 
@@ -1039,13 +1249,16 @@ bool DFlashDraftModel::load(const std::string& dir) {
     auto* hn = require("hidden_norm.weight");
     auto* nn = require("norm.weight");
     if (!fc || !hn || !nn) return false;
-    s.fc = s.upload(*fc);
-    s.hidden_norm = s.upload(*hn);
+    // Rank 1 of a split draft never projects the context (rank 0 sends it the result).
+    if (lead) {
+        s.fc = s.upload(*fc);
+        s.hidden_norm = s.upload(*hn);
+    }
     s.final_norm = s.upload(*nn);
     // Quantize the projector alongside the layer weights (see Impl::q8_fc). The bf16 copy stays:
     // the FIRST block projects the whole prompt and routes to the tensor-core GEMM, which is
     // compute-bound and wants bf16.
-    if (q8_on())
+    if (q8_on() && lead)
         s.pending_quant.push_back({s.fc, s.cfg.hidden,
                                    (int)s.cfg.target_layer_ids.size() * s.cfg.hidden, &s.q8_fc});
 
@@ -1066,13 +1279,13 @@ bool DFlashDraftModel::load(const std::string& dir) {
         auto* d = require(pfx + "mlp.down_proj.weight");
         if (!qn || !kn || !in || !pn)
             return false;
-        lw.wq = load_weight(pfx + "self_attn.q_proj.weight");
-        lw.wk = load_weight(pfx + "self_attn.k_proj.weight");
-        lw.wv = load_weight(pfx + "self_attn.v_proj.weight");
-        lw.wo = load_weight(pfx + "self_attn.o_proj.weight");
-        lw.gate = load_weight(pfx + "mlp.gate_proj.weight");
-        lw.up = load_weight(pfx + "mlp.up_proj.weight");
-        lw.down = load_weight(pfx + "mlp.down_proj.weight");
+        lw.wq = load_weight(pfx + "self_attn.q_proj.weight", 1);
+        lw.wk = load_weight(pfx + "self_attn.k_proj.weight", 1);
+        lw.wv = load_weight(pfx + "self_attn.v_proj.weight", 1);
+        lw.wo = load_weight(pfx + "self_attn.o_proj.weight", 2);
+        lw.gate = load_weight(pfx + "mlp.gate_proj.weight", 1);
+        lw.up = load_weight(pfx + "mlp.up_proj.weight", 1);
+        lw.down = load_weight(pfx + "mlp.down_proj.weight", 2);
         if (!lw.wq || !lw.wk || !lw.wv || !lw.wo || !lw.gate || !lw.up || !lw.down)
             return false;
         lw.q_norm = s.upload(*qn); lw.k_norm = s.upload(*kn);
@@ -1105,7 +1318,7 @@ bool DFlashDraftModel::load(const std::string& dir) {
     // Qwen3.6-35B-A3B's, for one -- is the normal case and should load exactly as before).
     auto* mw1 = optional("markov_head.markov_w1.weight");
     auto* mw2 = optional("markov_head.markov_w2.weight");
-    if (mw1 && mw2 && mw1->shape.size() == 2 && mw2->shape.size() == 2 &&
+    if (lead && mw1 && mw2 && mw1->shape.size() == 2 && mw2->shape.size() == 2 &&
         mw1->shape[1] == mw2->shape[1] && mw1->shape[1] > 0) {
         s.markov_w1 = s.upload(*mw1);
         s.markov_w2 = s.upload(*mw2);
@@ -1128,7 +1341,7 @@ bool DFlashDraftModel::load(const std::string& dir) {
             }
         }
         s.markov_rank = (int)mw1->shape[1];
-    } else if (mw1 || mw2) {
+    } else if (lead && (mw1 || mw2)) {
         fprintf(stderr, "[dflash] markov_head tensors present but malformed "
                         "(w1=%zux%zu w2=%zux%zu) -- skipping\n",
                 mw1 ? (size_t)mw1->shape[0] : 0, mw1 ? (size_t)mw1->shape[1] : 0,
@@ -1302,7 +1515,33 @@ bool ctx_gemm_enabled() {
 }  // namespace
 
 void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
-bool DFlashDraftModel::quant_ok() const { return p_ && p_->quant_ready && !p_->quant_failed; }
+bool DFlashDraftModel::quant_ok() const {
+    return p_ && p_->quant_ready && !p_->quant_failed && (!p_->tp_peer || p_->tp_peer->quant_ok());
+}
+
+bool DFlashDraftModel::tp_attach(DFlashDraftModel* peer, int peer_device, cudaStream_t stream,
+                                 cudaStream_t peer_stream) {
+    Impl& s = *p_;
+    if (!peer || !stream || !peer_stream || s.cfg.tp_rank != 0 || peer->p_->cfg.tp_rank != 1 ||
+        s.cfg.tp_size != 2 || peer->p_->cfg.tp_size != 2)
+        return false;
+    // The batched path's row scratch is taken now, on both cards: a rank that could not allocate
+    // it lazily, mid-step, would leave the other one waiting in a link op.
+    bool peer_multi = false;
+    tp_run_with_peer(peer_device, [&] { peer_multi = peer->p_->multi_alloc(); },
+                     [&] { s.multi_alloc(); });
+    s.tp_peer = peer;
+    s.tp_peer_dev = peer_device;
+    s.tp_stream = stream;
+    s.tp_split = true;
+    peer->p_->tp_stream = peer_stream;
+    peer->p_->tp_split = true;
+    fprintf(stderr, "[dflash] split draft: rank 0 on device %d, rank 1 on device %d "
+                    "(%d of %d query heads, %d KV heads, FFN %d per card; batched path %s)\n",
+            s.device, peer_device, s.cfg.n_q_heads, s.cfg.n_q_heads * 2, s.cfg.n_kv_heads,
+            s.cfg.intermediate, s.m_ready && peer_multi ? "on" : "off");
+    return true;
+}
 
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
@@ -1310,9 +1549,45 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      float* out_confidence, int target_hidden_start) {
     Impl& s = *p_;
     s.ensure_quant();
+    // Every decline that depends on rank-0-only state happens here, before the peer starts: inside
+    // the bodies the two ranks may only return early together, before their first link op.
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
+    if (!s.tp_peer)
+        return forward_block_body(target_hidden, ctx_len, noise_ids, pos0, out_argmax, stream,
+                                  proposals, out_confidence, target_hidden_start);
+    if (s.kv_cur == -1) {
+        // The built-in cache is taken on first use at tp (see alloc_scratch), on both cards.
+        bool have = false, peer_have = false;
+        tp_run_with_peer(s.tp_peer_dev, [&] { peer_have = s.tp_peer->p_->ensure_builtin_kv(); },
+                         [&] { have = s.ensure_builtin_kv(); });
+        if (!have || !peer_have) return false;
+    }
+    bool ok = false, peer_ok = false;
+    tp_run_with_peer(
+        s.tp_peer_dev,
+        [&] {
+            peer_ok = s.tp_peer->forward_block_body(nullptr, ctx_len, noise_ids, pos0, nullptr,
+                                                    nullptr, proposals, nullptr,
+                                                    target_hidden_start);
+        },
+        [&] {
+            ok = forward_block_body(target_hidden, ctx_len, noise_ids, pos0, out_argmax, stream,
+                                    proposals, out_confidence, target_hidden_start);
+        });
+    return ok && peer_ok;
+}
+
+bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len,
+                                          const int* noise_ids, int pos0,
+                                          int* out_argmax, cudaStream_t stream, int proposals,
+                                          float* out_confidence, int target_hidden_start) {
+    Impl& s = *p_;
+    // (dual-GPU) Rank 1 of a split draft: only its half of each layer. Its inputs -- the block's
+    // embedding and the projected context -- come from rank 0 through the link.
+    const bool lead = s.cfg.tp_rank == 0;
+    const bool split = s.tp_split;
     if (ctx_len < 0 || ctx_len + s.cfg.block_size > s.cfg.max_seq + s.cfg.block_size) return false;
-    cudaStream_t st = stream ? stream : s.stream;
+    cudaStream_t st = s.tp_stream ? s.tp_stream : (stream ? stream : s.stream);
     const auto& c = s.cfg;
     const int H = c.hidden;
     const int I = c.intermediate;
@@ -1395,7 +1670,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     } else {
         cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
     }
-    if (s.embed_rows > 0) {
+    if (!lead) {
+        // Rank 1 holds no embedding: zeros here, rank 0's rows arrive in the sum below.
+        cu(cudaMemsetAsync(s.noise, 0, (size_t)BW * H * sizeof(bf16), st), "split noise zero");
+    } else if (s.embed_rows > 0) {
         // Split table: gather the rows this device owns (zeros elsewhere), then copy each upper-
         // half row in from the peer's half -- the same bytes, so the embedding is bit-identical.
         kernels::launch_embedding_vocab_window(s.d_ids, s.embed, s.noise, BW, H, 0, s.embed_rows, st);
@@ -1425,6 +1703,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     } else {
         kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
     }
+    // x + 0 is exact, so both ranks now hold rank 0's embedding rows bit for bit.
+    if (split) tp_allreduce_bf16_on(s.noise, (size_t)BW * H, st);
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
     // fc.weight is [H, n_cap*H] (out, in). Loop gemv per row.
@@ -1577,7 +1857,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // per-layer context K/V below -- through the Q4 copies. 0 restores bf16 for both.
     static const bool kCtxQ4 = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_Q4");
                                    return !(e && e[0] == '0'); }();
-    if (fc_rows > 0) {
+    if (fc_rows > 0 && !lead) {
+        if (fc_skip < target_hidden_start) return false;
+        cu(cudaMemsetAsync(s.target_proj + (size_t)fc_skip * H, 0, (size_t)fc_rows * H * sizeof(bf16),
+                           st), "split ctx zero");
+        tp_allreduce_bf16_on(s.target_proj + (size_t)fc_skip * H, (size_t)fc_rows * H, st);
+    } else if (fc_rows > 0) {
         if (fc_skip < target_hidden_start) return false;
         const bf16* th = (const bf16*)target_hidden +
                          (size_t)(fc_skip - target_hidden_start) * n_cap * H;
@@ -1607,6 +1892,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // the fc/hidden_norm/KV-injection path rather than to the draft backbone or the head.
         if (getenv("SPARKINFER_DFLASH_ZERO_CTX"))
             cu(cudaMemsetAsync(tp, 0, (size_t)fc_rows * H * sizeof(bf16), st), "zero ctx");
+        // The projected context, to rank 1 (which adds zeros).
+        if (split) tp_allreduce_bf16_on(tp, (size_t)fc_rows * H, st);
     }
 
     // x = noise embedding
@@ -1833,6 +2120,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.attn + (size_t)t * qdim, w.wo, s.ao + (size_t)t * H, H, qdim, st);
         }
+        // Split: each rank's o_proj covers its own heads (K-split), so the sum is the full product.
+        if (split) tp_allreduce_bf16_on(s.ao, (size_t)BW * H, st);
         dflash_kernels::launch_add_rms(s.x, s.ao, s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st,
                                        dp4a_gu ? s.xq81 : nullptr);
         hn_ready = dp4a_gu;
@@ -1883,6 +2172,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // Fold the second residual into the norm that always consumes it: the next layer's input
         // norm, or the final norm after the last layer. Same math, one launch instead of two, and
         // the draft is eager-launched so each saved launch is also a saved gap.
+        if (split) tp_allreduce_bf16_on(s.down, (size_t)BW * H, st);   // K-split over the FFN
         const bf16* next_norm = (L + 1 < run_layers) ? s.layers[L + 1].input_norm : s.final_norm;
         dflash_kernels::launch_add_rms(s.h, s.down, s.x, next_norm, s.xn, BW, H, c.rms_eps, st,
                                        dp4a_qkv ? s.xq81 : nullptr);
@@ -1890,7 +2180,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // Per-layer residual stream, for the differential (see the dump block below). s.x is the
         // layer's output residual; comparing it layer by layer turns "the backbone diverges"
         // into "layer N diverges", which is the difference between a search and a fix.
-        if (const char* dd = getenv("SPARKINFER_DSPARK_DUMP")) {
+        if (const char* dd = lead ? getenv("SPARKINFER_DSPARK_DUMP") : nullptr) {
             static int dumped_layers = 0;
             if (dumped_layers <= L) {
                 dumped_layers = L + 1;
@@ -1908,6 +2198,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     }
     if (run_layers <= 0)
         dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, BW, H, c.rms_eps, st);
+    if (!lead) {
+        // The head and the Markov chain run on rank 0 only; this rank just keeps its cache in
+        // step (the same advance-then-crop as below).
+        s.seq_len = std::min(pos0 < 0 ? 0 : pos0, past + ctx_len + BW);
+        return true;
+    }
 
     // LM head (target weights) -> logits / argmax. Batched over the whole block: one batched
     // GEMV against the eagerly dequantized bf16 lm_head cache instead of a per-token
@@ -2188,8 +2484,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // Matches z-lab dflash: past_key_values_draft.update(...) then .crop(start).
     // Without this, seq_len stays 0, crop(pos0) clamps to 0, and every step rebuilds
     // from an empty cache — draft quality collapses (τ≈1.x) after the first block.
-    s.seq_len = past + ctx_len + BW;
-    crop(pos0);
+    s.seq_len = std::min(pos0 < 0 ? 0 : pos0, past + ctx_len + BW);   // this rank's crop(pos0)
     return true;
 }
 
@@ -2205,66 +2500,63 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
     Impl& s = *p_;
     s.ensure_quant();
     if (n < 1 || !seg) return false;
+    if (!s.tp_peer) return forward_blocks_body(n, seg, proposals, stream, -1);
+    // Split: rank 0 picks the path (it holds the head-side state the choice reads) and both ranks
+    // take it. Per-session declines of forward_block are rank-0-only too, so they are checked here.
+    if (!s.fc || !s.embed || !s.lm_head) return false;
+    for (int j = 0; j < n; j++)
+        if (!seg[j].ids || !seg[j].out_argmax) return false;
+    std::vector<int> past(n), ctx_off(n);
+    int ctx_total = 0;
+    const int mode = (s.multi_plan(n, seg, proposals, past, ctx_off, ctx_total) && s.m_ready &&
+                      s.tp_peer->p_->m_ready) ? 1 : 0;
+    bool ok = false, peer_ok = false;
+    tp_run_with_peer(
+        s.tp_peer_dev,
+        [&] { peer_ok = s.tp_peer->forward_blocks_body(n, seg, proposals, nullptr, mode); },
+        [&] { ok = forward_blocks_body(n, seg, proposals, stream, mode); });
+    return ok && peer_ok;
+}
+
+bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int proposals,
+                                           cudaStream_t stream, int mode) {
+    Impl& s = *p_;
     const auto& c = s.cfg;
+    const bool lead = c.tp_rank == 0;
+    const bool split = s.tp_split;
     auto one_by_one = [&]() {
         for (int j = 0; j < n; j++) {
-            if (!kv_state_select(seg[j].state)) return false;
-            if (!forward_block(seg[j].target_hidden, seg[j].ctx_len, seg[j].ids, seg[j].pos0,
-                               seg[j].out_argmax, stream, proposals, nullptr,
-                               seg[j].target_hidden_start))
+            if (!s.select(seg[j].state)) return false;
+            if (!forward_block_body(seg[j].target_hidden, seg[j].ctx_len, seg[j].ids, seg[j].pos0,
+                                    seg[j].out_argmax, stream, proposals, nullptr,
+                                    seg[j].target_hidden_start))
                 return false;
         }
         return true;
     };
-    static const bool multi_env = [] {
-        const char* e = getenv("SPARKINFER_DFLASH_MULTI"); return !(e && e[0] == '0');
-    }();
-    static const int kDp4a = []{ const char* e = getenv("SPARKINFER_DFLASH_DP4A");
-                                 return e ? atoi(e) : 15; }();
-    static const int kRowShift = []{
-        const char* e = getenv("SPARKINFER_DFLASH_ROW_SHIFT"); return (e && e[0] == '0') ? 0 : 1;
-    }();
-    static const int kFullWindowEnv = []{ const char* e = getenv("SPARKINFER_DFLASH_FULL_WINDOW");
-                                          return e ? atoi(e) : -1; }();
     static const int kDraftVocab = []{
         const char* e = getenv("SPARKINFER_DFLASH_DRAFT_VOCAB"); return e ? atoi(e) : 65536;
     }();
     const int depth = std::min(c.block_size, proposals > 0 ? std::min(proposals, 15) : 5);
     const int BW = s.width_for(depth);
-    const int R = Impl::kMultiRows;
     const int rows = n * BW;
-    const bool fast_w = (BW == 16 || BW == 8 || BW == 7 || BW == 6 || BW == 5 || BW == 4 || BW == 2);
-    bool ok = multi_env && n >= 2 && rows <= R && n * depth <= R && fast_w && kDp4a == 15 &&
-              kRowShift == 1 && s.xq81 && s.q8_fc.q4 && s.head_q8 && s.lm_head_type == 12 &&
-              kFullWindowEnv < 0 && 3 * c.sliding_window <= 0 && !s.lm_head_i4 &&
-              !s.lm_head_i8 && s.markov_w1 && s.markov_w2_q;
-    for (int L = 0; ok && L < c.n_layers; L++) {
-        const auto& w = s.layers[L];
-        ok = w.q8_wq.q4 && w.q8_wk.q4 && w.q8_wv.q4 && w.q8_wo.q4 && w.q8_gate.q4 &&
-             w.q8_up.q4 && w.q8_down.q4;
-    }
     int ctx_total = 0;
     std::vector<int> ctx_off(n), past(n);
     auto kc = [&](int id, int L) { return id == s.kv_cur ? s.k_cache[L] : s.kv_states[id].k[L]; };
     auto vc = [&](int id, int L) { return id == s.kv_cur ? s.v_cache[L] : s.kv_states[id].v[L]; };
     auto sl = [&](int id) -> int& { return id == s.kv_cur ? s.seq_len : s.kv_states[id].seq_len; };
-    auto cp = [&](int id) { return id == s.kv_cur ? s.kv_cap : s.kv_states[id].cap; };
-    for (int j = 0; ok && j < n; j++) {
-        const DraftSeg& g = seg[j];
-        ok = g.state >= 0 && g.state < (int)s.kv_states.size() && s.kv_states[g.state].live &&
-             g.ctx_len >= 1 && g.ctx_len <= 8 && g.target_hidden_start == 0 && g.target_hidden &&
-             g.ids && g.out_argmax;
-        if (!ok) break;
-        past[j] = sl(g.state);
-        ctx_off[j] = ctx_total;
-        ctx_total += g.ctx_len;
-        // Unwindowed contexts only: past 12288, or after a truncated capture (ctx_lo), the full
-        // layer attends a window, which forward_block applies and this pass does not.
-        const int lo = g.state == s.kv_cur ? s.ctx_lo : s.kv_states[g.state].ctx_lo;
-        ok = past[j] + g.ctx_len == g.pos0 && past[j] + g.ctx_len + BW <= cp(g.state) &&
-             past[j] + g.ctx_len < 12288 && lo == 0;
+    bool ok;
+    if (mode < 0) {
+        ok = s.multi_plan(n, seg, proposals, past, ctx_off, ctx_total) && s.multi_alloc();
+    } else {
+        // The leader's choice; its checks covered these sessions' states, which are mirrored.
+        ok = mode == 1;
+        for (int j = 0; ok && j < n; j++) {
+            past[j] = sl(seg[j].state);
+            ctx_off[j] = ctx_total;
+            ctx_total += seg[j].ctx_len;
+        }
     }
-    ok = ok && ctx_total <= R && s.multi_alloc();
     if (!ok) {
         static int noted = 0;
         if (getenv("SPARKINFER_DFLASH_MULTI_DEBUG") && n >= 2 && noted++ < 5)
@@ -2278,10 +2570,10 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
 
     {
         static long taken = 0;
-        if (getenv("SPARKINFER_DFLASH_MULTI_DEBUG") && (++taken & (taken - 1)) == 0)
+        if (lead && getenv("SPARKINFER_DFLASH_MULTI_DEBUG") && (++taken & (taken - 1)) == 0)
             fprintf(stderr, "[dflash] forward_blocks: batched x%ld (n=%d rows=%d)\n", taken, n, n * BW);
     }
-    cudaStream_t st = stream ? stream : s.stream;
+    cudaStream_t st = s.tp_stream ? s.tp_stream : (stream ? stream : s.stream);
     const int H = c.hidden, I = c.intermediate, B = c.block_size;
     const int n_cap = (int)c.target_layer_ids.size();
     const int qdim = c.n_q_heads * c.head_dim, kvdim = c.n_kv_heads * c.head_dim, d = c.head_dim;
@@ -2304,7 +2596,11 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
         for (int i = 0; i < BW; i++) s.m_h_ids[j * BW + i] = seg[j].ids[i];
     cu(cudaMemcpyAsync(s.m_d_ids, s.m_h_ids, (size_t)rows * sizeof(int), cudaMemcpyHostToDevice, st),
        "multi ids");
-    if (s.embed_rows > 0) {
+    if (!lead) {
+        // Rank 1: zeros; rank 0's embedding and projected context arrive in the sums below.
+        cu(cudaMemsetAsync(s.m_noise, 0, (size_t)rows * H * sizeof(bf16), st), "split noise zero");
+        cu(cudaMemsetAsync(s.m_tp, 0, (size_t)ctx_total * H * sizeof(bf16), st), "split ctx zero");
+    } else if (s.embed_rows > 0) {
         kernels::launch_embedding_vocab_window(s.m_d_ids, s.embed, s.m_noise, rows, H, 0,
                                                s.embed_rows, st);
         int dev = 0;
@@ -2335,13 +2631,20 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
     }
 
     // The sessions' new context rows, concatenated, through fc + hidden_norm.
-    for (int j = 0; j < n; j++)
-        cu(cudaMemcpyAsync(s.m_th + (size_t)ctx_off[j] * n_cap * H, seg[j].target_hidden,
-                           (size_t)seg[j].ctx_len * n_cap * H * sizeof(bf16),
-                           cudaMemcpyDeviceToDevice, st), "multi ctx gather");
-    proj(q81(s.m_th, n_cap * H, ctx_total), s.q8_fc, nullptr, nullptr, s.m_tp, nullptr, nullptr,
-         H, 0, 0, n_cap * H, ctx_total);
-    dflash_kernels::launch_rms(s.m_tp, s.hidden_norm, s.m_tp, ctx_total, H, c.rms_eps, st);
+    if (lead) {
+        for (int j = 0; j < n; j++)
+            cu(cudaMemcpyAsync(s.m_th + (size_t)ctx_off[j] * n_cap * H, seg[j].target_hidden,
+                               (size_t)seg[j].ctx_len * n_cap * H * sizeof(bf16),
+                               cudaMemcpyDeviceToDevice, st), "multi ctx gather");
+        proj(q81(s.m_th, n_cap * H, ctx_total), s.q8_fc, nullptr, nullptr, s.m_tp, nullptr, nullptr,
+             H, 0, 0, n_cap * H, ctx_total);
+        dflash_kernels::launch_rms(s.m_tp, s.hidden_norm, s.m_tp, ctx_total, H, c.rms_eps, st);
+    }
+    if (split) {
+        // Both ranks now hold rank 0's rows bit for bit (x + 0 is exact).
+        tp_allreduce_bf16_on(s.m_noise, (size_t)rows * H, st);
+        tp_allreduce_bf16_on(s.m_tp, (size_t)ctx_total * H, st);
+    }
     cu(cudaMemcpyAsync(s.m_x, s.m_noise, (size_t)rows * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
        "multi noise->x");
 
@@ -2397,18 +2700,27 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
         }
         proj(q81(s.m_attn, qdim, rows), w.q8_wo, nullptr, nullptr, s.m_ao, nullptr, nullptr,
              H, 0, 0, qdim, rows);
+        if (split) tp_allreduce_bf16_on(s.m_ao, (size_t)rows * H, st);
         dflash_kernels::launch_add_rms(s.m_x, s.m_ao, s.m_h, w.post_norm, s.m_hn, rows, H,
                                        c.rms_eps, st, s.m_xq81);
         proj(s.m_xq81, w.q8_gate, &w.q8_up, nullptr, s.m_gate, s.m_up, nullptr, I, I, 0, H, rows);
         dflash_kernels::launch_swiglu(s.m_gate, s.m_up, s.m_gate, rows * I, st);
         proj(q81(s.m_gate, I, rows), w.q8_down, nullptr, nullptr, s.m_down, nullptr, nullptr,
              H, 0, 0, I, rows);
+        if (split) tp_allreduce_bf16_on(s.m_down, (size_t)rows * H, st);
         const bf16* next_norm = (L + 1 < c.n_layers) ? s.layers[L + 1].input_norm : s.final_norm;
         dflash_kernels::launch_add_rms(s.m_h, s.m_down, s.m_x, next_norm, s.m_xn, rows, H,
                                        c.rms_eps, st, s.m_xq81);
         xn_ready = true;
     }
 
+    if (!lead) {
+        for (int j = 0; j < n; j++) {
+            int& len = sl(seg[j].state);
+            len = std::min(seg[j].pos0, past[j] + seg[j].ctx_len + BW);
+        }
+        return true;
+    }
     // Head over each session's proposal rows (row r - 1 backs proposal r), then the Markov bias
     // and argmax per proposal, chained per session.
     const size_t q8row = kernels::llama_q8_1_bytes(H);

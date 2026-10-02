@@ -39,6 +39,12 @@ struct DFlashDraftConfig {
     // steady state instead of every layer's. For a server that would call ensure_quant() at load
     // anyway (tp>1); the default keeps the deferred build (see Impl::pending_quant).
     bool eager_quant = false;
+    // (dual-GPU) Tensor-parallel slice this instance loads: rank r of tp_size holds query heads,
+    // KV heads and FFN columns [r/tp_size, (r+1)/tp_size) of every layer. After load(),
+    // n_q_heads / n_kv_heads / intermediate hold this rank's LOCAL counts. Rank 0 also holds fc,
+    // the head and the Markov/confidence heads; rank 1 only its half of the layers. 1 = whole.
+    int tp_rank = 0;
+    int tp_size = 1;
 
     // YaRN rotary scaling (RadixArk/Qwen3.8-27B-DSpark ships rope_type: "yarn"). factor <= 1
     // disables it and the draft uses plain theta^(-2i/d), so existing checkpoints are unaffected.
@@ -133,6 +139,15 @@ public:
     };
     bool forward_blocks(int n, const DraftSeg* seg, int proposals, cudaStream_t stream = nullptr);
 
+    // (dual-GPU) Pair this rank-0 draft with `peer`, the rank-1 slice loaded on `peer_device`.
+    // From here on every forward and KV-state call on this instance runs on both cards: the peer's
+    // half on the peer device's tp worker thread, the two halves summed through the target's
+    // GpuLink after each layer's o_proj and down_proj. `stream` / `peer_stream` are the target's
+    // own streams on the two cards -- the draft runs on them, so its link ops share one stream
+    // order per card with the target's. False (nothing attached) if the peer's scratch does not fit.
+    bool tp_attach(DFlashDraftModel* peer, int peer_device, cudaStream_t stream,
+                   cudaStream_t peer_stream);
+
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.
     const float* last_logits() const;
@@ -140,6 +155,16 @@ public:
 private:
     struct Impl;
     Impl* p_;
+    // This rank's share of forward_block / forward_blocks (the public calls run it on both ranks
+    // when a peer is attached). mode: -1 = choose the batched path here, 0 = one by one,
+    // 1 = batched (the leader's choice, so both ranks take the same path).
+    bool forward_block_body(const void* target_hidden, int ctx_len, const int* noise_ids, int pos0,
+                            int* out_argmax, cudaStream_t stream, int proposals,
+                            float* out_confidence, int target_hidden_start);
+    bool forward_blocks_body(int n, const DraftSeg* seg, int proposals, cudaStream_t stream,
+                             int mode);
+    int kv_state_create_local(int capacity);
+    void kv_state_free_local(int id);
 };
 
 } // namespace sparkinfer

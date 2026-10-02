@@ -92,6 +92,24 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2: the DSpark draft is split across both cards** like the target: each card holds half of
+  every draft layer's query heads (20 of 40), KV heads (4 of 8) and FFN columns, and the two halves
+  are summed over the link after each layer's o_proj and down_proj. Card 0 still projects the
+  captured context (fc) and runs the head and Markov chain (the draft scores only vocab ids below
+  65536, all in card 0's half of the head); card 1 receives the block embedding and the projected
+  context through the link and needs no capture of its own. Both halves run on their card's
+  target stream. The draft's built-in KV cache (unused by the group path) is allocated on first
+  use at tp=2. Measured on 2x RTX 5060 Ti, `--ctx 32768`: card 0 13341 -> 12667 MiB, card 1
+  11489 -> 12105 MiB. HyperQwen cohort, 512 tokens, two alternated runs per arm, draft ms/step
+  and e2e tok/s, split vs whole: C1 3.7 vs 4.5-4.8 ms, 94.9/93.6 vs 94.6/95.4; C2 3.7 vs
+  4.7-4.8 ms, 149.2/145.0 vs 149.4/147.5; C4 6.6-7.2 vs 8.0-9.0 ms, 221.6/211.9 vs 200.9/204.6.
+  `SPARKINFER_DSPARK_SPLIT=0` keeps the whole draft on card 0.
+- **A speculative join no longer finishes its prefill token by token.** If the joining request's
+  batched prefill does not fit beside its capture rows and draft state, the request leaves the
+  group and is prefilled ordinarily (the token loop took ~700 s for four concurrent 12k prompts
+  at `--ctx 131072`). The prompt's capture rows (51 KB a row) are freed right after the join's
+  first draft instead of when the group ends.
+
 - **tp=2 group speculation drafts every session in one batched draft pass**
   (`DFlashDraftModel::forward_blocks`): one embedding, fc and per-layer projection pass over all
   sessions' rows (16-row q4 GEMV tiles), per-session KV append and attention, one head pass.

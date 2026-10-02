@@ -173,6 +173,9 @@ struct ModelEngine::Impl {
     // Owned here, attached to model by pointer; declared before batch_engine so the engine, which
     // drives it, is destroyed first.
     std::unique_ptr<sparkinfer::DFlashDraftModel> draft;
+    // (dual-GPU) The draft's rank-1 slice on the second card (null unless the draft is split);
+    // `draft` drives it. Reset right after `draft`.
+    std::unique_ptr<sparkinfer::DFlashDraftModel> draft_peer;
     std::unique_ptr<sparkinfer::ContinuousBatchEngine> batch_engine;
     std::vector<int> prefix_tokens;
     bool ready = false;
@@ -223,6 +226,7 @@ struct ModelEngine::Impl {
         // sets tp_link, so the shutdown is a null no-op and the tp=1 teardown is byte-identical.
         batch_engine.reset();
         draft.reset();
+        draft_peer.reset();
         tp_models.clear();
         tp_kvs.clear();
         model.reset();
@@ -239,6 +243,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     impl_->reset_vision();
     impl_->batch_engine.reset();
     impl_->draft.reset();
+    impl_->draft_peer.reset();
     impl_->model.reset();
     impl_->engine.reset();
     impl_->kv.reset();
@@ -1297,7 +1302,41 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     // layer were all resident at once before, ~2.5 GB on DSpark, and that peak -- not the ~2 GB
     // the draft holds afterwards -- was what capped --ctx).
     dcfg.eager_quant = !impl_->tp_models.empty();
+    // (dual-GPU) At tp=2 the draft is split across the two cards like the target (half the query
+    // and KV heads and half the FFN of every layer per card, summed over the link), so its ~2 GB
+    // no longer all sit on the first card. SPARKINFER_DSPARK_SPLIT=0 keeps the whole draft there.
+    const bool split_draft = impl_->tp_models.size() == 1 && [] {
+        const char* e = getenv("SPARKINFER_DSPARK_SPLIT");
+        return !(e && e[0] == '0');
+    }();
+    if (split_draft) {
+        dcfg.tp_size = 2;
+        dcfg.tp_rank = 0;
+    }
     auto draft = std::make_unique<sparkinfer::DFlashDraftModel>(dcfg);
+    std::unique_ptr<sparkinfer::DFlashDraftModel> draft_peer;
+    if (split_draft) {
+        // Built and loaded on the second card's tp worker thread, which is bound to that card (the
+        // constructor's stream and every allocation land there).
+        const int peer_dev = impl_->tp_models[0]->tp_rank_view().device;
+        sparkinfer::DFlashDraftConfig pcfg = dcfg;
+        pcfg.tp_rank = 1;
+        bool peer_loaded = false;
+        sparkinfer::tp_run_with_peer(peer_dev, [&] {
+            draft_peer = std::make_unique<sparkinfer::DFlashDraftModel>(pcfg);
+            peer_loaded = draft_peer->load(dir);
+            if (peer_loaded) {
+                draft_peer->ensure_quant();
+                peer_loaded = draft_peer->quant_ok();
+            }
+        }, nullptr);
+        if (!peer_loaded) {
+            sparkinfer::tp_run_with_peer(peer_dev, [&] { draft_peer.reset(); }, nullptr);
+            err = "cannot load the DSpark draft's second-card half from " + dir + " at --ctx " +
+                  std::to_string(impl_->cfg.max_seq) + " -- lower --ctx, or SPARKINFER_DSPARK_SPLIT=0";
+            return false;
+        }
+    }
     if (!draft->load(dir)) {
         // The usual cause is device memory, not the checkpoint: the target's KV pool is sized for
         // the whole --ctx before the draft loads, and at --ctx 262144 a 32 GB card has no room
@@ -1312,6 +1351,14 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     // takes the request (and the tp group) down instead of failing here, cleanly, at load.
     if (!impl_->tp_models.empty()) {
         draft->ensure_quant();
+        if (draft_peer &&
+            !draft->tp_attach(draft_peer.get(), impl_->tp_models[0]->tp_rank_view().device,
+                              impl_->model->tp_rank_view().stream,
+                              impl_->tp_models[0]->tp_rank_view().stream)) {
+            err = "cannot pair the two halves of the split DSpark draft (SPARKINFER_DSPARK_SPLIT=0 "
+                  "keeps it on one card)";
+            return false;
+        }
         // Free-memory floor on every card after the draft is in: below it the server loads but
         // cannot open a session (each holds ~74 MB of GDN state per card on the 27B) or fit a
         // prefill window -- every request would fail with "device out of memory". Measured on
@@ -1345,6 +1392,7 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     }
     impl_->model->set_dflash_draft(draft.get());
     impl_->draft = std::move(draft);
+    impl_->draft_peer = std::move(draft_peer);
     impl_->batch_engine->enable_speculative(true);
     fprintf(stderr, "[sparkinfer-server] speculative decoding: DSpark draft %s (block %d, draft context %d)\n",
             dir.c_str(), impl_->draft->config().block_size, impl_->draft->config().max_seq);

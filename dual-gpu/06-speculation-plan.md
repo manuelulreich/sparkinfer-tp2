@@ -77,6 +77,15 @@ Every step lands only with these passing:
 
 ## S. Split the drafter across both cards
 
+**Status: done (2026-10-02).** Deviations from the plan below, and measurements:
+- The head and Markov chain stay on card 0. The draft scores only vocab ids below 65536 (`SPARKINFER_DFLASH_DRAFT_VOCAB`), all inside card 0's half of the lm_head, so S3's per-row argmax exchange is not needed.
+- fc is not replicated. Card 0 projects the context and sends the 10 KB/row result through a zero-padded all-reduce, so card 1 needs no capture buffer (the S-risk about card-1 capture memory does not apply).
+- The draft's built-in KV cache is allocated on first use at tp=2 (the group path drafts on per-session states).
+- Memory at `--ctx 32768`: card 0 13341 → 12667 MiB, card 1 11489 → 12105 MiB. That is −674 MiB on card 0, not the −1.0 GB estimated: fc (bf16 + Q4), the Markov tables and the 168 MB context-projection buffer remain on card 0. W2 removes the buffer.
+- Draft ms/step, split vs whole: C1 3.7 vs 4.5–4.8, C2 3.7 vs 4.7–4.8, C4 6.6–7.2 vs 8.0–9.0. End to end: C1 and C2 unchanged within noise, C4 +6% (221.6/211.9 vs 200.9/204.6).
+- The 131072 stress run exposed a policy problem: with card 0 roomier, all four 12k requests joined the group, and the later joins' batched prefill no longer fit, so they fell to the token loop (~700 s each). A join whose batched prefill declines now leaves the group and is prefilled ordinarily. The capture rows are freed after the join's first draft. After that the stress run completes in 41–122 s per request.
+
+
 **Why first:**
 - It removes ~1 GB from card 0 and halves every per-session draft buffer, which W then shrinks further.
 - It halves the draft's weight reads per card.
