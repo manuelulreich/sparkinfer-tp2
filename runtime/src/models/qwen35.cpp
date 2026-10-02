@@ -950,6 +950,10 @@ struct Qwen35Model::Impl {
     const int** h_vr_ma_tptr = nullptr;    // pinned twin
     int *vr_ma_tab = nullptr, *vr_ma_tab_win = nullptr;   // [R][max_blocks]
     float *vr_ma_m = nullptr, *vr_ma_l = nullptr, *vr_ma_acc = nullptr;
+    // (dual-GPU C2) Segmented multi-session verify: one GDN snapshot per segment (session),
+    // grown on demand, agreed across the ranks, released when the group run ends.
+    std::vector<float*> vr_seg_snap_lin;
+    std::vector<bf16*> vr_seg_snap_conv;
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -3737,9 +3741,19 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
 // only the state each row reads and writes (GDN conv/recurrent state, KV block table, position)
 // is chosen per row.
 int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
-                                 const uint64_t* row_seq, void* capture_dst, int* out_argmax) {
+                                 const uint64_t* row_seq, void* capture_dst, int* out_argmax,
+                                 int seg_n, void* const* seg_capture, int* seg_keep) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     const bool multi = row_seq != nullptr;
+    // (dual-GPU C2) Segmented: seg_n sessions each verify T = n / seg_n consecutive positions,
+    // rows STEP-major (row t * seg_n + j is session j's position row_pos[j] + t), so the rows of
+    // one step are contiguous and the GDN recurrence advances one step for all sessions per
+    // launch. Each session is snapshotted, kept to its own accepted prefix (seg_keep[j]) and
+    // replayed like the single-session verify.
+    const bool seg = multi && seg_n > 0;
+    const int S = seg ? seg_n : 0;
+    const int T = seg ? n / seg_n : 1;
+    if (seg && (n % seg_n != 0 || !seg_keep)) return -1;
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -3867,6 +3881,27 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     }
     cu(cudaMemcpyAsync(s.vr_ids, s.h_vr, (size_t)3 * R * sizeof(int), cudaMemcpyHostToDevice, st),
        "tp verify ids");
+    if (seg && T > 1) {
+        if ((int)s.vr_seg_snap_lin.size() < S) {
+            bool ok = true;
+            while (ok && (int)s.vr_seg_snap_lin.size() < S) {
+                void* a = nullptr;
+                void* b = nullptr;
+                ok = cudaMalloc(&a, ls * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc(&b, cs * sizeof(bf16)) == cudaSuccess;
+                if (!ok) { if (a) cudaFree(a); if (b) cudaFree(b); cudaGetLastError(); break; }
+                s.vr_seg_snap_lin.push_back((float*)a);
+                s.vr_seg_snap_conv.push_back((bf16*)b);
+            }
+            if (tp_prefill_agree_min(ok ? 1 : 0) == 0) return -1;   // nothing touched yet
+        }
+        for (int j = 0; j < S; j++) {
+            cu(cudaMemcpyAsync(s.vr_seg_snap_lin[j], row_lin[j], ls * sizeof(float),
+                               cudaMemcpyDeviceToDevice, st), "tp seg snap lin");
+            cu(cudaMemcpyAsync(s.vr_seg_snap_conv[j], row_conv[j], cs * sizeof(bf16),
+                               cudaMemcpyDeviceToDevice, st), "tp seg snap conv");
+        }
+    }
     if (!multi) {
         cu(cudaMemcpyAsync(s.vr_snap_lin, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, st),
            "tp verify snap lin");
@@ -3960,7 +3995,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     static const bool mb_env = [] {
         const char* e = getenv("SPARKINFER_TP_ROWS_GDN_BATCHED"); return !(e && e[0] == '0');
     }();
-    bool mb = multi && mb_env && n > 1 && c.linear_head_dim == 128;
+    bool mb = multi && mb_env && (seg ? S > 1 : n > 1) && c.linear_head_dim == 128;
     const int lvdim_full = c.linear_v_heads * lhd;
     if (mb && !s.vr_mb_ready) {
         bool ok = cudaMalloc(&s.vr_mb_ptrs, (size_t)2 * R * sizeof(void*)) == cudaSuccess &&
@@ -3987,6 +4022,32 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         cu(cudaMemcpyAsync(s.vr_mb_ptrs, s.h_vr_mb_ptrs, (size_t)2 * R * sizeof(void*),
                            cudaMemcpyHostToDevice, st), "tp rows gdn ptrs");
     }
+    // The batched conv + recurrence of layer L over `steps` row groups (all rows at once when
+    // unsegmented): group t is rows [t * G, (t + 1) * G), G = S (segmented) or n, launched in
+    // order so a session's step t + 1 reads the state its step t wrote. The gathered alpha/beta
+    // (vr_mb_a/b) and the full-width q|k|v rows (vr_full) must be in place for all rows.
+    auto gdn_batched_steps = [&](int L, int steps) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        const int G = seg ? S : n;
+        const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+        const size_t state_off = (size_t)gdn_state_slot(c, L) * vloc * lhd * lhd;
+        for (int t = 0; t < steps; t++) {
+            const size_t r0 = (size_t)t * G;
+            kernels::launch_qwen36_conv_split_l2norm_fused_batched(
+                s.vr_full + r0 * lqkv, w.ssm_conv, s.vr_mb_ptrs + r0, conv_off,
+                s.vr_mb_q + r0 * lqdim, s.vr_mb_k + r0 * lqdim, s.vr_mb_v + r0 * lvdim_full,
+                G, c.linear_q_heads, c.linear_v_heads, lhd, c.linear_conv_kernel, c.rms_eps, st,
+                q0, ql, q0, ql, v0, vloc);
+            if (!kernels::launch_qwen36_gdn_ar_batched(
+                    s.vr_mb_q + r0 * lqdim, s.vr_mb_k + r0 * lqdim, s.vr_mb_v + r0 * lvdim_full,
+                    s.vr_mb_a + r0 * c.linear_v_heads, s.vr_mb_b + r0 * c.linear_v_heads,
+                    w.ssm_dt, w.ssm_a, reinterpret_cast<float* const*>(s.vr_mb_ptrs + R + r0),
+                    state_off, s.vr_mb_o + r0 * lvdim_full, G, c.linear_q_heads, c.linear_v_heads,
+                    lhd, c.gdn_qh_block, st, /*state_compact_b16=*/false, v0, vloc)) {
+                cu(cudaErrorInvalidValue, "tp rows gdn batched");   // head_dim checked above
+            }
+        }
+    };
 
     // Attention for all rows at once (TC mode only: the flash-decode split layout follows the
     // batch's longest row, so a row's partial sums are not the single-row call's).
@@ -3994,7 +4055,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     static const bool ma_env = [] {
         const char* e = getenv("SPARKINFER_TP_ROWS_ATTN_BATCHED"); return !(e && e[0] == '0');
     }();
-    bool ma = tc && (mb || !multi) && ma_env;
+    bool ma = tc && (mb || !multi || seg) && ma_env;
     const int mbs = s.kv->max_blocks_per_seq();
     if (ma && s.vr_ma_state == 0) {
         const size_t fa = (size_t)R * n_q * Impl::MAX_NSPLITS;
@@ -4044,21 +4105,9 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
             }
             scatter_qkv(rec, n);
             if (mb) {
-                const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-                kernels::launch_qwen36_conv_split_l2norm_fused_batched(
-                    s.vr_full, w.ssm_conv, s.vr_mb_ptrs, conv_off, s.vr_mb_q, s.vr_mb_k, s.vr_mb_v,
-                    n, c.linear_q_heads, c.linear_v_heads, lhd, c.linear_conv_kernel, c.rms_eps, st,
-                    q0, ql, q0, ql, v0, vloc);
                 kernels::launch_gather_rows(s.vr_mb_a + v0, c.linear_v_heads, rec_a, vloc, vloc, n, st);
                 kernels::launch_gather_rows(s.vr_mb_b + v0, c.linear_v_heads, rec_b, vloc, vloc, n, st);
-                const size_t state_off = (size_t)gdn_state_slot(c, L) * vloc * lhd * lhd;
-                if (!kernels::launch_qwen36_gdn_ar_batched(
-                        s.vr_mb_q, s.vr_mb_k, s.vr_mb_v, s.vr_mb_a, s.vr_mb_b, w.ssm_dt, w.ssm_a,
-                        reinterpret_cast<float* const*>(s.vr_mb_ptrs + R), state_off, s.vr_mb_o,
-                        n, c.linear_q_heads, c.linear_v_heads, lhd, c.gdn_qh_block, st,
-                        /*state_compact_b16=*/false, v0, vloc)) {
-                    cu(cudaErrorInvalidValue, "tp rows gdn batched");   // head_dim checked above
-                }
+                gdn_batched_steps(L, T);
                 kernels::launch_gather_rows(s.vr_gdn, Kw, s.vr_mb_o + (size_t)v0 * lhd, lvdim_full,
                                             Kw, n, st);
             } else {
@@ -4195,6 +4244,16 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(s.vr_h, s.vr_ar, nextnorm, s.vr_x, s.vr_xn, n, H, c.rms_eps, st);
         // DSpark capture of this layer's output rows (leader only; the draft lives on rank 0).
+        if (seg && seg_capture && s.tp_rank == 0 && s.dflash_n_cap > 0)
+            for (int slot = 0; slot < s.dflash_n_cap; slot++)
+                if (s.dflash_layer_ids[slot] == L)
+                    for (int j = 0; j < S; j++)
+                        if (seg_capture[j])
+                            cu(cudaMemcpy2DAsync(static_cast<bf16*>(seg_capture[j]) + (size_t)slot * H,
+                                                 (size_t)s.dflash_n_cap * H * sizeof(bf16),
+                                                 s.vr_x + (size_t)j * H, (size_t)S * H * sizeof(bf16),
+                                                 (size_t)H * sizeof(bf16), T,
+                                                 cudaMemcpyDeviceToDevice, st), "tp seg capture");
         if (!multi && capture_dst && s.tp_rank == 0 && s.dflash_n_cap > 0)
             for (int slot = 0; slot < s.dflash_n_cap; slot++)
                 if (s.dflash_layer_ids[slot] == L)
@@ -4274,6 +4333,55 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     for (int r = 0; r < n; r++) out_argmax[r] = s.h_vr[3 * R + r];
     }
 
+    if (seg) {
+        // Session j's accepted prefix, as below; a partly accepted session is restored and its
+        // kept steps replayed through the batched kernels, the other sessions' rows of a step
+        // pointed at the (otherwise unused) single-verify snapshot as scratch.
+        int max_keep = 0;
+        bool any_partial = false;
+        for (int j = 0; j < S; j++) {
+            int k = 1;
+            while (k < T && ids[(size_t)k * S + j] == out_argmax[(size_t)(k - 1) * S + j]) ++k;
+            seg_keep[j] = k;
+            if (k < T) {
+                any_partial = true;
+                max_keep = std::max(max_keep, k);
+                cu(cudaMemcpyAsync(row_lin[j], s.vr_seg_snap_lin[j], ls * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, st), "tp seg restore lin");
+                cu(cudaMemcpyAsync(row_conv[j], s.vr_seg_snap_conv[j], cs * sizeof(bf16),
+                                   cudaMemcpyDeviceToDevice, st), "tp seg restore conv");
+            }
+        }
+        if (any_partial) {
+            if (mb) {
+                for (int t = 0; t < max_keep; t++)
+                    for (int j = 0; j < S; j++) {
+                        const bool live = seg_keep[j] < T && t < seg_keep[j];
+                        s.h_vr_mb_ptrs[t * S + j] = live ? (void*)row_conv[j] : (void*)s.vr_snap_conv;
+                        s.h_vr_mb_ptrs[R + t * S + j] = live ? (void*)row_lin[j] : (void*)s.vr_snap_lin;
+                    }
+                cu(cudaMemcpyAsync(s.vr_mb_ptrs, s.h_vr_mb_ptrs, (size_t)2 * R * sizeof(void*),
+                                   cudaMemcpyHostToDevice, st), "tp seg replay ptrs");
+            }
+            for (int L = 0; L < c.n_layers; L++) {
+                if (!is_linear_layer(c, L)) continue;
+                scatter_qkv(s.vr_rec_qkv + (size_t)L * R * wq, n);
+                if (mb) {
+                    kernels::launch_gather_rows(s.vr_mb_a + v0, c.linear_v_heads,
+                                                s.vr_rec_a + (size_t)L * R * vloc, vloc, vloc, n, st);
+                    kernels::launch_gather_rows(s.vr_mb_b + v0, c.linear_v_heads,
+                                                s.vr_rec_b + (size_t)L * R * vloc, vloc, vloc, n, st);
+                    gdn_batched_steps(L, max_keep);
+                } else {
+                    for (int t = 0; t < max_keep; t++)
+                        for (int j = 0; j < S; j++)
+                            if (seg_keep[j] < T && t < seg_keep[j]) gdn_step(L, t * S + j, s.vr_gdn);
+                }
+            }
+        }
+        cu(cudaStreamSynchronize(st), "tp seg commit");
+        return n;
+    }
     if (multi) return n;   // every row is one independent decode step: all kept
     // Accepted prefix: row 0 is always kept (it is the target's own next token); row r is kept
     // while the draft token at r matches the target's argmax at r-1.
@@ -8272,6 +8380,334 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     if (hooks) invalidate_decode_graph();
     draft.reset();
     return out;
+}
+
+// (dual-GPU C2) One segmented verify for a speculative group: both ranks run it (mirrored, as
+// batched_forward), only the leader captures. Returns n, or -1 when declined (nothing changed).
+int Qwen35Model::spec_group_verify(const int* ids, int n, const int* row_pos,
+                                   const uint64_t* row_seq, int seg_n, void* const* seg_capture,
+                                   int* out_argmax, int* seg_keep) {
+    if (!tp_active() || seg_n < 1 || n < 1) return -1;
+    std::vector<int> peer_out(n), peer_keep(seg_n);
+    TP_MIRROR(spec_group_verify(ids, n, row_pos, row_seq, seg_n, nullptr, peer_out.data(),
+                                peer_keep.data()));
+    return tp_rows_forward(ids, n, 0, row_pos, row_seq, nullptr, out_argmax, seg_n, seg_capture,
+                           seg_keep);
+}
+
+// Frees the per-segment GDN snapshots of the segmented verify (both ranks).
+void Qwen35Model::spec_group_release() {
+    TP_MIRROR(spec_group_release());
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    cudaStreamSynchronize(s.stream);
+    for (float* b : s.vr_seg_snap_lin) cudaFree(b);
+    for (bf16* b : s.vr_seg_snap_conv) cudaFree(b);
+    s.vr_seg_snap_lin.clear();
+    s.vr_seg_snap_conv.clear();
+}
+
+bool Qwen35Model::spec_group_supported() const {
+    return p_->dflash_draft && tp_active() && p_->tp_rank == 0 && p_->cfg.hybrid;
+}
+
+// (dual-GPU C2) Speculative decoding of several engine sessions at once. Every step drafts each
+// session in turn on its own draft KV state (the draft is ~3 ms a block), then verifies all
+// blocks in ONE segmented tp pass (spec_group_verify): the weights stream once for every
+// session's rows instead of once per session. Jobs join between steps (hooks.poll), are prefilled
+// with hidden-state capture and drafted once on the spot; jobs leave on EOS / max_new / their
+// on_tokens returning false, each reported through hooks.on_done with its SpecResume filled the
+// way dflash_generate fills it, so the engine resumes any unfinished job with ordinary decode.
+//
+// Policy is deliberately simple next to dflash_generate's single-session planner: every session
+// of a step verifies the same depth, min(SPARKINFER_SPEC_GROUP_DEPTH (default 6), rows / S - 1),
+// so the step's rows fit the tp rows pass.
+void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
+                                        const SpecGroupHooks& hooks) {
+    Impl& s = *p_;
+    const bool ignore_eos = [] {
+        const char* e = getenv("SPARKINFER_BENCH_IGNORE_EOS");
+        return e && e[0] == '1';
+    }();
+    static const int kDepthMax = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_DEPTH");
+        const int v = e ? atoi(e) : 6;
+        return v < 1 ? 1 : v;
+    }();
+    static const bool kTiming = getenv("SPARKINFER_DSPARK_TIMING") != nullptr;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const DFlashDraftConfig& dc = draft.config();
+    const int B = dc.block_size;
+    const int mask_id = dc.mask_token_id;
+    const int H = s.cfg.hidden;
+    const int R = kTpVerifyRows;
+
+    struct G {
+        SpecGroupJob* job = nullptr;
+        int n = 0;               // prompt length
+        int start = 0;           // committed position (prompt + emitted)
+        int next = -1;           // verified, not yet emitted
+        int state = -1;          // draft KV state
+        bf16* cap = nullptr;     // [B + 1][n_cap * H] capture rows of the last verify
+        int th_len = 0;          // rows of `cap` the next draft ingests
+        bool predrafted = false; // block[1..] already holds the join's first draft
+        std::vector<int> block, out;
+        bool done = false;
+    };
+    std::vector<G> gs;
+    bool group_ok = true;
+    long steps = 0, seg_steps = 0;
+    double accept_sum = 0, t_draft = 0, t_verify = 0;
+    auto ms_since = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+
+    Qwen35Model* tp_draft_peer = (s.tp_peers.size() == 2) ? s.tp_peers[1] : nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lk(s.device_mu);
+        const bool use_q4_head = lm_head_quant_type() == 12 && lm_head_weights();
+        const void* draft_head = use_q4_head ? lm_head_weights()
+                               : (s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights());
+        const int draft_head_type = use_q4_head ? lm_head_quant_type()
+                                  : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
+        draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
+                                 tp_draft_peer ? s.cfg.vocab / 2 : s.cfg.vocab, s.cfg.hidden);
+        if (tp_draft_peer)
+            draft.set_embed_split(s.cfg.vocab / 2, tp_draft_peer->embed_weights(),
+                                  tp_draft_peer->tp_rank_view().device);
+        draft.ensure_quant();
+        s.final_seqlen_hint = -1;
+    }
+
+    auto fill_resume = [&](G& g, bool finished, bool failed) {
+        SpecResume& r = g.job->resume;
+        r = SpecResume{};
+        r.engaged = true;
+        r.finished = finished || (int)g.out.size() >= g.job->max_new;
+        r.failed = failed;
+        r.position = g.start;
+        r.next_token = g.next;
+        r.emitted = (int)g.out.size();
+    };
+    auto drop = [&](G& g) {   // device_mu held
+        if (g.state >= 0) draft.kv_state_free(g.state);
+        if (g.cap) cudaFree(g.cap);
+        g.state = -1;
+        g.cap = nullptr;
+        g.done = true;
+    };
+
+    // Prefill + capture + first draft of a joining job. false: it could not start (resume not
+    // engaged: the engine prefills it ordinarily); nothing of its session was touched then
+    // except, possibly, its prefill (resume.engaged stays false only before the prefill).
+    auto join = [&](SpecGroupJob* job, int D) -> bool {
+        G g;
+        g.job = job;
+        job->resume = SpecResume{};
+        const std::vector<int>& prompt = *job->prompt;
+        g.n = (int)prompt.size();
+        if (g.n < 1 || job->max_new < 1) return false;
+        const long need = (long)g.n + job->max_new + 2L * (B + 1);
+        if (need > dc.max_seq) return false;
+        std::lock_guard<std::recursive_mutex> lk(s.device_mu);
+        int capture_start = 0;
+        if (g.n >= 12288) capture_start = g.n - 4096;
+        set_dflash_capture(true, dc.target_layer_ids, B + 1, capture_start,
+                           std::min(s.cfg.max_seq, g.n + job->max_new + B + 1));
+        if (!dflash_context_buffer() || !dflash_hidden_buffer()) return false;
+        const size_t cap_bytes = (size_t)(B + 1) * s.dflash_n_cap * H * sizeof(bf16);
+        if (cudaMalloc(&g.cap, cap_bytes) != cudaSuccess) { cudaGetLastError(); g.cap = nullptr; return false; }
+        g.state = draft.kv_state_create((int)need);
+        if (g.state < 0) { cudaFree(g.cap); return false; }
+        const int budget = session_token_budget(prompt.size(), job->max_new + B, s.cfg.max_seq);
+        invalidate_decode_graph();
+        bool kv_ok = s.kv->allocate(job->seq_id, budget);
+        if (kv_ok && tp_draft_peer) {
+            std::lock_guard<std::recursive_mutex> peer_lock(tp_draft_peer->p_->device_mu);
+            kv_ok = tp_draft_peer->p_->kv->allocate(job->seq_id, budget);
+            if (!kv_ok) fprintf(stderr, "[tp] spec group: rank-1 KV grow failed where rank 0 succeeded\n");
+        }
+        if (!kv_ok) { drop(g); return false; }
+        activate_session(job->seq_id);
+        reset_mrope_offset();
+        int next = -1, batched_done = 0;
+        if (batched_prefill_windowed_enabled(s.gguf, s.cfg, g.n, s.kv))
+            next = prefill_batched_chunked(prompt.data(), g.n, false, &batched_done);
+        if (next < 0) {
+            for (int i = batched_done; i < g.n; i++) {
+                set_dflash_capture_row(0);
+                const bool sample = (i + 1 == g.n);
+                const int r = forward_token(prompt[i], i, sample);
+                dflash_stash_capture(i);
+                if (sample) next = r;
+            }
+        }
+        if (next < 0 || next >= s.cfg.vocab) { drop(g); return false; }
+        g.start = g.n;
+        g.next = next;
+        g.block.assign(B + 1, mask_id);
+        g.block[0] = next;
+        draft.kv_state_select(g.state);
+        draft.reset();
+        std::vector<int> draft_ids(B + 1, 0);
+        auto _td = std::chrono::steady_clock::now();
+        if (!draft.forward_block(dflash_context_buffer(), g.n, g.block.data(), g.start,
+                                 draft_ids.data(), nullptr, D, nullptr, s.dflash_ctx_start)) {
+            // The prompt is prefilled: hand the job back engaged at its first token.
+            fprintf(stderr, "[spec-group] first draft failed (n=%d)\n", g.n);
+            drop(g);
+            fill_resume(g, false, false);
+            hooks.on_done(job);
+            return true;
+        }
+        if (kTiming) t_draft += ms_since(_td);
+        for (int i = 1; i <= D; i++) g.block[i] = draft_ids[i];
+        g.predrafted = true;
+        gs.push_back(std::move(g));
+        return true;
+    };
+
+    auto depth_for = [&](int S) { return std::max(0, std::min(kDepthMax, std::min(B, R / std::max(S, 1) - 1))); };
+    for (SpecGroupJob* j : jobs) {
+        if (!join(j, depth_for((int)jobs.size()))) {
+            // Not engaged: the engine re-prefills it; stop here so it is not left waiting.
+            j->resume = SpecResume{};
+            hooks.on_done(j);
+            group_ok = false;
+        }
+    }
+
+    std::vector<int> ids, pos, argmax, keep, draft_ids(B + 1, 0);
+    std::vector<uint64_t> seq;
+    std::vector<void*> caps;
+    while (group_ok) {
+        // Active sessions of this step.
+        std::vector<G*> act;
+        for (G& g : gs) if (!g.done) act.push_back(&g);
+        if (act.empty()) {
+            // Everyone left: poll once for newcomers, else the group is over.
+            std::vector<SpecGroupJob*> joins;
+            if (!hooks.poll(joins) || joins.empty()) break;
+            for (SpecGroupJob* j : joins)
+                if (!join(j, depth_for((int)joins.size()))) { j->resume = SpecResume{}; hooks.on_done(j); group_ok = false; }
+            continue;
+        }
+        const int S = (int)act.size();
+        const int D = depth_for(S);
+        const int T = D + 1;
+        if (D < 1) break;
+        {
+            std::lock_guard<std::recursive_mutex> lk(s.device_mu);
+            auto _td = std::chrono::steady_clock::now();
+            bool draft_failed = false;
+            for (G* g : act) {
+                if (g->predrafted) { g->predrafted = false; continue; }
+                g->block.assign(B + 1, mask_id);
+                g->block[0] = g->next;
+                draft.kv_state_select(g->state);
+                if (!draft.forward_block(g->cap, g->th_len, g->block.data(), g->start,
+                                         draft_ids.data(), nullptr, D, nullptr, 0)) {
+                    draft_failed = true;
+                    break;
+                }
+                for (int i = 1; i <= D; i++) g->block[i] = draft_ids[i];
+            }
+            if (kTiming) t_draft += ms_since(_td);
+            if (draft_failed) { fprintf(stderr, "[spec-group] draft failed\n"); break; }
+            const int n = S * T;
+            ids.assign(n, 0); pos.assign(n, 0); seq.assign(n, 0); argmax.assign(n, 0);
+            keep.assign(S, 1); caps.assign(S, nullptr);
+            for (int j = 0; j < S; j++) {
+                caps[j] = act[j]->cap;
+                for (int t = 0; t < T; t++) {
+                    ids[t * S + j] = act[j]->block[t];
+                    pos[t * S + j] = act[j]->start + t;
+                    seq[t * S + j] = act[j]->job->seq_id;
+                }
+            }
+            auto _tv = std::chrono::steady_clock::now();
+            const int r = spec_group_verify(ids.data(), n, pos.data(), seq.data(), S, caps.data(),
+                                            argmax.data(), keep.data());
+            if (kTiming) t_verify += ms_since(_tv);
+            if (r != n) { fprintf(stderr, "[spec-group] verify declined (S=%d T=%d)\n", S, T); break; }
+        }
+        steps++;
+        seg_steps += S;
+        // Commit each session's accepted prefix, exactly as dflash_generate does per step.
+        for (int j = 0; j < S; j++) {
+            G& g = *act[j];
+            const int kp = keep[j];
+            accept_sum += kp;
+            const size_t before = g.out.size();
+            bool stop = false;
+            for (int i = 0; i < kp && (int)g.out.size() < g.job->max_new; i++) {
+                g.out.push_back(g.block[i]);
+                if (!ignore_eos && (g.block[i] == s.cfg.eos_id ||
+                                    (s.cfg.eos_id2 >= 0 && g.block[i] == s.cfg.eos_id2))) {
+                    stop = true;
+                    break;
+                }
+            }
+            bool eos_next = false;
+            if (!stop) {
+                g.next = argmax[(size_t)(kp - 1) * S + j];
+                if (!ignore_eos && (g.next == s.cfg.eos_id ||
+                                    (s.cfg.eos_id2 >= 0 && g.next == s.cfg.eos_id2))) {
+                    if ((int)g.out.size() < g.job->max_new) g.out.push_back(g.next);
+                    eos_next = true;
+                }
+            }
+            bool stopped = false;
+            if (g.out.size() > before &&
+                !g.job->on_tokens(g.out.data() + before, (int)(g.out.size() - before)))
+                stopped = true;
+            const bool finished = stop || eos_next || (int)g.out.size() >= g.job->max_new;
+            if (!stop && !eos_next) {
+                g.start += kp;
+                g.th_len = kp;
+            }
+            if (finished || stopped) {
+                {
+                    std::lock_guard<std::recursive_mutex> lk(s.device_mu);
+                    drop(g);
+                }
+                fill_resume(g, finished, false);
+                hooks.on_done(g.job);
+            }
+        }
+        // Newcomers join (or the group stops and hands everyone back).
+        std::vector<SpecGroupJob*> joins;
+        if (!hooks.poll(joins)) break;
+        if (!joins.empty()) {
+            int live = 0;
+            for (G& g : gs) live += !g.done;
+            for (SpecGroupJob* j : joins)
+                if (!join(j, depth_for(live + (int)joins.size()))) {
+                    j->resume = SpecResume{};
+                    hooks.on_done(j);
+                    group_ok = false;
+                }
+        }
+    }
+    // Hand back whoever is still running, at its committed position.
+    {
+        std::lock_guard<std::recursive_mutex> lk(s.device_mu);
+        for (G& g : gs) {
+            if (g.done) continue;
+            drop(g);
+            fill_resume(g, false, false);
+            hooks.on_done(g.job);
+        }
+        draft.kv_state_select(-1);
+        draft.reset();
+        set_dflash_capture(false, {}, 0);
+        invalidate_decode_graph();
+    }
+    spec_group_release();
+    if (kTiming && steps > 0)
+        fprintf(stderr, "[spec-group] steps=%ld sessions/step=%.2f mean_accept=%.3f | draft %.2f "
+                        "ms/step | verify %.2f ms/step\n", steps, (double)seg_steps / steps,
+                accept_sum / seg_steps, t_draft / steps, t_verify / steps);
 }
 
 // ----- weight loading from a sparkinfer weight directory -----

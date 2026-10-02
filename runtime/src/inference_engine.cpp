@@ -6,6 +6,7 @@
 #include <mutex>
 
 #include <algorithm>
+#include <unordered_set>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -336,11 +337,39 @@ bool ContinuousBatchEngine::spec_eligible(const Request& r) {
            !r.use_prefix_session;
 }
 
+// Hands a speculative run's committed tokens to the job (TTFT, output, streaming callback,
+// timeout). false: the job stops (cancelled or timed out).
+bool ContinuousBatchEngine::spec_emit(Job& job, const int* tokens, int n) {
+    const double timeout_s = request_timeout_s_config();
+    for (int i = 0; i < n; i++) {
+        const auto t_emit = std::chrono::steady_clock::now();
+        if (!job.saw_first_tok) {
+            job.t_first = t_emit;
+            job.saw_first_tok = true;
+            job.ttft_ms = std::chrono::duration<double, std::milli>(job.t_first - job.t_submit).count();
+        }
+        job.output.push_back(tokens[i]);
+        job.decode_emitted++;
+        if (job.on_token && !job.on_token(tokens[i])) {
+            job.cancelled = true;
+            return false;
+        }
+    }
+    if (timeout_s > 0.0) {
+        const double elapsed_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - job.t_submit).count();
+        if (elapsed_s > timeout_s) {
+            job.error = "request timeout after " + std::to_string(elapsed_s) + "s (limit " +
+                        std::to_string(timeout_s) + "s)";
+            job.timed_out = true;
+            return false;
+        }
+    }
+    return true;
+}
+
 void ContinuousBatchEngine::run_speculative(Job& job) {
     job.spec_tried = true;
-    const Qwen35Config& cfg = model_->config();
-    const int prompt_len = (int)job.req.prompt.size();
-    const double timeout_s = request_timeout_s_config();
     // spec_running_ was raised, and spec_interrupt_ cleared, under mu_ when this job was picked.
     {
         std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
@@ -351,35 +380,90 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
     Qwen35Model::SpecHooks hooks;
     hooks.seq_id = job.seq_id;
     hooks.on_tokens = [&](const int* tokens, int n) -> bool {
-        for (int i = 0; i < n; i++) {
-            const auto t_emit = std::chrono::steady_clock::now();
-            if (!job.saw_first_tok) {
-                job.t_first = t_emit;
-                job.saw_first_tok = true;
-                job.ttft_ms = std::chrono::duration<double, std::milli>(job.t_first - job.t_submit).count();
-            }
-            job.output.push_back(tokens[i]);
-            job.decode_emitted++;
-            if (job.on_token && !job.on_token(tokens[i])) {
-                job.cancelled = true;
-                return false;
-            }
-        }
-        if (timeout_s > 0.0) {
-            const double elapsed_s = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - job.t_submit).count();
-            if (elapsed_s > timeout_s) {
-                job.error = "request timeout after " + std::to_string(elapsed_s) + "s (limit " +
-                            std::to_string(timeout_s) + "s)";
-                job.timed_out = true;
-                return false;
-            }
-        }
-        return !spec_interrupt_.load(std::memory_order_relaxed);
+        return spec_emit(job, tokens, n) && !spec_interrupt_.load(std::memory_order_relaxed);
     };
     Qwen35Model::SpecResume r;
     model_->dflash_generate(job.req.prompt, job.req.max_new_tokens, nullptr, nullptr, &hooks, &r);
     spec_running_.store(false, std::memory_order_relaxed);
+    spec_commit(job, r);
+}
+
+// (dual-GPU C2) Group size cap for run_speculative_group (SPARKINFER_SPEC_GROUP_MAX, default 4;
+// 0 disables group speculation) and whether a lone request also takes the group path, so that
+// requests arriving after it join it instead of interrupting it (SPARKINFER_SPEC_GROUP_SINGLE,
+// default on; 0 keeps dflash_generate for a lone request). Measured, HyperQwen cohort, 512
+// tokens: a lone request 98.4 (dflash_generate) vs 97.0 tok/s (group of one).
+static int spec_group_max() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_MAX");
+        return e ? atoi(e) : 4;
+    }();
+    return v;
+}
+static bool spec_group_single() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_SINGLE");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
+// (dual-GPU C2) Several fresh, eligible requests decode speculatively together
+// (Qwen35Model::dflash_generate_group). Requests submitted meanwhile join between steps while
+// they are eligible and the group has room; anything else stops the group, and every unfinished
+// job continues with ordinary (packed) decode from its committed position.
+void ContinuousBatchEngine::run_speculative_group(const std::vector<Job*>& first) {
+    struct Member {
+        Job* job;
+        Qwen35Model::SpecGroupJob gj;
+    };
+    std::vector<std::unique_ptr<Member>> members;
+    std::unordered_set<Job*> in_group;
+    auto make = [&](Job* job) {
+        job->spec_tried = true;
+        auto m = std::make_unique<Member>();
+        m->job = job;
+        m->gj.seq_id = job->seq_id;
+        m->gj.prompt = &job->req.prompt;
+        m->gj.max_new = job->req.max_new_tokens;
+        m->gj.user = m.get();
+        m->gj.on_tokens = [this, job](const int* t, int n) { return spec_emit(*job, t, n); };
+        in_group.insert(job);
+        Qwen35Model::SpecGroupJob* p = &m->gj;
+        members.push_back(std::move(m));
+        return p;
+    };
+    std::vector<Qwen35Model::SpecGroupJob*> start;
+    for (Job* j : first) start.push_back(make(j));
+    Qwen35Model::SpecGroupHooks hooks;
+    hooks.on_done = [&](Qwen35Model::SpecGroupJob* gj) {
+        Member* m = static_cast<Member*>(gj->user);
+        in_group.erase(m->job);
+        spec_commit(*m->job, gj->resume);
+        cv_.notify_all();
+    };
+    hooks.poll = [&](std::vector<Qwen35Model::SpecGroupJob*>& joins) -> bool {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!running_) return false;
+        int size = (int)in_group.size();
+        for (const auto& kv : jobs_) {
+            Job* j = kv.second.get();
+            if (j->done || in_group.count(j)) continue;
+            if (j->spec_tried || j->phase != SeqPhase::PREFILL || j->prefill_pos != 0 ||
+                !spec_eligible(j->req) || size >= spec_group_max())
+                return false;
+            joins.push_back(make(j));
+            ++size;
+        }
+        return true;
+    };
+    model_->dflash_generate_group(start, hooks);
+}
+
+// After a speculative run: finish the job, or leave it for ordinary decode at r.position.
+void ContinuousBatchEngine::spec_commit(Job& job, const Qwen35Model::SpecResume& r) {
+    const Qwen35Config& cfg = model_->config();
+    const int prompt_len = (int)job.req.prompt.size();
     if (!r.engaged) return;   // nothing ran: ordinary prefill picks the job up on the next iteration
     spec_runs_.fetch_add(1, std::memory_order_relaxed);
     spec_tokens_.fetch_add((uint64_t)job.decode_emitted, std::memory_order_relaxed);
@@ -672,7 +756,8 @@ void ContinuousBatchEngine::worker_loop() {
                         ++live;
                         only = kv.second.get();
                     }
-                    if (live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
+                    if (live == 1 && !(spec_group_single() && model_->spec_group_supported()) &&
+                        !only->spec_tried && only->phase == SeqPhase::PREFILL &&
                         only->prefill_pos == 0 && spec_eligible(only->req)) {
                         spec_job = only;
                         // Raised under mu_, which submit_locked also holds: a request submitted from
@@ -684,6 +769,28 @@ void ContinuousBatchEngine::worker_loop() {
             }
             if (spec_job) {
                 run_speculative(*spec_job);
+                cv_.notify_all();
+                continue;
+            }
+            std::vector<Job*> group;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                const int gmax = spec_group_max();
+                if (speculative_ && running_ && gmax > 0 && model_->spec_group_supported()) {
+                    bool all_fresh = true;
+                    for (const auto& kv : jobs_) {
+                        Job* j = kv.second.get();
+                        if (j->done) continue;
+                        if (j->spec_tried || j->phase != SeqPhase::PREFILL || j->prefill_pos != 0 ||
+                            !spec_eligible(j->req)) { all_fresh = false; break; }
+                        group.push_back(j);
+                    }
+                    const int lo = spec_group_single() ? 1 : 2;
+                    if (!all_fresh || (int)group.size() < lo || (int)group.size() > gmax) group.clear();
+                }
+            }
+            if (!group.empty()) {
+                run_speculative_group(group);
                 cv_.notify_all();
                 continue;
             }

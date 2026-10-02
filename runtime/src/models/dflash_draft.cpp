@@ -401,6 +401,14 @@ struct DFlashDraftModel::Impl {
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
     int seq_len = 0;
+    int kv_cap = 0;   // positions k_cache/v_cache hold (cfg.max_seq for the built-in cache)
+    // (dual-GPU) Extra KV caches, one per concurrently drafted session (kv_state_*). The active
+    // cache is always the one in k_cache/v_cache/seq_len/kv_cap; a state's slot holds it while
+    // it is not selected. Slot -1 is the built-in cache.
+    struct KvState { std::vector<bf16*> k, v; int seq_len = 0; int cap = 0; bool live = false; };
+    std::vector<KvState> kv_states;
+    KvState kv_default;
+    int kv_cur = -1;
 
     // The draft's quantized weight copies are built on first use, not at load. Constructing them
     // is what makes merely loading the draft tax the TARGET's decode: measured on RTX 5090 with
@@ -558,6 +566,7 @@ struct DFlashDraftModel::Impl {
             v_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
         }
         seq_len = 0;
+        kv_cap = cfg.max_seq;
     }
 
     // NVFP4 -> BF16 at load, decoded on the host.
@@ -636,6 +645,11 @@ DFlashDraftModel::DFlashDraftModel(const DFlashDraftConfig& cfg) : p_(new Impl()
 
 DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
+    if (!p_->kv_states.empty()) kv_state_select(-1);
+    for (auto& st : p_->kv_states) {
+        for (bf16* b : st.k) cudaFree(b);
+        for (bf16* b : st.v) cudaFree(b);
+    }
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
@@ -728,6 +742,64 @@ void DFlashDraftModel::crop(int keep) {
 }
 
 int DFlashDraftModel::seq_len() const { return p_->seq_len; }
+
+int DFlashDraftModel::kv_state_create(int capacity) {
+    Impl& s = *p_;
+    if (capacity <= 0) return -1;
+    if (capacity > s.cfg.max_seq) capacity = s.cfg.max_seq;
+    const size_t kvdim = (size_t)s.cfg.n_kv_heads * s.cfg.head_dim;
+    Impl::KvState st;
+    st.cap = capacity;
+    bool ok = true;
+    for (int L = 0; L < s.cfg.n_layers && ok; L++) {
+        void* k = nullptr;
+        void* v = nullptr;
+        ok = cudaMalloc(&k, (size_t)capacity * kvdim * sizeof(bf16)) == cudaSuccess;
+        if (ok) st.k.push_back((bf16*)k);
+        ok = ok && cudaMalloc(&v, (size_t)capacity * kvdim * sizeof(bf16)) == cudaSuccess;
+        if (ok) st.v.push_back((bf16*)v);
+    }
+    if (!ok) {
+        cudaGetLastError();
+        for (bf16* b : st.k) cudaFree(b);
+        for (bf16* b : st.v) cudaFree(b);
+        return -1;
+    }
+    st.live = true;
+    for (size_t i = 0; i < s.kv_states.size(); i++)
+        if (!s.kv_states[i].live) { s.kv_states[i] = std::move(st); return (int)i; }
+    s.kv_states.push_back(std::move(st));
+    return (int)s.kv_states.size() - 1;
+}
+
+bool DFlashDraftModel::kv_state_select(int id) {
+    Impl& s = *p_;
+    if (id == s.kv_cur) return true;
+    if (id >= 0 && (id >= (int)s.kv_states.size() || !s.kv_states[id].live)) return false;
+    Impl::KvState& out = s.kv_cur < 0 ? s.kv_default : s.kv_states[s.kv_cur];
+    out.k.swap(s.k_cache);
+    out.v.swap(s.v_cache);
+    out.seq_len = s.seq_len;
+    out.cap = s.kv_cap;
+    Impl::KvState& in = id < 0 ? s.kv_default : s.kv_states[id];
+    s.k_cache.swap(in.k);
+    s.v_cache.swap(in.v);
+    s.seq_len = in.seq_len;
+    s.kv_cap = in.cap;
+    s.kv_cur = id;
+    return true;
+}
+
+void DFlashDraftModel::kv_state_free(int id) {
+    Impl& s = *p_;
+    if (id < 0 || id >= (int)s.kv_states.size() || !s.kv_states[id].live) return;
+    if (s.kv_cur == id) kv_state_select(-1);
+    cudaStreamSynchronize(s.stream);
+    Impl::KvState& st = s.kv_states[id];
+    for (bf16* b : st.k) cudaFree(b);
+    for (bf16* b : st.v) cudaFree(b);
+    st = Impl::KvState{};
+}
 
 const float* DFlashDraftModel::last_logits() const { return p_->logits; }
 
@@ -1443,8 +1515,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // the same size). Project straight into the cache slice instead; the RoPE then runs in place
     // there. Same values written to the same addresses in the same order.
     const int new_len_all = ctx_len + BW;
-    if (past + new_len_all > c.max_seq) {
-        fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, c.max_seq);
+    if (past + new_len_all > s.kv_cap) {
+        fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, s.kv_cap);
         return false;
     }
     // Attention geometry for this block, hoisted: the context ingestion below needs the layer's

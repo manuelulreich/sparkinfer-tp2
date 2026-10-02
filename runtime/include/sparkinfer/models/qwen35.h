@@ -411,6 +411,28 @@ public:
         int emitted = 0;        // tokens handed to on_tokens
         bool tier_boundary = false;  // stopped where the next step would cross a KV split tier
     };
+    // (dual-GPU C2) Speculative decoding of several engine sessions at once (tp=2 leader only):
+    // see dflash_generate_group in qwen35.cpp. A job's resume is filled before on_done reports it.
+    struct SpecGroupJob {
+        uint64_t seq_id = 0;
+        const std::vector<int>* prompt = nullptr;
+        int max_new = 0;
+        std::function<bool(const int* tokens, int n)> on_tokens;   // false: this job stops
+        SpecResume resume;
+        void* user = nullptr;
+    };
+    struct SpecGroupHooks {
+        // Between steps, no lock held: append jobs to join; false stops the group.
+        std::function<bool(std::vector<SpecGroupJob*>& joins)> poll;
+        // A job left the group (finished, stopped, failed to start, or handed back).
+        std::function<void(SpecGroupJob*)> on_done;
+    };
+    bool spec_group_supported() const;
+    void dflash_generate_group(std::vector<SpecGroupJob*> jobs, const SpecGroupHooks& hooks);
+    int spec_group_verify(const int* ids, int n, const int* row_pos, const uint64_t* row_seq,
+                          int seg_n, void* const* seg_capture, int* out_argmax, int* seg_keep);
+    void spec_group_release();
+
     std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
                                      DFlashStats* stats = nullptr,
                                      ThermalGovernor* gov = nullptr,
@@ -830,7 +852,8 @@ private:
     // committing exactly those rows' GDN state, or -1 when declined (nothing changed).
     int verify_rows_tp(const int* ids, int n, int start_pos, void* capture_dst, int* out_argmax);
     int tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
-                        const uint64_t* row_seq, void* capture_dst, int* out_argmax);
+                        const uint64_t* row_seq, void* capture_dst, int* out_argmax,
+                        int seg_n = 0, void* const* seg_capture = nullptr, int* seg_keep = nullptr);
     bool tp_verify_alloc();
     void reserve_tp_verify_local(bool* ok);
     // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or

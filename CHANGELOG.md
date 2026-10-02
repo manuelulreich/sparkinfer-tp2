@@ -42,6 +42,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 speculative decoding of concurrent requests together** (DSpark group): every step drafts
+  each request on its own draft KV state, then verifies all of their blocks in ONE segmented
+  tensor-core pass (rows step-major, per-session GDN snapshot/replay, per-session capture), so the
+  weights stream once for the whole group. Requests arriving later join between steps instead of
+  interrupting speculation. HyperQwen cohort, 512 tokens, e2e: C2 93.7 (plain decode) → 122.5,
+  C4 155 → 173-181 (per-request sum 207-222); a lone request 97 tok/s (98.4 on the single-request
+  path). `SPARKINFER_SPEC_GROUP_MAX` (default 4, 0 = off), `SPARKINFER_SPEC_GROUP_SINGLE=0` (lone
+  requests on `dflash_generate`), `SPARKINFER_SPEC_GROUP_DEPTH` (default 6). Lossless gate passes
+  through the group path in deterministic mode.
 - **tp=2 DSpark verify runs on the FP4 tensor cores** (single request; it used the dp4a row
   GEMVs): verify 31.9 → 25.2 ms per 7-row block, HyperQwen cohort C1 77.4 → 98.4 tok/s at the same
   mean acceptance (~2.8), gate `dspark_count` 240 → 295. W4A4 like the batched decode, so outside

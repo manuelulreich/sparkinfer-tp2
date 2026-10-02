@@ -301,6 +301,9 @@ private:
     void finish_job_impl(Job& j);
     // Runs job speculatively until it finishes or another request arrives; see enable_speculative.
     void run_speculative(Job& job);
+    void run_speculative_group(const std::vector<Job*>& first);
+    bool spec_emit(Job& job, const int* tokens, int n);
+    void spec_commit(Job& job, const Qwen35Model::SpecResume& r);
     static bool spec_eligible(const Request& r);
 
     Qwen35Model* model_;

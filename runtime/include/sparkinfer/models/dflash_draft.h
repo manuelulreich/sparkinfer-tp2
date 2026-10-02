@@ -82,6 +82,14 @@ public:
 
     int seq_len() const;
 
+    // (dual-GPU) Per-session draft KV caches, for drafting several sequences in turn. create
+    // allocates one holding `capacity` positions (clamped to max_seq; -1 = out of memory);
+    // select makes it the cache reset/crop/seq_len/forward_block act on (-1 = the built-in one);
+    // free releases it (selecting the built-in cache if it was active).
+    int kv_state_create(int capacity);
+    bool kv_state_select(int id);
+    void kv_state_free(int id);
+
     // One parallel block forward.
     //   target_hidden: [ctx_len, n_capture * hidden] bf16 (concat features before fc)
     //   noise_ids:     [block_size] token ids (mask-filled block; position 0 = seed)
