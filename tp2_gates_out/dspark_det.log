@@ -1,0 +1,77 @@
+[sparkinfer-server] tp=2: CUDA_MODULE_LOADING=EAGER (lazy loading can fail silently on a near-full card)
+[sparkinfer-server] tokenizer loaded: /home/manuel/.cache/huggingface/hub/models--gittensor-model-hub--Qwen3.8-27B-NVFP4-RTX5090/snapshots/5b7a687fc8211a5d631c8ca6a593dd37eb26ce33/tokenizer.json (vocab=248077)
+[sparkinfer-server] tensor-parallel plan: tp=2 devices=0,1 (explicit)
+[sparkinfer-server] arch Qwen3.8-27B dense hybrid, layers=64, experts=1 top-1, max_seq=8192
+[sparkinfer-server] tp placement table: 851 names, 2 ranks (hf names)
+[tp] safetensors inventory cross-check: table entries=851, ranks=2, conv=Hf
+  table -> file: 451 found, 400 missing
+    model.language_model.layers.0.linear_attn.in_proj_qkv
+    model.language_model.layers.0.linear_attn.in_proj_z
+    model.language_model.layers.0.linear_attn.out_proj
+    model.language_model.layers.0.mlp.down_proj
+    model.language_model.layers.0.mlp.gate_proj
+    model.language_model.layers.0.mlp.up_proj
+    model.language_model.layers.1.linear_attn.in_proj_qkv
+    model.language_model.layers.1.linear_attn.in_proj_z
+    model.language_model.layers.1.linear_attn.out_proj
+    model.language_model.layers.1.mlp.down_proj
+    model.language_model.layers.1.mlp.gate_proj
+    model.language_model.layers.1.mlp.up_proj  (file-only names such as model.visual.* cannot be listed: the loader exposes no name enumeration)
+  byte audit (nvfp4 class model): table total on disk = 16994355336 B; known-name file bytes = 3230972928 B
+    per rank, model:    rank0=8497854088 B  rank1=8497854088 B  
+    per rank, file:      rank0=1616161284 B  rank1=1616161284 B  
+    per-name mismatches (file != model), first of 1:
+      lm_head.weight: file=635699200 B, model=715161608 B
+[sparkinfer-server] kv_cache: int8=1 slots=16/64 blocks=520 resident=0.1 GiB
+ (per-device: this rank's pool holds 2 of 4 KV heads; admission is the min across pools)
+[sparkinfer-server] tp head: the full (replicated) keep needs 833 MiB + 3072 MiB reserve; split per rank it is:
+  rank0 (dev 0): vocab rows 124160, keep need 416 MiB
+  rank1 (dev 1): vocab rows 124160, keep need 416 MiB
+[sparkinfer-server] tp head: the actual keep/decline (free-VRAM dependent) still runs in qwen35.cpp's compressed-tensors load (SPARKINFER_Q38_HEAD_NVFP4)
+[sparkinfer-server] loading compressed-tensors checkpoint ...
+[compressed-tensors] NVFP4 lm_head kept for wide packed decode (0.41 GB)
+[compressed-tensors] loaded 64 layers, native NVFP4 prefill FFN 64/64, decode FFN NVFP4
+[compressed-tensors] Q4_K prefill row scales ready (10 MB)
+[compressed-tensors] NVFP4 lm_head kept for wide packed decode (0.41 GB)
+[compressed-tensors] loaded 64 layers, native NVFP4 prefill FFN 64/64, decode FFN NVFP4
+[compressed-tensors] Q4_K prefill row scales ready (10 MB)
+[sparkinfer-server] tp rank1 (dev 1): KV heads [2,4), GDN v [24,48) loaded
+[runtime] NVIDIA GeForce RTX 5060 Ti  cc=12.0  SMs=36  BW=448 GB/s
+[runtime] NVIDIA GeForce RTX 5060 Ti  cc=12.0  SMs=36  BW=448 GB/s
+[tp-audit] rank 0 (device 0): on-disk 8497854088 B, card free 5744361472/16660430848 B, per-card est at ctx 131072 = 12981302920 B -> fits 16 GiB (17,179,869,184 B)
+[tp-audit] rank 1 (device 1): on-disk 8497854088 B, card free 5744361472/16660430848 B, per-card est at ctx 131072 = 12981302920 B -> fits 16 GiB (17,179,869,184 B)
+[gpu_link] init: flag all-reduce on (ops <= 262144 bytes)
+[gpu_link] init: transport=p2p-mapped (peer access enabled both ways), dev A=0, dev B=1, max_bytes=536870912
+[tp] rank 0 attached (device 0; H=5120 V=248320 64 layers; peer slot present)
+[tp] rank 1 attached (device 1; H=5120 V=248320 64 layers; peer slot EMPTY)
+[sparkinfer-server] tp=2: GpuLink attached (rank0 dev 0, rank1 dev 1); split-weight forward active
+[sparkinfer-server] prefix cache: off (SPARKINFER_DETERMINISTIC=1 -- a request's output may not depend on what earlier requests cached)
+[sparkinfer-server] vision tower: off (SPARKINFER_VISION=0)
+[sparkinfer-server] continuous batching enabled (policy=0, batch=64)
+[sparkinfer-server] model ready: /home/manuel/.cache/huggingface/hub/models--gittensor-model-hub--Qwen3.8-27B-NVFP4-RTX5090/snapshots/5b7a687fc8211a5d631c8ca6a593dd37eb26ce33
+[sparkinfer-server] sampling defaults: greedy for requests that omit temperature/top_k/top_p (SPARKINFER_DETERMINISTIC=1)
+[sparkinfer-server] advertising model id: qwen3.8-27b (override with --model-name)
+[sparkinfer-server] tool calls: constrained decoding on (248320 tokens, 2 stop ids, 0.2 s)
+[dflash] YaRN: factor=32.0 orig_max=8192 att_scale=1.3466 (inv_freq[0]=1.000e+00 inv_freq[63]=4.020e-09)
+[dflash] loaded draft: layers=5 H=5120 B=7 n_cap=5 mask=248077 markov_rank=256 confidence=1
+[dflash] released the bf16 q/o/gate/up/down copies (2.10 GB): the quantized mirrors serve every block width in use
+[sparkinfer-server] speculative decoding: DSpark draft /home/manuel/.cache/huggingface/hub/models--gittensor-model-hub--Qwen3.8-27B-DSpark-NVFP4/snapshots/eba1ac5a66c74902eaa95a4000a7c5eda96d8e95 (block 7, draft context 8192)
+[sparkinfer-server] OpenAI-compatible API on http://127.0.0.1:8091
+  GET  /health
+  GET  /v1/models
+  GET  /v1/info
+  GET  /v1/capacity
+  GET  /metrics
+  POST /v1/tokenize
+  POST /v1/chat/completions
+  POST /v1/completions
+  POST /v1/score
+  POST /v1/messages  POST /v1/messages/count_tokens  (Anthropic)
+  POST /v1/responses  (OpenAI Responses, stateless)
+  read_timeout=300s write_timeout=300s max_output_tokens=4096 max_queue_depth=unlimited drain_grace=30s  DETERMINISTIC=1 (bit-reproducible)
+[tp] tp=2 prefill is EAGER-only (the o_proj all-reduce is not stream-capturable; graph capture/replay bypassed)
+[tp] prefill arms N=13: fp4 gu=0 down=0 gdn=0 attn=0, i8ffn=0 (this rank had 0x0, agreed 0x0)
+[gdn] windowed instance: prefill single-scan (chunked path declined) has no windowed kernel; that slot stages through the full-layout gdn_scratch around it
+[tp] tp=2 decode is EAGER-only (no CUDA-graph capture; P2P is not stream-capturable)
+[sparkinfer-server] shutdown signal received, draining in-flight requests...
+[sparkinfer-server] drained (nothing in flight), exiting

@@ -3700,7 +3700,19 @@ void Qwen35Model::reserve_tp_verify_local(bool* ok) {
 // by the next step, as in the tp=1 verify.
 int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capture_dst,
                                 int* out_argmax) {
+    return tp_rows_forward(ids, n, start_pos, nullptr, nullptr, capture_dst, out_argmax);
+}
+
+// (dual-GPU C1) The row-batched tp forward behind both verify_rows_tp (row_seq == nullptr: n
+// consecutive positions of the ACTIVE session, snapshot + partial-accept replay) and
+// decode_packed_tp (row_seq != nullptr: row r is one decode step of session row_seq[r] at
+// row_pos[r], every row kept). Per row the arithmetic is the single-row decode body's either way;
+// only the state each row reads and writes (GDN conv/recurrent state, KV block table, position)
+// is chosen per row.
+int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
+                                 const uint64_t* row_seq, void* capture_dst, int* out_argmax) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    const bool multi = row_seq != nullptr;
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -3709,9 +3721,28 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
     // Every decline happens here, before the first link op, and depends only on state both ranks
     // share (config, loaded formats, the mirrored session), so the ranks always decline together.
     if (!ids || !out_argmax || n < 1 || n > R) return -1;
-    if (!s.gguf || !c.hybrid || !c.dense_ffn || s.active_lin_state_b16 || !s.lin_state ||
-        !s.lin_conv_state || (s.use_pq && !s.use_llama))
-        return -1;
+    if (!s.gguf || !c.hybrid || !c.dense_ffn || (s.use_pq && !s.use_llama)) return -1;
+    if (multi && !row_pos) return -1;
+    // Per-row GDN state (multi: each row's own session; verify: the active one for every row).
+    float* row_lin[kTpVerifyRows];
+    bf16* row_conv[kTpVerifyRows];
+    uint64_t row_kv[kTpVerifyRows];
+    for (int r = 0; r < n; r++) {
+        if (multi) {
+            auto it = s.sessions.find(row_seq[r]);
+            if (it == s.sessions.end() || it->second.lin_state_b16 || !it->second.lin_state ||
+                !it->second.lin_conv_state)
+                return -1;
+            row_lin[r] = static_cast<float*>(it->second.lin_state);
+            row_conv[r] = static_cast<bf16*>(it->second.lin_conv_state);
+            row_kv[r] = row_seq[r];
+        } else {
+            if (s.active_lin_state_b16 || !s.lin_state || !s.lin_conv_state) return -1;
+            row_lin[r] = s.lin_state;
+            row_conv[r] = s.lin_conv_state;
+            row_kv[r] = s.active_seq_id;
+        }
+    }
     const int HD = c.head_dim;
     const int n_q = c.n_q_heads / 2, n_kv = c.n_kv_heads / 2;
     const int qdim_l = n_q * HD, kvdim_l = n_kv * HD;
@@ -3751,17 +3782,20 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
 
     // Entry: ids / positions / seq_lens, the GDN snapshot, and the embedding (vocab-window gather
     // + all-reduce == the decode entry's owner-row exchange).
+    auto pos_of = [&](int r) { return multi ? row_pos[r] : start_pos + r; };
     for (int r = 0; r < n; r++) {
         s.h_vr[r] = ids[r];
-        s.h_vr[R + r] = start_pos + r;
-        s.h_vr[2 * R + r] = start_pos + r + 1;
+        s.h_vr[R + r] = pos_of(r);
+        s.h_vr[2 * R + r] = pos_of(r) + 1;
     }
     cu(cudaMemcpyAsync(s.vr_ids, s.h_vr, (size_t)3 * R * sizeof(int), cudaMemcpyHostToDevice, st),
        "tp verify ids");
-    cu(cudaMemcpyAsync(s.vr_snap_lin, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, st),
-       "tp verify snap lin");
-    cu(cudaMemcpyAsync(s.vr_snap_conv, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
-       "tp verify snap conv");
+    if (!multi) {
+        cu(cudaMemcpyAsync(s.vr_snap_lin, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, st),
+           "tp verify snap lin");
+        cu(cudaMemcpyAsync(s.vr_snap_conv, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "tp verify snap conv");
+    }
     kernels::launch_embedding_vocab_window(s.vr_ids, s.w.embed_tokens, s.vr_x, n, H,
                                            (int)s.tp_rank * Vr, Vr, st);
     tp_prefill_allreduce_bf16(s.vr_x, (size_t)n * H);
@@ -3823,7 +3857,7 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
     // tp_gdn_layer_tp runs it; the gated-delta output lands in `out`.
     auto gdn_step = [&](int L, int r, bf16* out) {
         const Qwen35LayerWeights& w = s.w.layers[L];
-        bf16* conv_state = s.lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+        bf16* conv_state = row_conv[r] + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
         kernels::launch_qwen36_conv_split_l2norm_fused(s.vr_full + (size_t)r * lqkv, w.ssm_conv,
                                                        conv_state, s.lin_q, s.lin_k, s.lin_v,
                                                        c.linear_q_heads, c.linear_v_heads, lhd,
@@ -3835,9 +3869,9 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
                                       s.vr_rec_a + ab, s.vr_rec_b + ab,
                                       static_cast<const bf16*>(w.ssm_dt) + v0,
                                       static_cast<const bf16*>(w.ssm_a) + v0,
-                                      s.lin_state, state_off, out,
+                                      row_lin[r], state_off, out,
                                       c.gdn_qh_block ? vloc / g : vloc, vloc,
-                                      lhd, c.gdn_qh_block, st, s.active_lin_state_b16);
+                                      lhd, c.gdn_qh_block, st, /*state_b16=*/false);
     };
 
     for (int L = 0; L < c.n_layers; L++) {
@@ -3875,7 +3909,9 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
             void* vpool = (char*)s.kv->v_pool() + s.kv->layer_base_elems(L) * kv_elem;
             void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
-            int* ltab = w.swa ? s.kv->block_table_win(s.active_seq_id) : s.kv->block_table(s.active_seq_id);
+            auto ltab_of = [&](int r) {
+                return w.swa ? s.kv->block_table_win(row_kv[r]) : s.kv->block_table(row_kv[r]);
+            };
             // Row by row, as the decode body appends: these kernels index the block table PER
             // TOKEN (block_table[tok * max_blocks + blk], the packed-sequence layout), so a
             // multi-token call on one sequence's table would put rows 1.. in other tables' blocks.
@@ -3885,22 +3921,22 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
                 const bf16* vrw = s.vr_v + (size_t)r * kvdim_l;
                 if (kv8)
                     kernels::launch_rope_kv_append_partial_int8(qr, kr, vrw, kpool, vpool, kscale, vscale,
-                                                                ltab, s.vr_pos + r, 1, n_q, n_kv, HD,
+                                                                ltab_of(r), s.vr_pos + r, 1, n_q, n_kv, HD,
                                                                 c.rope_dim, c.rope_theta, s.kv->block_size(),
                                                                 s.kv->max_blocks_per_seq(), st);
                 else
                     kernels::launch_rope_kv_append_partial(qr, kr, vrw, (bf16*)kpool, (bf16*)vpool,
-                                                           ltab, s.vr_pos + r, 1, n_q, n_kv, HD,
+                                                           ltab_of(r), s.vr_pos + r, 1, n_q, n_kv, HD,
                                                            c.rope_dim, c.rope_theta, s.kv->block_size(),
                                                            s.kv->max_blocks_per_seq(), st);
             }
             for (int r = 0; r < n; r++)
-                kernels::launch_flash_decode_split(s.vr_q + (size_t)r * qdim_l, kpool, vpool, ltab,
+                kernels::launch_flash_decode_split(s.vr_q + (size_t)r * qdim_l, kpool, vpool, ltab_of(r),
                                                    s.vr_seq + r, s.vr_attn + (size_t)r * qdim_l,
                                                    s.fa_m, s.fa_l, s.fa_acc, 1, n_q, n_kv, HD,
                                                    s.kv->block_size(), s.kv->max_blocks_per_seq(),
                                                    s.n_splits, 1.f / sqrtf((float)HD), st,
-                                                   nullptr, start_pos + r + 1,
+                                                   nullptr, pos_of(r) + 1,
                                                    kscale, vscale, kv8 ? 1 : 0, nullptr, 0);
             if (w.q_has_gate)
                 kernels::launch_qwen36_mul_sigmoid(s.vr_attn, s.vr_g, n * qdim_l, st);
@@ -3943,7 +3979,7 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(s.vr_h, s.vr_ar, nextnorm, s.vr_x, s.vr_xn, n, H, c.rms_eps, st);
         // DSpark capture of this layer's output rows (leader only; the draft lives on rank 0).
-        if (capture_dst && s.tp_rank == 0 && s.dflash_n_cap > 0)
+        if (!multi && capture_dst && s.tp_rank == 0 && s.dflash_n_cap > 0)
             for (int slot = 0; slot < s.dflash_n_cap; slot++)
                 if (s.dflash_layer_ids[slot] == L)
                     dflash_kernels::launch_capture_rows(
@@ -3988,6 +4024,7 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
     cu(cudaStreamSynchronize(st), "tp verify sync");
     for (int r = 0; r < n; r++) out_argmax[r] = s.h_vr[3 * R + r];
 
+    if (multi) return n;   // every row is one independent decode step: all kept
     // Accepted prefix: row 0 is always kept (it is the target's own next token); row r is kept
     // while the draft token at r matches the target's argmax at r-1.
     int keep = 1;
@@ -4039,6 +4076,36 @@ bool Qwen35Model::decode_packed_tp(const int* tokens, const int* positions,
     // representation batch, the one hazard the tp=1 packed path declines for, cannot arise.
     for (int i = 0; i < n; i++)
         if (s.sessions.find(seq_ids[i]) == s.sessions.end()) return false;
+    // (dual-GPU C1) Row-batched: all rows through one tp_rows_forward (the verify body with each
+    // row on its own session), so every block's weights stream once for all rows and the
+    // all-reduces cover all rows at once. The rows kernels are the single-row decode kernels' row
+    // twins (the invariant DSpark's losslessness already rests on), so each row's argmax is the
+    // token the per-row loop below would produce. Groups of kTpVerifyRows; a decline (b16 GDN
+    // state, verify scratch unavailable -- decided identically on both ranks) keeps the loop.
+    // SPARKINFER_TP_PACKED_ROWS=0 forces the loop (A/B).
+    static const bool rows_on = [] {
+        const char* e = getenv("SPARKINFER_TP_PACKED_ROWS");
+        return !(e && e[0] == '0');
+    }();
+    if (rows_on && n > 1) {
+        bool ok = true;
+        for (int i0 = 0; i0 < n && ok; i0 += kTpVerifyRows) {
+            const int m = std::min(kTpVerifyRows, n - i0);
+            ok = tp_rows_forward(tokens + i0, m, 0, positions + i0, seq_ids + i0, nullptr,
+                                 out_sampled + i0) == m;
+            // A decline happens before any state is touched, so the rows from i0 on can still
+            // take the loop; rows already run must not run again.
+            if (!ok) {
+                for (int i = i0; i < n; i++) {
+                    activate_session(seq_ids[i]);
+                    out_sampled[i] = forward_token_tp(tokens[i], positions[i], true, 0.f, 0, 0,
+                                                      0, 1.f, 0.f, 0.f);
+                }
+                return true;
+            }
+        }
+        return true;
+    }
     for (int i = 0; i < n; i++) {
         activate_session(seq_ids[i]);
         out_sampled[i] = forward_token_tp(tokens[i], positions[i],
@@ -7870,6 +7937,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         if (spec_stopped) break;
     }
     auto t_end = std::chrono::steady_clock::now();
+    if (kTiming && !stats && steps > 0)   // the serving path passes no stats: report here
+        fprintf(stderr, "[dspark] steps=%ld mean_accept=%.3f | draft %.2f ms x%ld | token-loop fwd "
+                        "%.2f ms x%ld | batched verify %.2f ms x%ld\n",
+                (long)steps, accept_sum / steps, n_draft ? t_draft_ms / n_draft : 0.0, n_draft,
+                n_fwd ? t_fwd_ms / n_fwd : 0.0, n_fwd, n_batched ? t_batched_ms / n_batched : 0.0,
+                n_batched);
     if (stats) {
         stats->steps = steps;
         stats->mean_accept = steps > 0 ? accept_sum / steps : 0;

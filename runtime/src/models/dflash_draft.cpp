@@ -424,6 +424,42 @@ struct DFlashDraftModel::Impl {
         }
         pending_quant.clear();
         quant_ready = true;
+        release_unused_bf16();
+    }
+
+    // (dual-GPU C3) Once every quantized mirror exists, the bf16 q/o/gate/up/down copies are dead
+    // weight: the block projections read them only on the per-token fallback (a block width the
+    // batched kernels are not instantiated for, or a missing mirror), and the default width always
+    // rounds onto an instantiated one (see BW in draft_step). k/v (the wide first block's context
+    // GEMM reads them) and fc stay. On DSpark that is ~3.3 GB of a 16 GB card -- at tp=2 the draft
+    // shares card 0 with half the target, and holding them starved the prefill arena and the
+    // draft's own capture buffer. Not when SPARKINFER_DFLASH_BLOCK_WIDTH forces a width (the
+    // fallback could then run), nor with SPARKINFER_DFLASH_KEEP_BF16=1 (A/B).
+    void release_unused_bf16() {
+        static const bool keep = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_KEEP_BF16");
+            const char* w = getenv("SPARKINFER_DFLASH_BLOCK_WIDTH");
+            return (e && e[0] == '1') || (w && atoi(w) > 0);
+        }();
+        if (keep || quant_failed || !q8_on()) return;
+        auto has = [](const Q8W& q) { return (q.q4 && q.dm) || (q.q && q.s); };
+        size_t freed = 0;
+        const size_t qd = (size_t)cfg.n_q_heads * cfg.head_dim, H = cfg.hidden,
+                     I = cfg.intermediate;
+        for (auto& lw : layers) {
+            if (!(has(lw.q8_wq) && has(lw.q8_wo) && has(lw.q8_gate) && has(lw.q8_up) &&
+                  has(lw.q8_down)))
+                continue;
+            release(lw.wq); lw.wq = nullptr;
+            release(lw.wo); lw.wo = nullptr;
+            release(lw.gate); lw.gate = nullptr;
+            release(lw.up); lw.up = nullptr;
+            release(lw.down); lw.down = nullptr;
+            freed += (2 * qd * H + 3 * I * H) * sizeof(bf16);
+        }
+        if (freed)
+            fprintf(stderr, "[dflash] released the bf16 q/o/gate/up/down copies (%.2f GB): the "
+                            "quantized mirrors serve every block width in use\n", freed / 1e9);
     }
 
     Q8W make_q8(bf16* w, int N, int K) {

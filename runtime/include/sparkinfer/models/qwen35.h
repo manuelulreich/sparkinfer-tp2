@@ -829,6 +829,8 @@ private:
     // per-row argmax bit-identical to forward_token_tp; returns the accepted-prefix length after
     // committing exactly those rows' GDN state, or -1 when declined (nothing changed).
     int verify_rows_tp(const int* ids, int n, int start_pos, void* capture_dst, int* out_argmax);
+    int tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
+                        const uint64_t* row_seq, void* capture_dst, int* out_argmax);
     bool tp_verify_alloc();
     void reserve_tp_verify_local(bool* ok);
     // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or

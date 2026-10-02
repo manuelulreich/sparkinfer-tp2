@@ -63,6 +63,13 @@ class Client:
         d["_wall_s"] = time.time() - t
         return d
 
+    def chat(self, content, max_tokens):
+        t = time.time()
+        d = self._req("/v1/chat/completions", {"messages": [{"role": "user", "content": content}],
+                                               "max_tokens": max_tokens, "temperature": 0})
+        d["_wall_s"] = time.time() - t
+        return d
+
     def metric(self, name):
         try:
             h = {"Authorization": "Bearer " + self.key} if self.key else {}
@@ -110,6 +117,11 @@ def main():
                          "predictable (DSpark upper bound)")
     ap.add_argument("--prefill-only", action="store_true")
     ap.add_argument("--decode-only", action="store_true")
+    ap.add_argument("--cohort", default="",
+                    help="JSONL of {\"prompt\": ...} (e.g. HyperQwen's bench/prompts_real.jsonl): "
+                         "chat requests, greedy, --cohort-len tokens each, run at every --conc "
+                         "level instead of the prefill/decode ladder (HyperQwen's cohort test)")
+    ap.add_argument("--cohort-len", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED_BASE", "1000")))
     ap.add_argument("--out", default="bench_results.jsonl")
     a = ap.parse_args()
@@ -145,6 +157,29 @@ def main():
     def log(kind, target, conc, d):
         d = dict(d); d.pop("choices", None)
         out.write(json.dumps({"kind": kind, "target": target, "conc": conc, **d}) + "\n"); out.flush()
+
+    if a.cohort:
+        cprompts = [json.loads(l)["prompt"] for l in open(a.cohort) if l.strip()]
+        for C in concs:
+            s0 = c.metric("sparkinfer_speculative_runs_total")
+            res, wall = [], 0.0
+            for i in range(0, len(cprompts), C):
+                r, w = run_parallel(lambda p: c.chat(p, a.cohort_len), [(p,) for p in cprompts[i:i + C]])
+                res += r; wall += w
+            s1 = c.metric("sparkinfer_speculative_runs_total")
+            for d in res: log("cohort", a.cohort_len, C, d)
+            ok = [d for d in res if "_error" not in d]
+            if not ok:
+                print(f"ROW cohort conc={C} | FAILED: {res[0].get('_error')}"); continue
+            dtps = [(d["usage"]["completion_tokens"] - 1) * 1000.0 /
+                    max(d["usage"]["generation_ms"] - d["usage"]["ttft_ms"], 1e-3) for d in ok]
+            ct = [d["usage"]["completion_tokens"] for d in ok]
+            spec = (f" | spec_runs+={s1 - s0:.0f}" if s0 is not None and s1 is not None else "")
+            print(f"ROW cohort conc={C} | {statistics.median(dtps):.1f} tok/s/request (median) "
+                  f"sum={C * statistics.median(dtps):.1f} | e2e={sum(ct) / wall:.1f} tok/s | "
+                  f"out={statistics.median(ct):.0f} tok | n={len(ok)}{spec}")
+        print(f"# raw responses in {a.out}")
+        return
 
     if not a.decode_only:
         for L in [x for x in ladder if x <= max_ctx]:

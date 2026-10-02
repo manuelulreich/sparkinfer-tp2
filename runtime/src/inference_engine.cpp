@@ -846,7 +846,12 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         if (!j->req.forced_tokens.empty()) return false;
         if (j->req.logprobs || j->on_token_logprob) return false;
         if (j->req.temperature != 0.f) return false;
-        if (j->req.top_k > 0 || j->req.top_p < 1.0f) return false;
+        // Truncation is inert at temperature 0 (forward_token's top-k/top-p mask cannot move the
+        // argmax -- see qwen35.h's forward_token doc), so it must not decline the pack. It used to:
+        // the server fills top_k/top_p from generation_config.json (Qwen3.8: 20 / 0.95) for any
+        // request that omits them, so a plain temperature-0 request was never packed and
+        // concurrent greedy decode ran one forward per sequence.
+        if (j->req.temperature != 0.f && (j->req.top_k > 0 || j->req.top_p < 1.0f)) return false;
         if (j->req.presence_penalty != 0.f || j->req.frequency_penalty != 0.f) return false;
         // decode_packed applies no logit bias: a request with logit_bias or a constraint decodes on
         // its own, where forward_token applies it.

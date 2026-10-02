@@ -11,4 +11,4 @@ __pycache__/
 dist/
 .claude
 .env.eval
-eval/.baseline_cache.json
+eval/.baseline_cache.jsontp2_gates_out/
