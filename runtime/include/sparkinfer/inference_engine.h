@@ -202,6 +202,7 @@ public:
         double generation_ms = -1.0;
         double decode_tps = -1.0;
         int cached_tokens = 0;   // prompt tokens served from the prefix cache, not recomputed
+        int speculative_tokens = 0;   // completion tokens produced by speculative decoding
     };
 
     ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,

@@ -75,7 +75,8 @@ greedy, plain-text requests while they are the sole active request. Vision, samp
 logprobs, forced-token paths, prefix resumes, and requests that overlap another request stay on or
 hand off to lossless autoregressive decoding. `/metrics` exposes
 `sparkinfer_speculative_runs_total`, `sparkinfer_speculative_tokens_total`, and
-`sparkinfer_speculative_handoffs_total` so this is observable in production.
+`sparkinfer_speculative_handoffs_total` so this is observable in production; a non-streamed chat
+completion also reports the tokens DSpark produced for it as `usage.speculative_tokens`.
 
 ### Serve on two cards (`--tp 2`)
 

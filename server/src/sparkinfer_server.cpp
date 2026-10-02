@@ -2456,6 +2456,7 @@ int main(int argc, char** argv) {
                      nlohmann::json logprobs_json = nullptr;
                      long long prompt_tokens = 0, completion_tokens = 0;
                                  int cached_tokens = 0;   // prompt tokens served from the prefix cache
+                     int speculative_tokens = 0;
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
@@ -2517,6 +2518,7 @@ int main(int argc, char** argv) {
                                  false, 0, nullptr, {}, &cur_images,
                                  grammar_constraint(constrained_format, format_grammar, g_format_constrained));
                              out.prompt_tokens += (long long)cur_prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
+                             out.speculative_tokens += outcome.speculative_tokens;
                              out.completion_tokens += (long long)ids.size();
                              if (!outcome.error.empty()) {
                                  // A hard engine fault (overloaded/alloc_failed/timed_out) is not a
@@ -2642,6 +2644,7 @@ int main(int argc, char** argv) {
                              return out;
                          }
                          out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
+                         out.speculative_tokens = outcome.speculative_tokens;
                          out.completion_tokens = (long long)outcome.tokens.size();
                          if (stopped_by_sequence) {
                              size_t pos;
@@ -2839,6 +2842,10 @@ int main(int argc, char** argv) {
                  if (gen_max >= 0.0) usage["generation_ms"] = gen_max;
                  if (decode_tps_agg >= 0.0) usage["decode_tps"] = decode_tps_agg;
                  usage["prompt_tokens_details"] = {{"cached_tokens", (int)results[0].cached_tokens}};
+                 // Not an OpenAI field: completion tokens DSpark produced (the rest decoded ordinarily).
+                 int spec_agg = 0;
+                 for (const auto& r : results) spec_agg += r.speculative_tokens;
+                 usage["speculative_tokens"] = spec_agg;
 
                  nlohmann::json choices = nlohmann::json::array();
                  for (int i = 0; i < controls.n; i++) {

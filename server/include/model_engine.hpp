@@ -37,6 +37,7 @@ struct CompletionResult {
     double generation_ms = -1.0;
     double decode_tps = -1.0;
     int cached_tokens = 0;   // prompt tokens served from the automatic prefix cache, not recomputed
+    int speculative_tokens = 0;   // completion tokens produced by speculative decoding (DSpark)
 };
 
 // Images already decoded and preprocessed, ready for the vision tower. Mirrored field-by-field

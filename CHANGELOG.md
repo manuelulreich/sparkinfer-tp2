@@ -33,6 +33,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **A prefix-cache hit no longer falls into the token loop when the card is short of memory.**
+  The prefill that continues a cached prefix (every agent turn) retried with windows only when
+  the continuation was longer than the window; a shorter one, or a window that declined too, went
+  token by token. It now halves and retries from where the landed passes stopped, as a prefill from
+  position 0 already did. 2x RTX 5060 Ti, `--ctx 131072` with the DSpark draft, an opencode-like
+  conversation (`multiturn_bench.py`): turns continuing 5.4k / 6.6k tokens after a 22k / 28k
+  cached prefix took 102 s / 126 s to the first token, now 2.0 s / 3.4 s.
 - **tp=2 with the DSpark draft: out-of-memory no longer takes the server down, and `--ctx 131072`
   now fits.** Measured on 2x RTX 5060 Ti, Qwen3.8-27B + DSpark:
   - The draft's quantized copies were built after every layer's bf16 weights were resident
@@ -173,6 +180,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Benchmarks
 
+- **`bench/scripts/multiturn_bench.py`**: replays opencode-like coding sessions (an ~11k-token
+  system prompt with a tool schema, then the model's answers alternating with 1-8k-token tool
+  results taken from this repository's sources) at 1/2/4 conversations, greedy and with default
+  sampling. Per turn: TTFT, prefilled and cached tokens, decode tok/s, and whether DSpark produced
+  the tokens. Chat completions now report that as `usage.speculative_tokens`.
 - `simple_bench.py --cohort FILE`: HyperQwen's cohort test (chat prompts from a JSONL, greedy,
   `--cohort-len` tokens, at each `--conc`), so the two engines are compared on the same prompts.
   `SPARKINFER_DSPARK_TIMING=1` now also reports the serving path's DSpark acceptance and step costs.

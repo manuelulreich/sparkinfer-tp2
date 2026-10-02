@@ -1635,6 +1635,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     out.generation_ms = result.generation_ms;
     out.decode_tps = result.decode_tps;
     out.cached_tokens = result.cached_tokens;
+    out.speculative_tokens = result.speculative_tokens;
     if (!result.error.empty()) {
         out.error = result.error;
         fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());

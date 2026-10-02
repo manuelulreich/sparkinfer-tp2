@@ -103,6 +103,7 @@ struct ContinuousBatchEngine::Job {
     // Prefix cache: tokens this job started from rather than prefilled, and the recurrent-state
     // snapshots taken at req.cache_checkpoints (offered to the cache in finish_job_impl).
     int cached_tokens = 0;
+    int spec_tokens = 0;   // tokens produced by a speculative run (the rest, if any, decoded ordinarily)
     struct Checkpoint {
         int pos = 0;
         Qwen35Model::RecurrentStateSnapshot state;
@@ -467,6 +468,7 @@ void ContinuousBatchEngine::spec_commit(Job& job, const Qwen35Model::SpecResume&
     if (!r.engaged) return;   // nothing ran: ordinary prefill picks the job up on the next iteration
     spec_runs_.fetch_add(1, std::memory_order_relaxed);
     spec_tokens_.fetch_add((uint64_t)job.decode_emitted, std::memory_order_relaxed);
+    job.spec_tokens = job.decode_emitted;
 
     job.prefill_pos = prompt_len;
     job.phase = SeqPhase::DECODE;
@@ -735,6 +737,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.generation_ms = it->second->generation_ms;
     out.decode_tps = it->second->decode_tps;
     out.cached_tokens = it->second->cached_tokens;
+    out.speculative_tokens = it->second->spec_tokens;
     jobs_.erase(it);
     return out;
 }
