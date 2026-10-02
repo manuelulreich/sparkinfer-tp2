@@ -2286,8 +2286,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const int* btable_win = s.kv->block_table_win(s.seq_id);
     const int  bs = s.kv->block_size();
     const int  mbs = s.kv->max_blocks_per_seq();
-    const bool kv8 = s.kv->int8_kv();
-    const int  kv_elem = kv8 ? 1 : 2;
+    const int kvf = s.kv->kv_dtype();   // KVDtype: 0 bf16, 1 int8, 2 fp8, 3 nvfp4
+    const bool kv8 = kvf != 0;   // quantized pool (scale pools present)
     const float rope_theta = c.rope_theta, eps = c.rms_eps;
     const int rope_dim = (c.rope_dim > 0) ? c.rope_dim : c.head_dim;
     // MRoPE positions for THIS window. s.mrope_pos is indexed by absolute prompt position, while
@@ -2953,8 +2953,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         st, pos0);
                 }
             } else {
-                signed char* kpool = (signed char*)s.kv->k_pool() + s.kv->layer_base_elems(L) * kv_elem;
-                signed char* vpool = (signed char*)s.kv->v_pool() + s.kv->layer_base_elems(L) * kv_elem;
+                signed char* kpool = (signed char*)s.kv->k_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(L));
+                signed char* vpool = (signed char*)s.kv->v_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(L));
                 void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
                 void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
                 // (S7a-3) rank-width views of the q/k/v buffers and the q/kv head counts for the
@@ -3026,10 +3026,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kernels::launch_prefill_qknorm_rope_kv_int8((tp_wide ? tp_qb : qb) + o * aw_qdim, (tp_wide ? tp_kf : kf) + o * aw_kvdim,
                             (tp_wide ? tp_vf : vf) + o * aw_kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
-                            bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
+                            bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w, kvf);
                         if (!kernels::launch_prefill_attn_int8_paged((tp_wide ? tp_qb : qb) + o * aw_qdim, kpool, vpool,
                                 kscale, vscale, bt, (tp_wide ? tp_att : att) + o * aw_qdim, len, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads,
-                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0)) {
+                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0, kvf)) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
                             fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
                                             "pos0=%d\n", c.head_dim, win_blocks, pos0);
@@ -5460,8 +5460,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // logical->physical map; == btable on a pool with no windowed slices (see kv_cache.h).
     const int* btable_win = s.kv->block_table_win(s.seq_id);
     const int bs = s.kv->block_size(), mbs = s.kv->max_blocks_per_seq();
-    const bool kv8 = s.kv->int8_kv();
-    const int kv_elem = kv8 ? 1 : 2;
+    const int kvf = s.kv->kv_dtype();   // KVDtype: 0 bf16, 1 int8, 2 fp8, 3 nvfp4
+    const bool kv8 = kvf != 0;   // quantized pool (scale pools present)
     // The flash-decode split/combine kernels are already batched over grid.y = num_seqs, and every
     // buffer this function hands them is laid out with exactly the per-row stride they expect. The
     // one thing that is not is the block table: they index block_table[seq * max_blocks + blk], and
@@ -5762,9 +5762,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (!supported) break;
             char* kp = static_cast<char*>(s.kv->k_pool()) +
-                       s.kv->layer_base_elems(L) * kv_elem;
+                       s.kv->kv_bytes(s.kv->layer_base_elems(L));
             char* vp = static_cast<char*>(s.kv->v_pool()) +
-                       s.kv->layer_base_elems(L) * kv_elem;
+                       s.kv->kv_bytes(s.kv->layer_base_elems(L));
             char* ks = kv8 ? static_cast<char*>(s.kv->k_scale_pool()) +
                              s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
@@ -6252,9 +6252,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (!supported || !w.q_has_gate) break;
             char* kp = static_cast<char*>(s.kv->k_pool()) +
-                       s.kv->layer_base_elems(L) * kv_elem;
+                       s.kv->kv_bytes(s.kv->layer_base_elems(L));
             char* vp = static_cast<char*>(s.kv->v_pool()) +
-                       s.kv->layer_base_elems(L) * kv_elem;
+                       s.kv->kv_bytes(s.kv->layer_base_elems(L));
             char* ks = kv8 ? static_cast<char*>(s.kv->k_scale_pool()) +
                              s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
@@ -6264,12 +6264,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     kernels::launch_qknorm_rope_kv_partial_int8_gated(
                         b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btab_rows, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
-                        c.rms_eps, bs, mbs, st);
+                        c.rms_eps, bs, mbs, st, kvf);
                 else
                     kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
                         b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
-                        c.rms_eps, bs, mbs, st);
+                        c.rms_eps, bs, mbs, st, kvf);
             } else {
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
                 if (packed)
@@ -6303,7 +6303,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // drifts from AR at long context (#712). start_pos + N is the largest row
                 // length in this batch, matching what AR would report at the last row.
                 1.f / sqrtf((float)c.head_dim), st, nullptr, packed ? packed_seq_hint : start_pos + N,
-                ks, vs, kv8 ? 1 : 0, int8_gate_fused ? qg : nullptr);
+                ks, vs, kvf, int8_gate_fused ? qg : nullptr);
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
             // dependency latency for the same work.

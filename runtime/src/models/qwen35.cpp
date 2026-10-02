@@ -2502,10 +2502,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 kernels::launch_gemm(s.xn, w.wv, s.v, 1, s.kvdim, H, 1.f, 0.f, gc, st);
             }
             // ---- QK-norm + RoPE + KV-append ----
-            const bool kv8 = s.kv->int8_kv();
-            const int kv_elem = kv8 ? 1 : 2;
-            void* kpool = (char*)s.kv->k_pool() + s.kv->layer_base_elems(L) * kv_elem;
-            void* vpool = (char*)s.kv->v_pool() + s.kv->layer_base_elems(L) * kv_elem;
+            const int kvf = s.kv->kv_dtype();   // KVDtype: 0 bf16, 1 int8, 2 fp8, 3 nvfp4
+            const bool kv8 = kvf != 0;   // quantized pool (scale pools present)
+            void* kpool = (char*)s.kv->k_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(L));
+            void* vpool = (char*)s.kv->v_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(L));
             void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             const bool partial_rope = (c.rope_dim > 0 && c.rope_dim < c.head_dim);
@@ -2533,12 +2533,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                             kernels::launch_qknorm_rope_kv_partial_int8_gated(s.qraw, s.q, s.qgate, s.k, s.v,
                                 w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, ltab, s.d_pos, 1,
                                 c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
-                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st, kvf);
                         } else {
                             kernels::launch_qknorm_rope_kv_partial_int8(s.q, s.k, s.v, w.q_norm, w.k_norm,
                                 kpool, vpool, kscale, vscale, ltab, s.d_pos, 1,
                                 c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta, c.rms_eps,
-                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                                s.kv->block_size(), s.kv->max_blocks_per_seq(), st, kvf);
                         }
                     } else {
                         if (s.use_qkfuse)
@@ -2550,7 +2550,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
                             ltab, s.d_pos, 1, c.n_q_heads, c.n_kv_heads,
                             c.head_dim, c.rope_dim, c.rope_theta,
-                            s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                            s.kv->block_size(), s.kv->max_blocks_per_seq(), st, kvf);
                     }
                 } else if (partial_rope && s.use_qkfuse) {
                     kernels::launch_qknorm_rope_kv_partial(s.q, s.k, s.v, w.q_norm, w.k_norm,
@@ -2687,7 +2687,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                    1.f / sqrtf((float)c.head_dim), st,
                                                    (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr,
                                                    s.sparse_budget * s.kv->block_size(),
-                                                   kscale, vscale, kv8 ? 1 : 0,
+                                                   kscale, vscale, kvf,
                                                    attn_gate_q8 ? s.qgate : nullptr);
             } else if (sparse_on) {
                 kernels::launch_fa_kv_window_select(s.d_seqlen, s.sparse_sel, c.n_kv_heads,
@@ -2705,7 +2705,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
                                                1.f / sqrtf((float)c.head_dim), st,
                                                (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, seqlen,
-                                               kscale, vscale, kv8 ? 1 : 0,
+                                               kscale, vscale, kvf,
                                                attn_gate_q8 ? s.qgate : nullptr,
                                                mg_gate_ok ? 1 : 0);
             }
@@ -4203,10 +4203,10 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                 kernels::launch_rmsnorm(s.vr_q, w.q_norm, s.vr_q, n * n_q, HD, c.rms_eps, st);
                 kernels::launch_rmsnorm(s.vr_k, w.k_norm, s.vr_k, n * n_kv, HD, c.rms_eps, st);
             }
-            const bool kv8 = s.kv->int8_kv();
-            const int kv_elem = kv8 ? 1 : 2;
-            void* kpool = (char*)s.kv->k_pool() + s.kv->layer_base_elems(L) * kv_elem;
-            void* vpool = (char*)s.kv->v_pool() + s.kv->layer_base_elems(L) * kv_elem;
+            const int kvf = s.kv->kv_dtype();   // KVDtype: 0 bf16, 1 int8, 2 fp8, 3 nvfp4
+            const bool kv8 = kvf != 0;   // quantized pool (scale pools present)
+            void* kpool = (char*)s.kv->k_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(L));
+            void* vpool = (char*)s.kv->v_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(L));
             void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             auto ltab_of = [&](int r) {
@@ -4219,7 +4219,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                     kernels::launch_rope_kv_append_partial_int8(s.vr_q, s.vr_k, s.vr_v, kpool, vpool,
                                                                 kscale, vscale, tab, s.vr_pos, n, n_q,
                                                                 n_kv, HD, c.rope_dim, c.rope_theta,
-                                                                s.kv->block_size(), mbs, st);
+                                                                s.kv->block_size(), mbs, st, kvf);
                 else
                     kernels::launch_rope_kv_append_partial(s.vr_q, s.vr_k, s.vr_v, (bf16*)kpool,
                                                            (bf16*)vpool, tab, s.vr_pos, n, n_q, n_kv,
@@ -4229,7 +4229,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                                    s.vr_ma_m, s.vr_ma_l, s.vr_ma_acc, n, n_q, n_kv,
                                                    HD, s.kv->block_size(), mbs, s.n_splits,
                                                    1.f / sqrtf((float)HD), st, nullptr, ma_maxlen,
-                                                   kscale, vscale, kv8 ? 1 : 0, nullptr, 0);
+                                                   kscale, vscale, kvf, nullptr, 0);
             } else {
             // Row by row, as the decode body appends: these kernels index the block table PER
             // TOKEN (block_table[tok * max_blocks + blk], the packed-sequence layout), so a
@@ -4242,7 +4242,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                     kernels::launch_rope_kv_append_partial_int8(qr, kr, vrw, kpool, vpool, kscale, vscale,
                                                                 ltab_of(r), s.vr_pos + r, 1, n_q, n_kv, HD,
                                                                 c.rope_dim, c.rope_theta, s.kv->block_size(),
-                                                                s.kv->max_blocks_per_seq(), st);
+                                                                s.kv->max_blocks_per_seq(), st, kvf);
                 else
                     kernels::launch_rope_kv_append_partial(qr, kr, vrw, (bf16*)kpool, (bf16*)vpool,
                                                            ltab_of(r), s.vr_pos + r, 1, n_q, n_kv, HD,
@@ -4256,7 +4256,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                                    s.kv->block_size(), s.kv->max_blocks_per_seq(),
                                                    s.n_splits, 1.f / sqrtf((float)HD), st,
                                                    nullptr, pos_of(r) + 1,
-                                                   kscale, vscale, kv8 ? 1 : 0, nullptr, 0);
+                                                   kscale, vscale, kvf, nullptr, 0);
             }
             if (w.q_has_gate)
                 kernels::launch_qwen36_mul_sigmoid(s.vr_attn, s.vr_g, n * qdim_l, st);
@@ -4678,10 +4678,10 @@ void Qwen35Model::tp_attn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
     // -- RoPE + KV-append into THIS rank's pool, which was built for exactly n_kv heads: pool
     // head j == model kv head kv_head_start + j, and this rank's local kv head j is that model
     // head, so the kernel's [(ctok*n_kv + j)*HD] indexing lands the token in this rank's rows.
-    const bool kv8 = s.kv->int8_kv();
-    const int kv_elem = kv8 ? 1 : 2;
-    void* kpool = (char*)s.kv->k_pool() + s.kv->layer_base_elems(l) * kv_elem;
-    void* vpool = (char*)s.kv->v_pool() + s.kv->layer_base_elems(l) * kv_elem;
+    const int kvf = s.kv->kv_dtype();   // KVDtype: 0 bf16, 1 int8, 2 fp8, 3 nvfp4
+    const bool kv8 = kvf != 0;   // quantized pool (scale pools present)
+    void* kpool = (char*)s.kv->k_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(l));
+    void* vpool = (char*)s.kv->v_pool() + s.kv->kv_bytes(s.kv->layer_base_elems(l));
     void* kscale = kv8 ? (char*)s.kv->k_scale_pool() + s.kv->scale_layer_base_elems(l) * 2 : nullptr;
     void* vscale = kv8 ? (char*)s.kv->v_scale_pool() + s.kv->scale_layer_base_elems(l) * 2 : nullptr;
     int* ltab = w.swa ? s.kv->block_table_win(s.active_seq_id) : s.kv->block_table(s.active_seq_id);
@@ -4689,7 +4689,7 @@ void Qwen35Model::tp_attn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
         kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
                                                     ltab, s.tp_pos, 1, n_q, n_kv,
                                                     HD, c.rope_dim, c.rope_theta,
-                                                    s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                                                    s.kv->block_size(), s.kv->max_blocks_per_seq(), st, kvf);
     else
         kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool,
                                                ltab, s.tp_pos, 1, n_q, n_kv,
@@ -4710,7 +4710,7 @@ void Qwen35Model::tp_attn_layer_tp(int l, uint16_t* x, const uint16_t* xn) {
                                        s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits,
                                        1.f / sqrtf((float)HD), st,
                                        (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr, seqlen,
-                                       kscale, vscale, kv8 ? 1 : 0,
+                                       kscale, vscale, kvf,
                                        attn_gate_q8 ? s.qgate : nullptr, 0);
     // Sigmoid gate over the rank's attn window (fused into the combine only for the gated-combine
     // shapes above, which 27B is not).

@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include "sparkinfer/kernels/kv_quant.cuh"
 #endif
 
 namespace sparkinfer {
@@ -450,7 +451,7 @@ __global__ void rope_kv_append_partial_int8_kernel(
     __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table, const int* __restrict__ positions,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
-    int block_size, int max_blocks_per_seq
+    int block_size, int max_blocks_per_seq, int kv_fmt
 ) {
     const int tok  = blockIdx.y;
     const int unit = blockIdx.x;          // [0,nq)=Q rope ; [nq,nq+nkv)=K ; [nq+nkv,nq+2nkv)=V
@@ -504,15 +505,9 @@ __global__ void rope_kv_append_partial_int8_kernel(
         s_red[0] = a;
     }
     __syncthreads();
-    const float d  = s_red[0] / 127.0f;
-    const int   qi = (s_red[0] == 0.f) ? 0 : (int)roundf(val / d);
-    if (is_k) {
-        k_pool[dst + t] = (signed char)qi;
-        if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    } else {
-        v_pool[dst + t] = (signed char)qi;
-        if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    }
+    // int8 / fp8 / nvfp4 store (kv_quant.cuh); kv_fmt 1 is the original int8 arithmetic.
+    kvq_store(kv_fmt, is_k ? (void*)k_pool : (void*)v_pool, is_k ? k_scale : v_scale, dst,
+              ctok * n_kv_heads + hh, head_dim, t, val, s_red[0]);
 }
 
 // int8-KV decode append for Muse Glimmer. Muse's per-layer pattern is NORMAL (consecutive-pair)
@@ -603,7 +598,7 @@ __global__ void qknorm_rope_kv_partial_int8_kernel(
     __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table, const int* __restrict__ positions,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
-    int block_size, int max_blocks_per_seq, float eps
+    int block_size, int max_blocks_per_seq, float eps, int kv_fmt
 ) {
     const int tok  = blockIdx.y;
     const int unit = blockIdx.x;
@@ -700,15 +695,9 @@ __global__ void qknorm_rope_kv_partial_int8_kernel(
         s_red[0] = a;
     }
     __syncthreads();
-    const float d  = s_red[0] / 127.0f;
-    const int   qi = (s_red[0] == 0.f) ? 0 : (int)roundf(val / d);
-    if (is_k) {
-        k_pool[dst + t] = (signed char)qi;
-        if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    } else {
-        v_pool[dst + t] = (signed char)qi;
-        if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    }
+    // int8 / fp8 / nvfp4 store (kv_quant.cuh); kv_fmt 1 is the original int8 arithmetic.
+    kvq_store(kv_fmt, is_k ? (void*)k_pool : (void*)v_pool, is_k ? k_scale : v_scale, dst,
+              ctok * n_kv_heads + hh, head_dim, t, val, s_red[0]);
 }
 
 // Gated Qwen3.6 full-attn: read Q from qraw (2*head_dim interleaved), extract gate,
@@ -723,7 +712,7 @@ __global__ void qknorm_rope_kv_partial_int8_gated_kernel(
     __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table, const int* __restrict__ positions,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta,
-    int block_size, int max_blocks_per_seq, float eps
+    int block_size, int max_blocks_per_seq, float eps, int kv_fmt
 ) {
     const int tok  = blockIdx.y;
     const int unit = blockIdx.x;
@@ -820,15 +809,9 @@ __global__ void qknorm_rope_kv_partial_int8_gated_kernel(
         s_red[0] = a;
     }
     __syncthreads();
-    const float d  = s_red[0] / 127.0f;
-    const int   qi = (s_red[0] == 0.f) ? 0 : (int)roundf(val / d);
-    if (is_k) {
-        k_pool[dst + t] = (signed char)qi;
-        if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    } else {
-        v_pool[dst + t] = (signed char)qi;
-        if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    }
+    // int8 / fp8 / nvfp4 store (kv_quant.cuh); kv_fmt 1 is the original int8 arithmetic.
+    kvq_store(kv_fmt, is_k ? (void*)k_pool : (void*)v_pool, is_k ? k_scale : v_scale, dst,
+              ctok * n_kv_heads + hh, head_dim, t, val, s_red[0]);
 }
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
@@ -960,7 +943,7 @@ void launch_rope_kv_append_partial_int8(void* q, const void* k, const void* v,
                                         const int* block_table, const int* positions,
                                         int n_tokens, int n_q_heads, int n_kv_heads,
                                         int head_dim, int rotary_dim, float theta,
-                                        int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+                                        int block_size, int max_blocks_per_seq, cudaStream_t stream, int kv_fmt) {
     // one block per (token, head-unit); blockDim == head_dim so a full K/V head vector reduces in-block.
     dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
     rope_kv_append_partial_int8_kernel<<<grid, head_dim, 0, stream>>>(
@@ -969,7 +952,7 @@ void launch_rope_kv_append_partial_int8(void* q, const void* k, const void* v,
         reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
-        block_size, max_blocks_per_seq);
+        block_size, max_blocks_per_seq, kv_fmt);
 }
 
 void launch_muse_kv_append_int8(void* q, const void* k, const void* v,
@@ -994,7 +977,7 @@ void launch_qknorm_rope_kv_partial_int8(void* q, void* k, const void* v, const v
                                         const int* block_table, const int* positions,
                                         int n_tokens, int n_q_heads, int n_kv_heads,
                                         int head_dim, int rotary_dim, float theta, float eps,
-                                        int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+                                        int block_size, int max_blocks_per_seq, cudaStream_t stream, int kv_fmt) {
     dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
     const int smem = head_dim * (int)sizeof(float);
     qknorm_rope_kv_partial_int8_kernel<<<grid, head_dim, smem, stream>>>(
@@ -1004,7 +987,7 @@ void launch_qknorm_rope_kv_partial_int8(void* q, void* k, const void* v, const v
         reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
-        block_size, max_blocks_per_seq, eps);
+        block_size, max_blocks_per_seq, eps, kv_fmt);
 }
 
 void launch_qknorm_rope_kv_partial_int8_gated(
@@ -1012,7 +995,7 @@ void launch_qknorm_rope_kv_partial_int8_gated(
     void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, const int* positions,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
-    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream, int kv_fmt) {
     dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
     const int smem = head_dim * (int)sizeof(float);
     qknorm_rope_kv_partial_int8_gated_kernel<false><<<grid, head_dim, smem, stream>>>(
@@ -1023,7 +1006,7 @@ void launch_qknorm_rope_kv_partial_int8_gated(
         reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
-        block_size, max_blocks_per_seq, eps);
+        block_size, max_blocks_per_seq, eps, kv_fmt);
 }
 
 void launch_dflash_qknorm_rope_kv_partial_int8_gated(
@@ -1031,7 +1014,7 @@ void launch_dflash_qknorm_rope_kv_partial_int8_gated(
     void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, const int* positions,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
-    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream, int kv_fmt) {
     dim3 grid(n_q_heads + 2 * n_kv_heads, n_tokens);
     const int smem = head_dim * (int)sizeof(float);
     qknorm_rope_kv_partial_int8_gated_kernel<true><<<grid, head_dim, smem, stream>>>(
@@ -1042,7 +1025,7 @@ void launch_dflash_qknorm_rope_kv_partial_int8_gated(
         reinterpret_cast<signed char*>(k_pool), reinterpret_cast<signed char*>(v_pool),
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, positions, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta,
-        block_size, max_blocks_per_seq, eps);
+        block_size, max_blocks_per_seq, eps, kv_fmt);
 }
 
 void launch_rope(void* q, void* k, const int* positions,

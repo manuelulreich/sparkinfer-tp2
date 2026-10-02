@@ -431,6 +431,36 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
       kvc.int8_kv = e ? (e[0] != '0')
                       : (impl_->cfg.muse_glimmer ? false
                          : impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
+    // SPARKINFER_KV_DTYPE=bf16|int8|fp8|nvfp4 picks the KV element format explicitly and wins over
+    // SPARKINFER_KV_INT8 (which keeps working: unset KV_DTYPE = the int8/bf16 choice above). fp8
+    // (e4m3, per-head fp16 scale; int8's layout) and nvfp4 (e2m1 + e4m3 per-16 block scales) are
+    // wired through the Qwen3.5/3.6/3.8 hybrid attention paths only (decode, tp=2 rows, batched
+    // prefill); anything else falls back to the default with a warning.
+    kvc.kv_dtype = kvc.int8_kv ? sparkinfer::KV_INT8 : sparkinfer::KV_BF16;
+    if (const char* e = getenv("SPARKINFER_KV_DTYPE"); e && e[0]) {
+        const std::string v(e);
+        int want = -1;
+        if (v == "bf16") want = sparkinfer::KV_BF16;
+        else if (v == "int8") want = sparkinfer::KV_INT8;
+        else if (v == "fp8" || v == "e4m3") want = sparkinfer::KV_FP8;
+        else if (v == "nvfp4" || v == "fp4") want = sparkinfer::KV_NVFP4;
+        else fprintf(stderr, "[sparkinfer-server] SPARKINFER_KV_DTYPE=%s not understood "
+                             "(bf16|int8|fp8|nvfp4) -- keeping %s\n", e,
+                     sparkinfer::kv_dtype_name(kvc.kv_dtype));
+        const bool fp_ok = impl_->cfg.hybrid && !impl_->cfg.muse_glimmer &&
+                           impl_->cfg.head_dim % 16 == 0;
+        if ((want == sparkinfer::KV_FP8 || want == sparkinfer::KV_NVFP4) && !fp_ok) {
+            fprintf(stderr, "[sparkinfer-server] SPARKINFER_KV_DTYPE=%s is only wired for the "
+                            "Qwen3.5/3.6/3.8 hybrid models -- keeping %s\n", e,
+                    sparkinfer::kv_dtype_name(kvc.kv_dtype));
+            want = -1;
+        }
+        if (want >= 0) kvc.kv_dtype = want;
+    }
+    kvc.int8_kv = kvc.kv_dtype == sparkinfer::KV_INT8;
+    if (kvc.kv_dtype >= sparkinfer::KV_FP8 && lmcache_enabled())
+        fprintf(stderr, "[sparkinfer-server] warning: lmcache staging does not know the %s KV "
+                        "layout\n", sparkinfer::kv_dtype_name(kvc.kv_dtype));
     // Only the full-attention layers get a pool slot. The Gated-DeltaNet layers of a hybrid model
     // carry a recurrent state and never read paged KV, so a slot for them is pure waste -- on
     // Qwen3.8-27B that is 16 slots of 64, i.e. the pool was 4x larger than the model can use.
@@ -467,9 +497,10 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     // Reports the slot count actually used, and the resident bytes rather than the bf16 budget --
     // the old line multiplied by n_layers (all 64) and by 2 regardless of int8, so it overstated
     // a hybrid int8 pool by 8x and was the number anyone sizing a deployment would have read.
-    fprintf(stderr, "[sparkinfer-server] kv_cache: int8=%d slots=%d/%d blocks=%zu resident=%.1f GiB\n",
-            kvc.int8_kv ? 1 : 0, kvL, impl_->cfg.n_layers, blocks,
-            (double)kvL * 2.0 * epb * (kvc.int8_kv ? 1.0 : 2.0) * blocks
+    fprintf(stderr, "[sparkinfer-server] kv_cache: dtype=%s int8=%d slots=%d/%d blocks=%zu resident=%.2f GiB\n",
+            sparkinfer::kv_dtype_name(kvc.kv_dtype), kvc.int8_kv ? 1 : 0, kvL, impl_->cfg.n_layers,
+            blocks,
+            (double)kvL * 2.0 * (double)sparkinfer::kv_dtype_bytes(kvc.kv_dtype, epb) * blocks
                 / (1024.0 * 1024.0 * 1024.0));
     if (plan.tp > 1)
         fprintf(stderr,

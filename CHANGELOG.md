@@ -5,7 +5,39 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Added
+
+- **FP8 (e4m3) and NVFP4 KV cache for the Qwen3.5/3.6/3.8 hybrids:
+  `SPARKINFER_KV_DTYPE=bf16|int8|fp8|nvfp4`.** fp8 uses the int8 cache's layout (one byte per
+  element plus one fp16 scale per token and KV head, here amax/448). nvfp4 stores each head
+  vector as e2m1 nibbles plus one e4m3 scale per 16 elements, with the fp16 per-head scale as the
+  second level: 9/16 byte per element, 0.28 GiB instead of int8's 0.50 GiB for a 32k pool. Decode
+  at long context runs a new f16 tensor-core flash-decode kernel that widens the codes in
+  registers (Q and P stay f16, so the KV format is the only quantization); prefill dequantizes the
+  attended history into a bf16 plane and runs the bf16 tensor-core prefill attention.
+  Qwen3.8-27B, tp=2 on 2x RTX 5060 Ti (decode 128 / 16k ctx, prefill 3k / 16k tokens, tok/s;
+  KL = top-5 continuation KL against bf16 KV in deterministic mode at 1k / 4k / 16k):
+
+  | KV    | decode 128 | decode 16k | prefill 3k | prefill 16k | KL vs bf16            |
+  |-------|-----------:|-----------:|-----------:|------------:|-----------------------|
+  | bf16  | 54.0       | 48.3       | 3440       | 3053        | 0                     |
+  | int8  | 54.1       | 51.4       | 3492       | 3371        | 0.012 / 0.018 / 0.014 |
+  | fp8   | 54.1       | 52.1       | 3438       | 3052        | 0.014 / 0.016 / 0.012 |
+  | nvfp4 | 54.0       | 50.8       | 3435       | 3052        | 0.018 / 0.025 / 0.018 |
+
+  int8 stays the default (its int8 tensor-core prefill attention is still the fastest);
+  `SPARKINFER_KV_INT8` keeps working when `SPARKINFER_KV_DTYPE` is unset. The pool's token
+  capacity is unchanged (it stays bf16-denominated); fp8/nvfp4 only allocate less.
+  `SPARKINFER_FAMMA_F8=0` keeps fp8/nvfp4 decode on the dequant-to-shared-memory tile kernel
+  (16k decode 48.5 / 46.0 tok/s).
+
 ### Fixed
+
+- **tp=2 bf16-KV prefill attention fell back to the scalar kernel on one card.** The bf16
+  tensor-core prefill attention raised its shared-memory limit once per process instead of once
+  per device, so the second card's launch failed and the pass took the tiled fallback at half
+  the prefill rate (3072 tokens: 1560 instead of 3440 tok/s), depending on thread timing. A
+  refused wide tier also left its error pending, which made the next tier decline as well.
 
 - **`usage.decode_tps` included the prefill.** The chat and text completion responses (streamed
   and not) divided the output tokens by `generation_ms`, which runs from submission, so a long

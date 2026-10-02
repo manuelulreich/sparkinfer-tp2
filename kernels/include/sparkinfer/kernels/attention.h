@@ -78,7 +78,8 @@ void launch_qknorm_rope_kv_partial_int8(
     void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, const int* positions,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
-    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr,
+    int kv_fmt = 1);
 
 // Gated Qwen3.6: fused split_q_gate + QK-norm + partial-RoPE + int8 KV-append.
 void launch_qknorm_rope_kv_partial_int8_gated(
@@ -86,7 +87,8 @@ void launch_qknorm_rope_kv_partial_int8_gated(
     void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, const int* positions,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
-    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+    float theta, float eps, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr,
+    int kv_fmt = 1);
 
 // Exact DFlash continuation variant: all candidate positions share one sequence block-table row.
 void launch_dflash_qknorm_rope_kv_partial_int8_gated(
@@ -95,7 +97,7 @@ void launch_dflash_qknorm_rope_kv_partial_int8_gated(
     const int* block_table, const int* positions,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
     float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr, int kv_fmt = 1);
 
 // Variant for models with partial rotary embeddings (e.g. Qwen3.6: 64 of 256
 // dimensions rotate, the remaining per-head dimensions are copied unchanged).
@@ -115,11 +117,14 @@ void launch_muse_kv_append_int8(void* q, const void* k, const void* v,
                                 float theta, bool rope_normal,
                                 int block_size, int max_blocks_per_seq, cudaStream_t stream);
 
+// kv_fmt (all the *_int8 KV writers): 1 = int8 (the default, unchanged), 2 = fp8 e4m3, 3 = nvfp4 --
+// the KVDtype of kv_cache.h; see kv_quant.cuh for the layouts.
 void launch_rope_kv_append_partial_int8(
     void* q, const void* k, const void* v, void* k_pool, void* v_pool, void* k_scale, void* v_scale,
     const int* block_table, const int* positions,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim,
-    float theta, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+    float theta, int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr,
+    int kv_fmt = 1);
 
 // Flash prefill: full causal attention for prompt processing.
 // q/k/v:  [batch, seqlen, num_heads, head_dim]

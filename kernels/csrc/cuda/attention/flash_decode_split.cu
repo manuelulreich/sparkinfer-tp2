@@ -19,6 +19,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <climits>
+#include <type_traits>
+#include "sparkinfer/kernels/kv_quant.cuh"
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #include <cuda_pipeline.h>
@@ -78,13 +80,13 @@ __global__ void fa_split_kernel(
         float p = 0.f;
         #pragma unroll
         for (int e = 0; e < ELEMS; e++)
-            p += qr[e] * (int8_kv ? (float)ki[base + lane + e * 32] * ks : fa_to_f(kb[base + lane + e * 32]));
+            p += qr[e] * (int8_kv ? kvq_load1(int8_kv, ki, base + lane + e * 32, HEAD_DIM, ks) : fa_to_f(kb[base + lane + e * 32]));
         const float score = fa_wsum(p) * scale;
         const float mn = fmaxf(m, score), corr = __expf(m - mn), pe = __expf(score - mn);
         l = l * corr + pe;
         #pragma unroll
         for (int e = 0; e < ELEMS; e++)
-            acc[e] = acc[e] * corr + pe * (int8_kv ? (float)vi[base + lane + e * 32] * vs : fa_to_f(vb[base + lane + e * 32]));
+            acc[e] = acc[e] * corr + pe * (int8_kv ? kvq_load1(int8_kv, vi, base + lane + e * 32, HEAD_DIM, vs) : fa_to_f(vb[base + lane + e * 32]));
         m = mn;
     }
 
@@ -451,7 +453,9 @@ __global__ void fa_split_gqa_pipeg_kernel(
 
 // QKH hoists the SEQ per-row QK dots ahead of their warp reductions -- see the compute loop
 // below. Only meaningful for SEQ > 1, and bit-identical to the shipped order.
-template <int HEAD_DIM, int GQA, int TILE, bool INT8, int SEQ = 1, bool QKH = false>
+// INT8 is the KV format code (kv_quant.cuh): 0 bf16, 1 int8, 2 fp8 e4m3, 3 nvfp4. The quantized
+// formats all dequantize into the same bf16 smem tile, so the dot loop is format-blind.
+template <int HEAD_DIM, int GQA, int TILE, int INT8, int SEQ = 1, bool QKH = false>
 __global__ void fa_split_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pool,
     const void* __restrict__ v_pool, const int* __restrict__ block_table,
@@ -533,6 +537,20 @@ __global__ void fa_split_gqa_kernel(
                 const size_t base = s_rowbase[within] + d;
                 *reinterpret_cast<uint4*>(s_k + i) = __ldg(reinterpret_cast<const uint4*>(kb + base));
                 *reinterpret_cast<uint4*>(s_v + i) = __ldg(reinterpret_cast<const uint4*>(vb + base));
+            }
+        } else if constexpr (INT8 != 1) {
+            // fp8 / nvfp4: 8 elements per thread through kv_quant.cuh, same bf16 smem tile.
+            for (int i = threadIdx.x * 8; i < valid * HEAD_DIM; i += blockDim.x * 8) {
+                const int within = i / HEAD_DIM, d = i % HEAD_DIM;
+                const size_t base = s_rowbase[within] + d;
+                float kf8[8], vf8[8];
+                kvq_load8<INT8>(k_pool, base, HEAD_DIM, s_ksc[within], kf8);
+                kvq_load8<INT8>(v_pool, base, HEAD_DIM, s_vsc[within], vf8);
+                #pragma unroll
+                for (int j = 0; j < 8; j += 2) {
+                    *reinterpret_cast<__nv_bfloat162*>(s_k + i + j) = __floats2bfloat162_rn(kf8[j], kf8[j + 1]);
+                    *reinterpret_cast<__nv_bfloat162*>(s_v + i + j) = __floats2bfloat162_rn(vf8[j], vf8[j + 1]);
+                }
             }
         } else {
             // int8: load 8 int8 (int2) + per-token scale, dequant to bf16 into smem (dot loop unchanged).
@@ -862,6 +880,38 @@ template __global__ void fa_split_gqa_kernel<256, 4, FA_GQA4_TILE, true>(const _
     const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
 #endif
 #ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<256, 4, FA_GQA4_TILE, 2>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, 2>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE, 2>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<128, 16, FA_GQA_TILE, 2>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<256, 4, FA_GQA4_TILE, 3>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<256, 8, FA_GQA_TILE, 3>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<128, 8, FA_GQA_TILE, 3>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
+template __global__ void fa_split_gqa_kernel<128, 16, FA_GQA_TILE, 3>(const __nv_bfloat16*, const void*, const void*,
+    const int*, const int*, float*, float*, float*, float, int, int, int, int, int, const __half*, const __half*);
+#endif
+#ifndef _MSC_VER
 template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, FA_COMBINE_NW>(const float*, const float*, const float*, __nv_bfloat16*, int, int, fa_block_q8_1*);
 #endif
 #ifndef _MSC_VER
@@ -1157,6 +1207,254 @@ template __global__ void fa_split_gqa_mma_i8_kernel<256, 6>(const __nv_bfloat16*
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
 #endif
+
+// ============================================================================
+// fp8 / nvfp4 KV tensor-core flash-decode split (hd256, GQA <= 16). The int8 kernel above runs
+// QK and PV on the int8 tensor cores with Q and P' quantized to int8; e4m3 and e2m1 codes are not
+// int8, so this twin instead widens the KV codes to f16 in registers (cvt.f16x2.e4m3x2, and a
+// byte-permute table for e2m1) and runs mma.sync.m16n8k16 f16 -> f32. Q and P' stay f16 (P' is
+// normalized per row to [0,1] like the int8 kernel's P'/pd), so the only quantization left is the
+// KV format itself. Same grid, partials and combine as the int8 kernel: one block per
+// (seq, kv_head, split), 8 warps, groups of 8 physical 16-token blocks.
+//
+// Operand layouts. The dims of QK and the tokens of PV are reduction axes, so each k-step may use
+// any permutation of them as long as A and B agree; picking "thread c owns physical elements
+// [4c, 4c+4) of a 16-wide k-step" turns every fragment into contiguous loads:
+//   QK  B = K^T: 8 contiguous bytes of one token row per thread cover two k-steps.
+//   PV  B = V:   the warp owns 32 output dims; n-tile j column g is dim 4g+j, so a thread reads
+//                dims [4g, 4g+4) of its 4 tokens (4 x LDG.32) and transposes the 4x4 bytes.
+// ============================================================================
+__device__ __forceinline__ void fa_mma_f16(float c[4], const unsigned a[4], const unsigned b[2]) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+// Two e4m3 codes (low byte = low half) -> f16x2.
+__device__ __forceinline__ unsigned fa_e4m3x2_h2(unsigned v16) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(v16 & 0xffffu), __NV_E4M3);
+    return (unsigned)h.x | ((unsigned)h.y << 16);
+}
+// Four e2m1 nibbles (low nibble first) -> four e4m3 bytes of the same value (exact).
+__device__ __forceinline__ unsigned fa_e2m1x4_e4m3x4(unsigned nib16) {
+    // magnitude table, e4m3 of 0 .5 1 1.5 | 2 3 4 6
+    const unsigned mag = __byte_perm(0x3C383000u, 0x4C484440u, nib16 & 0x7777u);
+    const unsigned s = nib16 & 0x8888u;
+    const unsigned sign = ((s & 0x8u) << 4) | ((s & 0x80u) << 8) | ((s & 0x800u) << 12) | ((s & 0x8000u) << 16);
+    return mag | sign;
+}
+__device__ __forceinline__ unsigned fa_h2_mul(unsigned a, __half2 b) {
+    __half2 x = *reinterpret_cast<__half2*>(&a);
+    x = __hmul2(x, b);
+    return *reinterpret_cast<unsigned*>(&x);
+}
+
+template <int HEAD_DIM, int GQA, int FMT>
+__global__ void __launch_bounds__(256, 2) fa_split_gqa_mma_f8_kernel(
+    const __nv_bfloat16* __restrict__ q, const unsigned char* __restrict__ k_pool,
+    const unsigned char* __restrict__ v_pool, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int max_blocks, int n_splits,
+    const __half* __restrict__ k_scale, const __half* __restrict__ v_scale
+) {
+    static_assert(HEAD_DIM == 256, "8 warps x 32 output dims");
+    static_assert(GQA <= 16, "M tile is 16 q rows");
+    const int seq = blockIdx.y, split = blockIdx.x % n_splits, kvh = blockIdx.x / n_splits;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const int g = lane >> 2, c = lane & 3;
+    const int sl = seq_lens[seq];
+    const int chunk = (sl + n_splits - 1) / n_splits;
+    const int start = split * chunk, end = min(sl, start + chunk);
+    // Byte offsets of a (token, kv_head) row go through kvq_bytes (nvfp4 = 9/16 byte/element).
+    const int SLD = num_kv_heads;
+
+    __shared__ __align__(16) __half s_q[16][HEAD_DIM];   // Q rows (pad rows zero)
+    __shared__ __align__(16) __half s_p[16][128];        // P'/pd for the group, f16 in [0,1]
+    __shared__ float s_s[16][128 + 4];                   // scores
+    __shared__ float s_ks[128], s_vs[128];
+    __shared__ float s_m[16], s_l[16], s_corr[16], s_pd[16];
+
+    for (int i = tid; i < 16 * HEAD_DIM; i += blockDim.x) {
+        const int r = i / HEAD_DIM, d = i % HEAD_DIM;
+        s_q[r][d] = __float2half(r < GQA ? __bfloat162float(q[(size_t)(seq * num_q_heads + kvh * GQA + r) * HEAD_DIM + d]) : 0.f);
+    }
+    if (tid < 16) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
+    float o[4][4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f; }
+    __syncthreads();
+
+    const int first_blk = start / 16;
+    const int nblk = (end > start) ? ((end - 1) / 16 - first_blk + 1) : 0;
+    for (int g0 = 0; g0 < nblk; g0 += 8) {
+        const int gblk = min(8, nblk - g0);
+        const int gbase = (first_blk + g0) * 16;
+        for (int j = tid; j < gblk * 16; j += blockDim.x) {
+            const int pb = block_table[seq * max_blocks + first_blk + g0 + j / 16];
+            const size_t si = (size_t)(pb * 16 + (j & 15)) * SLD + kvh;
+            s_ks[j] = __half2float(k_scale[si]);
+            s_vs[j] = __half2float(v_scale[si]);
+        }
+        // ---- QK: warp w scores physical block w of the group (16 tokens = 2 n-tiles) ----
+        if (warp < gblk) {
+            const int pb = block_table[seq * max_blocks + first_blk + g0 + warp];
+            float acc[2][4];
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) { acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f; }
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                const size_t row = ((size_t)(pb * 16 + nt * 8 + g)) * num_kv_heads + kvh;   // token row
+                const unsigned char* kr = k_pool + kvq_bytes(FMT, row * HEAD_DIM);
+                #pragma unroll 4
+                for (int kb = 0; kb < HEAD_DIM; kb += 32) {
+                    unsigned bA[2], bB[2];
+                    if constexpr (FMT == KVQ_FP8) {
+                        const uint2 w = __ldg(reinterpret_cast<const uint2*>(kr + kb + c * 8));
+                        bA[0] = fa_e4m3x2_h2(w.x); bA[1] = fa_e4m3x2_h2(w.x >> 16);
+                        bB[0] = fa_e4m3x2_h2(w.y); bB[1] = fa_e4m3x2_h2(w.y >> 16);
+                    } else {
+                        const unsigned w = __ldg(reinterpret_cast<const unsigned*>(kr + ((kb + c * 8) >> 1)));
+                        const float bsf = kvq_e4m3f(__ldg(kr + HEAD_DIM / 2 + ((kb + c * 8) >> 4)));
+                        const __half2 bs = __float2half2_rn(bsf);
+                        const unsigned e0 = fa_e2m1x4_e4m3x4(w & 0xffffu), e1 = fa_e2m1x4_e4m3x4(w >> 16);
+                        bA[0] = fa_h2_mul(fa_e4m3x2_h2(e0), bs); bA[1] = fa_h2_mul(fa_e4m3x2_h2(e0 >> 16), bs);
+                        bB[0] = fa_h2_mul(fa_e4m3x2_h2(e1), bs); bB[1] = fa_h2_mul(fa_e4m3x2_h2(e1 >> 16), bs);
+                    }
+                    const uint4 qa = *reinterpret_cast<const uint4*>(&s_q[g][kb + c * 8]);
+                    const uint4 qb = *reinterpret_cast<const uint4*>(&s_q[g + 8][kb + c * 8]);
+                    const unsigned aA[4] = {qa.x, qb.x, qa.y, qb.y};
+                    const unsigned aB[4] = {qa.z, qb.z, qa.w, qb.w};
+                    fa_mma_f16(acc[nt], aA, bA);
+                    fa_mma_f16(acc[nt], aB, bB);
+                }
+            }
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                const int col = warp * 16 + nt * 8 + 2 * c;
+                s_s[g][col] = acc[nt][0];     s_s[g][col + 1] = acc[nt][1];
+                s_s[g + 8][col] = acc[nt][2]; s_s[g + 8][col + 1] = acc[nt][3];
+            }
+        }
+        __syncthreads();
+        // ---- online softmax over the group; P' = p * v_scale, normalized per row ----
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++) {
+            const int r = warp * 2 + rr;
+            float sc[4], mx = -1e30f;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int t = lane + u * 32, gtok = gbase + t;
+                sc[u] = (t < gblk * 16 && gtok >= start && gtok < end) ? s_s[r][t] * s_ks[t] * scale : -1e30f;
+                mx = fmaxf(mx, sc[u]);
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+            const float m_old = s_m[r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
+            float pv[4], sum = 0.f, pamax = 0.f;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                pv[u] = 0.f;
+                if (sc[u] > -1e29f) {
+                    const float p = __expf(sc[u] - m_new);
+                    sum += p; pv[u] = p * s_vs[lane + u * 32]; pamax = fmaxf(pamax, fabsf(pv[u]));
+                }
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                sum += __shfl_xor_sync(0xffffffff, sum, off);
+                pamax = fmaxf(pamax, __shfl_xor_sync(0xffffffff, pamax, off));
+            }
+            const float inv = pamax > 0.f ? 1.f / pamax : 0.f;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) s_p[r][lane + u * 32] = __float2half(pv[u] * inv);
+            if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_corr[r] = corr; s_pd[r] = pamax; }
+        }
+        __syncthreads();
+        // ---- PV: warp owns dims [32w, 32w+32); n-tile j column g = dim 32w + 4g + j ----
+        {
+            float acc[4][4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f; }
+            const int dim0 = warp * 32 + 4 * g;
+            for (int kb = 0; kb < gblk; kb++) {
+                const int pb = block_table[seq * max_blocks + first_blk + g0 + kb];
+                unsigned W[4];
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const int tk = c * 4 + r;                  // token within the block
+                    const int gtok = gbase + kb * 16 + tk;
+                    const size_t row = ((size_t)(pb * 16 + tk)) * num_kv_heads + kvh;
+                    unsigned w = 0;
+                    if (gtok >= start && gtok < end) {
+                        if constexpr (FMT == KVQ_FP8) {
+                            w = __ldg(reinterpret_cast<const unsigned*>(v_pool + row * HEAD_DIM + dim0));
+                        } else {
+                            const unsigned char* vr = v_pool + kvq_bytes(FMT, row * HEAD_DIM);
+                            const unsigned nib = __ldg(reinterpret_cast<const unsigned short*>(vr + (dim0 >> 1)));
+                            w = fa_e2m1x4_e4m3x4(nib);
+                        }
+                    }
+                    W[r] = w;
+                }
+                const unsigned lo01 = __byte_perm(W[0], W[1], 0x5140), hi01 = __byte_perm(W[0], W[1], 0x7362);
+                const unsigned lo23 = __byte_perm(W[2], W[3], 0x5140), hi23 = __byte_perm(W[2], W[3], 0x7362);
+                unsigned b[4][2];
+                b[0][0] = fa_e4m3x2_h2(lo01); b[1][0] = fa_e4m3x2_h2(lo01 >> 16);
+                b[2][0] = fa_e4m3x2_h2(hi01); b[3][0] = fa_e4m3x2_h2(hi01 >> 16);
+                b[0][1] = fa_e4m3x2_h2(lo23); b[1][1] = fa_e4m3x2_h2(lo23 >> 16);
+                b[2][1] = fa_e4m3x2_h2(hi23); b[3][1] = fa_e4m3x2_h2(hi23 >> 16);
+                if constexpr (FMT == KVQ_NVFP4) {
+                    // per-token block scale of dims [dim0, dim0+4) (one 16-block)
+                    float bs[4];
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        const int gtok = gbase + kb * 16 + c * 4 + r;
+                        const size_t row = ((size_t)(pb * 16 + c * 4 + r)) * num_kv_heads + kvh;
+                        // never touch an unwritten row's scale: 0 * NaN would poison the mma
+                        bs[r] = (gtok >= start && gtok < end)
+                              ? kvq_e4m3f(__ldg(v_pool + kvq_bytes(FMT, row * HEAD_DIM) + HEAD_DIM / 2 + (dim0 >> 4)))
+                              : 0.f;
+                    }
+                    const __half2 s01 = __floats2half2_rn(bs[0], bs[1]), s23 = __floats2half2_rn(bs[2], bs[3]);
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) { b[j][0] = fa_h2_mul(b[j][0], s01); b[j][1] = fa_h2_mul(b[j][1], s23); }
+                }
+                const uint2 pa = *reinterpret_cast<const uint2*>(&s_p[g][kb * 16 + c * 4]);
+                const uint2 pc = *reinterpret_cast<const uint2*>(&s_p[g + 8][kb * 16 + c * 4]);
+                const unsigned a[4] = {pa.x, pc.x, pa.y, pc.y};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) fa_mma_f16(acc[j], a, b[j]);
+            }
+            const float cg = s_corr[g], cg8 = s_corr[g + 8], pg = s_pd[g], pg8 = s_pd[g + 8];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                o[j][0] = o[j][0] * cg  + acc[j][0] * pg;
+                o[j][1] = o[j][1] * cg  + acc[j][1] * pg;
+                o[j][2] = o[j][2] * cg8 + acc[j][2] * pg8;
+                o[j][3] = o[j][3] * cg8 + acc[j][3] * pg8;
+            }
+        }
+    }
+
+    // ---- partials: thread holds rows g, g+8 at dims 32w + 4*(2c) + j and 32w + 4*(2c+1) + j ----
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int r = g + half * 8;
+        if (r < GQA) {
+            const int idx = (seq * num_q_heads + kvh * GQA + r) * n_splits + split;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                part_acc[(size_t)idx * HEAD_DIM + warp * 32 + 4 * (2 * c) + j]     = o[j][half * 2];
+                part_acc[(size_t)idx * HEAD_DIM + warp * 32 + 4 * (2 * c + 1) + j] = o[j][half * 2 + 1];
+            }
+        }
+    }
+    if (tid < GQA) {
+        const int idx = (seq * num_q_heads + kvh * GQA + tid) * n_splits + split;
+        part_m[idx] = s_m[tid]; part_l[idx] = s_l[tid];
+    }
+}
 template <int NW>
 static inline void fa_launch_combine(
     const float* part_m, const float* part_l, const float* part_acc,
@@ -1290,6 +1588,29 @@ void launch_flash_decode_split(
         if (famma256 < 0) { const char* e = getenv("SPARKINFER_FAMMA"); famma256 = (e && e[0] == '0') ? 0 : 1; }
         const int mma_chunk256 = (n_splits > 0) ? (seqlen + n_splits - 1) / n_splits : 0;
         const bool mma_ok256 = famma256 && seqlen > 512 && block_size == 16 && mma_chunk256 >= 32;
+        // fp8 / nvfp4 KV: the f16 tensor-core twin of the int8 mma kernel, same engagement rule.
+        // SPARKINFER_FAMMA_F8=0 keeps those formats on the dequant-to-smem tile kernel.
+        static int famma_f8 = -1;
+        if (famma_f8 < 0) { const char* e = getenv("SPARKINFER_FAMMA_F8"); famma_f8 = (e && e[0] == '0') ? 0 : 1; }
+        auto try_f8_mma = [&](auto gqa_tag) -> bool {
+            constexpr int G = decltype(gqa_tag)::value;
+            if (!(mma_ok256 && famma_f8 && (int8_kv == 2 || int8_kv == 3))) return false;
+            dim3 gq(num_kv_heads * n_splits, num_seqs);
+            if (int8_kv == 2)
+                fa_split_gqa_mma_f8_kernel<256, G, 2><<<gq, 256, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const unsigned char*>(k_pool),
+                    reinterpret_cast<const unsigned char*>(v_pool), block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+            else
+                fa_split_gqa_mma_f8_kernel<256, G, 3><<<gq, 256, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const unsigned char*>(k_pool),
+                    reinterpret_cast<const unsigned char*>(v_pool), block_table, seq_lens,
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, max_blocks, n_splits,
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+            combine_hd256(out_q8);
+            return true;
+        };
         static int fagqa4 = -1;
         if (fagqa4 < 0) { const char* e = getenv("SPARKINFER_FAGQA4"); fagqa4 = (e && e[0] == '0') ? 0 : 1; }
         if (fagqa4 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 4) {
@@ -1297,12 +1618,13 @@ void launch_flash_decode_split(
             constexpr int GQA = 4, TILE = FA_GQA4_TILE;
             constexpr int MMA_THREADS = fa_mma_block_threads<256, GQA>::v;
             dim3 gq(num_kv_heads * n_splits, num_seqs);
+            if (try_f8_mma(std::integral_constant<int, GQA>{})) return;
             static int famma4 = -1;
             if (famma4 < 0) {
                 const char* e = getenv("SPARKINFER_FAMMA4");
                 famma4 = (e && e[0] == '0') ? 0 : 1;
             }
-            if (mma_ok256 && int8_kv && famma4) {
+            if (mma_ok256 && int8_kv == 1 && famma4) {
                 const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
                                      + (size_t)(16 + GQA) * 256 * sizeof(float)
                                      + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
@@ -1313,11 +1635,14 @@ void launch_flash_decode_split(
                     reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
             } else {
                 const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
-                if (int8_kv)
-                    fa_split_gqa_kernel<256, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                        reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+#define SI_FA4_T(F) fa_split_gqa_kernel<256, GQA, TILE, F><<<gq, GQA * 32, smem, stream>>>(                \
+                        reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,          \
+                        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, \
+                        reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale))
+                if (int8_kv == 2)      SI_FA4_T(2);
+                else if (int8_kv == 3) SI_FA4_T(3);
+                else if (int8_kv)      SI_FA4_T(true);
+#undef SI_FA4_T
                 else
                     fa_split_gqa_kernel<256, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
@@ -1341,6 +1666,7 @@ void launch_flash_decode_split(
         if (fagqa6 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 6) {
             constexpr int GQA = 6, TILE = FA_GQA6_TILE;
             dim3 gq(num_kv_heads * n_splits, num_seqs);
+            if (try_f8_mma(std::integral_constant<int, GQA>{})) return;
             // int8 tensor-core arm, same as the 4:1 and 8:1 groups already take: Q and P go to
             // int8 so QK and PV run on the int8 tensor cores, and the KV global read halves
             // again. M is the group's 6 q-heads padded to the 16-row mma; blockDim stays 256
@@ -1348,7 +1674,7 @@ void launch_flash_decode_split(
             // which is independent of GQA. SPARKINFER_FAMMA6=0 keeps the bf16 tile kernel.
             static int famma6 = -1;
             if (famma6 < 0) { const char* e = getenv("SPARKINFER_FAMMA6"); famma6 = (e && e[0] == '0') ? 0 : 1; }
-            if (mma_ok256 && int8_kv && famma6) {
+            if (mma_ok256 && int8_kv == 1 && famma6) {
                 constexpr int MMA_THREADS = fa_mma_block_threads<256, GQA>::v;
                 const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
                                      + (size_t)(16 + GQA) * 256 * sizeof(float)
@@ -1581,7 +1907,13 @@ void launch_flash_decode_split(
                     return;
                 }
             }
-            if (int8_kv) {
+            if (int8_kv == 2) {          // fp8 KV: same tile, e4m3 dequant into smem
+                if (fa6_deep) SI_FA6_LAUNCH(TILE_DEEP, 2);
+                else          SI_FA6_LAUNCH(TILE, 2);
+            } else if (int8_kv == 3) {   // nvfp4 KV
+                if (fa6_deep) SI_FA6_LAUNCH(TILE_DEEP, 3);
+                else          SI_FA6_LAUNCH(TILE, 3);
+            } else if (int8_kv) {
                 if (fa6_deep) SI_FA6_LAUNCH(TILE_DEEP, true);
                 else          SI_FA6_LAUNCH(TILE, true);
             } else {
@@ -1596,7 +1928,8 @@ void launch_flash_decode_split(
         if (num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
             constexpr int GQA = 8, TILE = FA_GQA_TILE;
             dim3 gq(num_kv_heads * n_splits, num_seqs);
-            if (mma_ok256 && int8_kv) {   // int8 tensor-core hd256 — halves the KV read for the 10 full-attn layers
+            if (try_f8_mma(std::integral_constant<int, GQA>{})) return;
+            if (mma_ok256 && int8_kv == 1) {   // int8 tensor-core hd256 — halves the KV read for the 10 full-attn layers
                 const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
                                      + (size_t)(16 + GQA) * 256 * sizeof(float)     // s_s[16][256] + s_o[GQA][256]
                                      + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
@@ -1653,11 +1986,14 @@ void launch_flash_decode_split(
             // whole run, so when int8_kv is on the tile kernel MUST dequant int8->bf16 in smem (the
             // <256,...,true> instantiation) — reading the int8 pool as bf16 would be garbage.
             const size_t smem = (size_t)2 * TILE * 256 * sizeof(__nv_bfloat16);
-            if (int8_kv)
-                fa_split_gqa_kernel<256, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+#define SI_FA8_T(F) fa_split_gqa_kernel<256, GQA, TILE, F><<<gq, GQA * 32, smem, stream>>>(                \
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,          \
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, \
+                    reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale))
+            if (int8_kv == 2)      SI_FA8_T(2);
+            else if (int8_kv == 3) SI_FA8_T(3);
+            else if (int8_kv)      SI_FA8_T(true);
+#undef SI_FA8_T
             else
                 fa_split_gqa_kernel<256, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
@@ -1715,7 +2051,7 @@ void launch_flash_decode_split(
         constexpr int GQA = 16, TILE = FA_GQA_TILE;
         constexpr int MMA_THREADS = fa_mma_block_threads<128, GQA>::v;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
-        if (mma_aligned && int8_kv && fagqa16_mma) {
+        if (mma_aligned && int8_kv == 1 && fagqa16_mma) {
             // Same tensor-core split the 8:1 group takes, on 8 warps (see fa_mma_block_threads
             // <128,16>). The tile kernel above already reads each KV byte once per group; what this
             // adds is the QK/PV dot on the int8 tensor cores instead of per-lane FMA plus the
@@ -1730,11 +2066,14 @@ void launch_flash_decode_split(
                 ksc, vsc);
         } else {
             const size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
-            if (int8_kv)
-                fa_split_gqa_kernel<128, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    ksc, vsc);
+#define SI_FA128_T(F) fa_split_gqa_kernel<128, GQA, TILE, F><<<gq, GQA * 32, smem, stream>>>(              \
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,          \
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, \
+                    ksc, vsc)
+            if (int8_kv == 2)      SI_FA128_T(2);
+            else if (int8_kv == 3) SI_FA128_T(3);
+            else if (int8_kv)      SI_FA128_T(true);
+#undef SI_FA128_T
             else
                 fa_split_gqa_kernel<128, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
@@ -1756,7 +2095,7 @@ void launch_flash_decode_split(
     if (use_gqa && num_kv_heads > 0 && num_q_heads == num_kv_heads * 8) {
         constexpr int GQA = 8, TILE = FA_GQA_TILE;
         dim3 gq(num_kv_heads * n_splits, num_seqs);
-        if (mma_aligned && int8_kv) {   // int8 tensor-core (halved KV read) — the long-context win
+        if (mma_aligned && int8_kv == 1) {   // int8 tensor-core (halved KV read) — the long-context win
             const size_t i8_smem = (size_t)2 * 16 * 128 * sizeof(signed char)
                                  + (size_t)(16 + GQA) * 128 * sizeof(float)   // s_s[16][HD] + s_o[GQA][HD]
                                  + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
@@ -1770,11 +2109,14 @@ void launch_flash_decode_split(
             // guard contexts (128/512/4k, int8 off) match main exactly; the int8 instantiation serves the
             // forced-int8 short/unaligned path (accuracy gate) and never touches the bf16 codegen.
             const size_t smem = (size_t)2 * TILE * 128 * sizeof(__nv_bfloat16);
-            if (int8_kv)
-                fa_split_gqa_kernel<128, GQA, TILE, true><<<gq, GQA * 32, smem, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
-                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
-                    ksc, vsc);
+#define SI_FA128_T(F) fa_split_gqa_kernel<128, GQA, TILE, F><<<gq, GQA * 32, smem, stream>>>(              \
+                    reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,          \
+                    part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits, \
+                    ksc, vsc)
+            if (int8_kv == 2)      SI_FA128_T(2);
+            else if (int8_kv == 3) SI_FA128_T(3);
+            else if (int8_kv)      SI_FA128_T(true);
+#undef SI_FA128_T
             else
                 fa_split_gqa_kernel<128, GQA, TILE, false><<<gq, GQA * 32, smem, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool, block_table, seq_lens,
