@@ -931,6 +931,24 @@ struct Qwen35Model::Impl {
     int* h_vr = nullptr;            // pinned [4][R]: ids | positions | seqlens | argmax
     float* vr_snap_lin = nullptr;
     bf16* vr_snap_conv = nullptr;
+    // (dual-GPU C1b) FP4 tensor-core staging for the multi-session rows path: one activation
+    // operand (data + block scales) for the widest K, and one CUTLASS workspace for every shape.
+    int vr_tc_state = 0;            // 0 = untried, 1 = ready, -1 = declined (agreed across ranks)
+    void *vr_tc_a = nullptr, *vr_tc_as = nullptr, *vr_tc_ws = nullptr;
+    // (dual-GPU C1c) Multi-session GDN in one launch per layer: per-row state / conv pointer
+    // arrays (device + pinned staging) and full-width q|k|v, alpha/beta and output rows.
+    bool vr_mb_ready = false;
+    void** vr_mb_ptrs = nullptr;    // device [2R]: R conv-state pointers, then R state pointers
+    void** h_vr_mb_ptrs = nullptr;  // pinned twin
+    bf16 *vr_mb_q = nullptr, *vr_mb_k = nullptr, *vr_mb_v = nullptr, *vr_mb_a = nullptr,
+         *vr_mb_b = nullptr, *vr_mb_o = nullptr;
+    // ...and the attention layers' KV append + flash decode in one launch each (TC mode): packed
+    // per-row block tables (full and ring) and flash-decode partials for R rows.
+    int vr_ma_state = 0;            // 0 untried, 1 ready, -1 declined (agreed)
+    const int** vr_ma_tptr = nullptr;      // device [2R]: full-table pointers, then ring-table
+    const int** h_vr_ma_tptr = nullptr;    // pinned twin
+    int *vr_ma_tab = nullptr, *vr_ma_tab_win = nullptr;   // [R][max_blocks]
+    float *vr_ma_m = nullptr, *vr_ma_l = nullptr, *vr_ma_acc = nullptr;
 
     template <class T> T* alloc(size_t n) { void* p=nullptr; cu(cudaMalloc(&p, n*sizeof(T)), "malloc"); return (T*)p; }
 };
@@ -3580,7 +3598,7 @@ void Qwen35Model::tp_allreduce_logits() {
     });
 }
 
-constexpr int kTpVerifyRows = 16;
+constexpr int kTpVerifyRows = 32;   // = kQwen35MaxPackedRows: one rows pass per packed step
 
 // (dual-GPU WP-12) verify_rows_tp's scratch, all-or-nothing and agreed across the ranks. Called
 // lazily by the first verify, or up front by reserve_tp_verify() so the draft's load accounts for it.
@@ -3780,6 +3798,46 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
 
     if (!s.vr_ready && !tp_verify_alloc()) return -1;
 
+    // (dual-GPU C1b) Multi-session rows on the FP4 tensor cores. The dp4a rows kernels re-read
+    // the weights for every 8 rows, while the block-scaled GEMM reads them once for up to ~32
+    // rows at the weight-read floor (measured on one 5060 Ti: gate|up 111 us at M = 8, 16 and 32;
+    // dp4a needs 123 us per 8). Activations are FP4 (W4A4, as the prefill), so a packed row is no
+    // longer bit-identical to the same row decoded alone; deterministic mode keeps the dp4a rows.
+    // Rows pad to a multiple of 8 (the GEMM's row rule); every scratch buffer holds R rows and
+    // rows are independent, so the padding rows compute garbage nobody reads.
+    // SPARKINFER_TP_DECODE_TC=0 disables; _MINROWS (default 8) is the smallest batch that uses it.
+    static const bool tc_env = [] {
+        const char* e = getenv("SPARKINFER_TP_DECODE_TC"); return !(e && e[0] == '0');
+    }();
+    static const int tc_min = [] {
+        const char* e = getenv("SPARKINFER_TP_DECODE_TC_MINROWS"); return e ? atoi(e) : 8;
+    }();
+    const int mp = (n + 7) & ~7;
+    bool tc = multi && tc_env && n >= tc_min && mp <= R && !deterministic_mode() &&
+              s.vr_tc_state >= 0;
+    if (tc && s.vr_tc_state == 0) {
+        const int kmax_tc = std::max(std::max(H, fl), std::max(qdim_l, Kw));
+        size_t ws = kernels::prefill_nvfp4_workspace_bytes_f32(R, Vr, H);
+        const int shapes[][2] = {{wq, H}, {Kw, H}, {H, Kw}, {2 * qdim_l, H}, {kvdim_l, H},
+                                 {H, qdim_l}, {fl, H}, {H, fl}};
+        for (auto& sh : shapes)
+            ws = std::max(ws, kernels::prefill_nvfp4_workspace_bytes(R, sh[0], sh[1]));
+        bool ok = cudaMalloc(&s.vr_tc_a, kernels::prefill_nvfp4_data_bytes(R, kmax_tc)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_tc_as, kernels::prefill_nvfp4_scale_bytes_a(R, kmax_tc)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_tc_ws, ws ? ws : 16) == cudaSuccess;
+        ok = tp_prefill_agree_min(ok ? 1 : 0) != 0;
+        s.vr_tc_state = ok ? 1 : -1;
+        if (!ok) tc = false;
+    }
+    // The block-scaled form of a projection, when this pass runs it (else false: dp4a rows).
+    auto proj_tc = [&](const void* fp4, const void* sf, float alpha, const bf16* in, int K,
+                       void* out, int N) {
+        return tc && fp4 && sf &&
+               kernels::launch_prefill_nvfp4_quant_a(in, s.vr_tc_a, s.vr_tc_as, mp, K, st) &&
+               kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, fp4, sf, out, mp, N, K,
+                                                  s.vr_tc_ws, st, alpha);
+    };
+
     // Entry: ids / positions / seq_lens, the GDN snapshot, and the embedding (vocab-window gather
     // + all-reduce == the decode entry's owner-row exchange).
     auto pos_of = [&](int r) { return multi ? row_pos[r] : start_pos + r; };
@@ -3874,28 +3932,135 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                       lhd, c.gdn_qh_block, st, /*state_b16=*/false);
     };
 
+    // (dual-GPU C1c) Multi-session rows advance independent sequences, so the GDN conv and
+    // recurrence run as ONE batched launch per layer (each row on its own session's state through
+    // a pointer array) instead of n launches each -- the per-row launches were the step's floor
+    // once the projections went to the tensor cores (~7,400 launches at 32 rows). Same kernels
+    // the tp=1 packed decode uses; their batch==1 arithmetic is the single-row kernels'.
+    // SPARKINFER_TP_ROWS_GDN_BATCHED=0 keeps the per-row launches (A/B).
+    static const bool mb_env = [] {
+        const char* e = getenv("SPARKINFER_TP_ROWS_GDN_BATCHED"); return !(e && e[0] == '0');
+    }();
+    bool mb = multi && mb_env && n > 1 && c.linear_head_dim == 128;
+    const int lvdim_full = c.linear_v_heads * lhd;
+    if (mb && !s.vr_mb_ready) {
+        bool ok = cudaMalloc(&s.vr_mb_ptrs, (size_t)2 * R * sizeof(void*)) == cudaSuccess &&
+                  cudaHostAlloc(&s.h_vr_mb_ptrs, (size_t)2 * R * sizeof(void*),
+                                cudaHostAllocDefault) == cudaSuccess &&
+                  cudaMalloc(&s.vr_mb_q, (size_t)R * lqdim * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_mb_k, (size_t)R * lqdim * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_mb_v, (size_t)R * lvdim_full * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_mb_a, (size_t)R * c.linear_v_heads * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_mb_b, (size_t)R * c.linear_v_heads * sizeof(bf16)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_mb_o, (size_t)R * lvdim_full * sizeof(bf16)) == cudaSuccess;
+        // The other rank's windows of the packed qkv rows are never written by scatter_qkv; the
+        // batched conv skips them (windowed), but keep the bytes defined anyway.
+        if (ok) ok = cudaMemsetAsync(s.vr_full, 0, (size_t)R * lqkv * sizeof(bf16), st) == cudaSuccess;
+        ok = tp_prefill_agree_min(ok ? 1 : 0) != 0;
+        s.vr_mb_ready = ok;
+    }
+    if (mb && !s.vr_mb_ready) mb = false;
+    if (mb) {
+        for (int r = 0; r < n; r++) {
+            s.h_vr_mb_ptrs[r] = row_conv[r];
+            s.h_vr_mb_ptrs[R + r] = row_lin[r];
+        }
+        cu(cudaMemcpyAsync(s.vr_mb_ptrs, s.h_vr_mb_ptrs, (size_t)2 * R * sizeof(void*),
+                           cudaMemcpyHostToDevice, st), "tp rows gdn ptrs");
+    }
+
+    // Attention for all rows at once (TC mode only: the flash-decode split layout follows the
+    // batch's longest row, so a row's partial sums are not the single-row call's).
+    // SPARKINFER_TP_ROWS_ATTN_BATCHED=0 keeps the per-row launches.
+    static const bool ma_env = [] {
+        const char* e = getenv("SPARKINFER_TP_ROWS_ATTN_BATCHED"); return !(e && e[0] == '0');
+    }();
+    bool ma = tc && mb && ma_env;
+    const int mbs = s.kv->max_blocks_per_seq();
+    if (ma && s.vr_ma_state == 0) {
+        const size_t fa = (size_t)R * n_q * Impl::MAX_NSPLITS;
+        bool ok = cudaMalloc(&s.vr_ma_tptr, (size_t)2 * R * sizeof(int*)) == cudaSuccess &&
+                  cudaHostAlloc(&s.h_vr_ma_tptr, (size_t)2 * R * sizeof(int*),
+                                cudaHostAllocDefault) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ma_tab, (size_t)R * mbs * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ma_tab_win, (size_t)R * mbs * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ma_m, fa * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ma_l, fa * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ma_acc, fa * HD * sizeof(float)) == cudaSuccess;
+        ok = tp_prefill_agree_min(ok ? 1 : 0) != 0;
+        s.vr_ma_state = ok ? 1 : -1;
+    }
+    if (ma && s.vr_ma_state != 1) ma = false;
+    int ma_maxlen = 0;
+    if (ma) {
+        for (int r = 0; r < n; r++) {
+            s.h_vr_ma_tptr[r] = s.kv->block_table(row_kv[r]);
+            s.h_vr_ma_tptr[R + r] = s.kv->block_table_win(row_kv[r]);
+            ma_maxlen = std::max(ma_maxlen, pos_of(r) + 1);
+        }
+        cu(cudaMemcpyAsync(s.vr_ma_tptr, s.h_vr_ma_tptr, (size_t)2 * R * sizeof(int*),
+                           cudaMemcpyHostToDevice, st), "tp rows attn tables");
+        dflash_kernels::launch_gather_rows_i32(s.vr_ma_tptr, s.vr_ma_tab, mbs, n, st);
+        dflash_kernels::launch_gather_rows_i32(s.vr_ma_tptr + R, s.vr_ma_tab_win, mbs, n, st);
+    }
+
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (is_linear_layer(c, L)) {
             bf16* rec = s.vr_rec_qkv + (size_t)L * R * wq;
-            proj_rows(w.wqkv, w.wqkv_type, s.vr_xn, H, rec, wq);
-            proj_rows(w.wqkv_gate, w.wqkv_gate_type, s.vr_xn, H, s.vr_z, Kw);
-            proj_rows(w.ssm_alpha, w.ssm_alpha_type, s.vr_xn, H, s.vr_rec_a + (size_t)L * R * vloc, vloc);
-            proj_rows(w.ssm_beta, w.ssm_beta_type, s.vr_xn, H, s.vr_rec_b + (size_t)L * R * vloc, vloc);
+            if (!proj_tc(w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf, w.gdn_qkv_fp4_alpha, s.vr_xn, H, rec, wq))
+                proj_rows(w.wqkv, w.wqkv_type, s.vr_xn, H, rec, wq);
+            if (!proj_tc(w.gdn_z_fp4, w.gdn_z_fp4_sf, w.gdn_z_fp4_alpha, s.vr_xn, H, s.vr_z, Kw))
+                proj_rows(w.wqkv_gate, w.wqkv_gate_type, s.vr_xn, H, s.vr_z, Kw);
+            bf16* rec_a = s.vr_rec_a + (size_t)L * R * vloc;
+            bf16* rec_b = s.vr_rec_b + (size_t)L * R * vloc;
+            if (tc && w.ssm_alpha_type == 0 && w.ssm_beta_type == 0) {
+                // One launch for both small bf16 projections over all rows (TC mode only: the
+                // rows kernel is not the single-row GEMV's reduction order).
+                dflash_kernels::launch_gemv_rows_exact_fused2(s.vr_xn, w.ssm_alpha, w.ssm_beta,
+                                                              rec_a, rec_b, n, vloc, vloc, H, st);
+            } else {
+                proj_rows(w.ssm_alpha, w.ssm_alpha_type, s.vr_xn, H, rec_a, vloc);
+                proj_rows(w.ssm_beta, w.ssm_beta_type, s.vr_xn, H, rec_b, vloc);
+            }
             scatter_qkv(rec, n);
-            for (int r = 0; r < n; r++) gdn_step(L, r, s.vr_gdn + (size_t)r * Kw);
+            if (mb) {
+                const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+                kernels::launch_qwen36_conv_split_l2norm_fused_batched(
+                    s.vr_full, w.ssm_conv, s.vr_mb_ptrs, conv_off, s.vr_mb_q, s.vr_mb_k, s.vr_mb_v,
+                    n, c.linear_q_heads, c.linear_v_heads, lhd, c.linear_conv_kernel, c.rms_eps, st,
+                    q0, ql, q0, ql, v0, vloc);
+                kernels::launch_gather_rows(s.vr_mb_a + v0, c.linear_v_heads, rec_a, vloc, vloc, n, st);
+                kernels::launch_gather_rows(s.vr_mb_b + v0, c.linear_v_heads, rec_b, vloc, vloc, n, st);
+                const size_t state_off = (size_t)gdn_state_slot(c, L) * vloc * lhd * lhd;
+                if (!kernels::launch_qwen36_gdn_ar_batched(
+                        s.vr_mb_q, s.vr_mb_k, s.vr_mb_v, s.vr_mb_a, s.vr_mb_b, w.ssm_dt, w.ssm_a,
+                        reinterpret_cast<float* const*>(s.vr_mb_ptrs + R), state_off, s.vr_mb_o,
+                        n, c.linear_q_heads, c.linear_v_heads, lhd, c.gdn_qh_block, st,
+                        /*state_compact_b16=*/false, v0, vloc)) {
+                    cu(cudaErrorInvalidValue, "tp rows gdn batched");   // head_dim checked above
+                }
+                kernels::launch_gather_rows(s.vr_gdn, Kw, s.vr_mb_o + (size_t)v0 * lhd, lvdim_full,
+                                            Kw, n, st);
+            } else {
+                for (int r = 0; r < n; r++) gdn_step(L, r, s.vr_gdn + (size_t)r * Kw);
+            }
             kernels::launch_qwen36_gated_norm(s.vr_gdn, s.vr_z, w.ssm_norm, s.vr_ln, n * vloc, lhd,
                                               c.rms_eps, st);
-            proj_rows(w.ssm_out, w.ssm_out_type, s.vr_ln, Kw, s.vr_ar, H);
+            if (!proj_tc(w.gdn_out_fp4, w.gdn_out_fp4_sf, w.gdn_out_fp4_alpha, s.vr_ln, Kw, s.vr_ar, H))
+                proj_rows(w.ssm_out, w.ssm_out_type, s.vr_ln, Kw, s.vr_ar, H);
         } else {
             if (w.q_has_gate) {
-                proj_rows(w.wq, w.wq_type, s.vr_xn, H, s.vr_qraw, 2 * qdim_l);
+                if (!proj_tc(w.wq_fp4, w.wq_fp4_sf, w.wq_fp4_alpha, s.vr_xn, H, s.vr_qraw, 2 * qdim_l))
+                    proj_rows(w.wq, w.wq_type, s.vr_xn, H, s.vr_qraw, 2 * qdim_l);
                 kernels::launch_qwen36_split_q_gate(s.vr_qraw, s.vr_q, s.vr_g, n * n_q, HD, st);
             } else {
                 proj_rows(w.wq, w.wq_type, s.vr_xn, H, s.vr_q, qdim_l);
             }
-            proj_rows(w.wk, w.wk_type, s.vr_xn, H, s.vr_k, kvdim_l);
-            proj_rows(w.wv, w.wv_type, s.vr_xn, H, s.vr_v, kvdim_l);
+            if (!proj_tc(w.wk_fp4, w.wk_fp4_sf, w.wk_fp4_alpha, s.vr_xn, H, s.vr_k, kvdim_l))
+                proj_rows(w.wk, w.wk_type, s.vr_xn, H, s.vr_k, kvdim_l);
+            if (!proj_tc(w.wv_fp4, w.wv_fp4_sf, w.wv_fp4_alpha, s.vr_xn, H, s.vr_v, kvdim_l))
+                proj_rows(w.wv, w.wv_type, s.vr_xn, H, s.vr_v, kvdim_l);
             if (s.use_qkfuse)
                 kernels::launch_rmsnorm_qk(s.vr_q, s.vr_k, w.q_norm, w.k_norm, n * n_q, n * n_kv, HD,
                                            c.rms_eps, st);
@@ -3912,6 +4077,25 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
             auto ltab_of = [&](int r) {
                 return w.swa ? s.kv->block_table_win(row_kv[r]) : s.kv->block_table(row_kv[r]);
             };
+            if (ma) {
+                // One call per kernel for all rows: they index the packed per-row tables.
+                int* tab = w.swa ? s.vr_ma_tab_win : s.vr_ma_tab;
+                if (kv8)
+                    kernels::launch_rope_kv_append_partial_int8(s.vr_q, s.vr_k, s.vr_v, kpool, vpool,
+                                                                kscale, vscale, tab, s.vr_pos, n, n_q,
+                                                                n_kv, HD, c.rope_dim, c.rope_theta,
+                                                                s.kv->block_size(), mbs, st);
+                else
+                    kernels::launch_rope_kv_append_partial(s.vr_q, s.vr_k, s.vr_v, (bf16*)kpool,
+                                                           (bf16*)vpool, tab, s.vr_pos, n, n_q, n_kv,
+                                                           HD, c.rope_dim, c.rope_theta,
+                                                           s.kv->block_size(), mbs, st);
+                kernels::launch_flash_decode_split(s.vr_q, kpool, vpool, tab, s.vr_seq, s.vr_attn,
+                                                   s.vr_ma_m, s.vr_ma_l, s.vr_ma_acc, n, n_q, n_kv,
+                                                   HD, s.kv->block_size(), mbs, s.n_splits,
+                                                   1.f / sqrtf((float)HD), st, nullptr, ma_maxlen,
+                                                   kscale, vscale, kv8 ? 1 : 0, nullptr, 0);
+            } else {
             // Row by row, as the decode body appends: these kernels index the block table PER
             // TOKEN (block_table[tok * max_blocks + blk], the packed-sequence layout), so a
             // multi-token call on one sequence's table would put rows 1.. in other tables' blocks.
@@ -3938,9 +4122,11 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                                    s.n_splits, 1.f / sqrtf((float)HD), st,
                                                    nullptr, pos_of(r) + 1,
                                                    kscale, vscale, kv8 ? 1 : 0, nullptr, 0);
+            }
             if (w.q_has_gate)
                 kernels::launch_qwen36_mul_sigmoid(s.vr_attn, s.vr_g, n * qdim_l, st);
-            proj_rows(w.wo, w.wo_type, s.vr_attn, qdim_l, s.vr_ar, H);
+            if (!proj_tc(w.wo_fp4, w.wo_fp4_sf, w.wo_fp4_alpha, s.vr_attn, qdim_l, s.vr_ar, H))
+                proj_rows(w.wo, w.wo_type, s.vr_attn, qdim_l, s.vr_ar, H);
         }
         // AR-A + tail1, as forward_token_tp.
         tp_prefill_allreduce_bf16(s.vr_ar, (size_t)n * H);
@@ -3950,7 +4136,18 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         bf16* fg = s.vr_ffn;
         bf16* fu = s.vr_ffn + (size_t)R * fl;
         bf16* fh = s.vr_ffn + (size_t)2 * R * fl;
-        if (kernels::qwen38_nvfp4_dp4a()) {
+        const bool ffn_tc = tc && w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf &&
+            w.down_fp4 && w.down_fp4_sf &&
+            kernels::launch_prefill_nvfp4_quant_a(s.vr_hn, s.vr_tc_a, s.vr_tc_as, mp, H, st) &&
+            kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, w.gate_fp4, w.gate_fp4_sf,
+                                               fg, mp, fl, H, s.vr_tc_ws, st, w.gate_fp4_alpha) &&
+            kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, w.up_fp4, w.up_fp4_sf,
+                                               fu, mp, fl, H, s.vr_tc_ws, st, w.up_fp4_alpha) &&
+            kernels::launch_prefill_nvfp4_swiglu_quant_a(fg, fu, s.vr_tc_a, s.vr_tc_as, mp, fl, st) &&
+            kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, w.down_fp4, w.down_fp4_sf,
+                                               s.vr_ar, mp, H, fl, s.vr_tc_ws, st, w.down_fp4_alpha);
+        if (ffn_tc) {
+        } else if (kernels::qwen38_nvfp4_dp4a()) {
             kernels::launch_gemv_nvfp4_quant_x(s.vr_hn, s.vr_nq, s.vr_ns, n, H, st);
             if (!kernels::launch_gemv_nvfp4_rows_dp4a2(s.vr_nq, s.vr_ns, w.gate_nv, w.up_nv,
                                                         fg, fu, n, fl, H, st)) {
@@ -3991,7 +4188,16 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     // and argmax, row-batched.
     const bool head_q4k = s.use_pq && s.use_llama && s.w.lm_head_type == 12;
     bool head_done = false;
-    if (head_q4k) {
+    if (tc) {
+        // Both ranks must take the same head form: the FP4 head copy is free-VRAM dependent.
+        const bool head_tc = tp_prefill_agree_min(s.w.lm_head_fp4 && s.w.lm_head_fp4_sf ? 1 : 0) != 0;
+        head_done = head_tc &&
+            kernels::launch_prefill_nvfp4_quant_a(s.vr_xn, s.vr_tc_a, s.vr_tc_as, mp, H, st) &&
+            kernels::launch_prefill_nvfp4_gemm_f32(s.vr_tc_a, s.vr_tc_as, s.w.lm_head_fp4,
+                                                   s.w.lm_head_fp4_sf, s.vr_lh, mp, Vr, H,
+                                                   s.vr_tc_ws, st, s.w.lm_head_fp4_alpha);
+    }
+    if (!head_done && head_q4k) {
         kernels::launch_quantize_q8_1_rows(s.vr_xn, s.vr_q81, H, n, H, st);
         head_done = kernels::launch_mmvq_rows_f32(12, s.vr_q81, s.w.lm_head, s.vr_lh, n, Vr, H, st);
     }

@@ -1128,6 +1128,18 @@ int main(int argc, char** argv) {
     }
 
     httplib::Server svr;
+    // Request worker threads. httplib's default pool is max(8, cores - 1), and every in-flight
+    // request (streamed or not) holds one for its whole generation -- so on a 4-core host at most
+    // 8 requests ever reached the batch engine, and packed decode could never run wider than 8
+    // rows however many clients were waiting (measured on a 4-core 2x5060 Ti box: aggregate
+    // pinned at 8 x the per-request rate). The threads mostly sleep on the engine, so 64 is cheap.
+    // SPARKINFER_HTTP_THREADS overrides.
+    {
+        const char* e = getenv("SPARKINFER_HTTP_THREADS");
+        const unsigned hw = std::thread::hardware_concurrency();
+        const size_t n = e && atoi(e) > 0 ? (size_t)atoi(e) : std::max<size_t>(64, hw);
+        svr.new_task_queue = [n] { return new httplib::ThreadPool(n); };
+    }
 
     // Reports the DEVICE, not just the process. A lost CUDA context leaves the HTTP thread
     // perfectly able to answer -- which is exactly the failure that hid a dead server behind a

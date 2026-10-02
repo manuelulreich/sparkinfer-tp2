@@ -395,7 +395,9 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
     const void* qkv_bf16, const void* conv_w_bf16,
     void* const* conv_states_bf16, size_t conv_off, void* q_bf16, void* k_bf16,
     void* v_bf16, int batch, int q_heads, int v_heads, int head_dim,
-    int conv_kernel, float eps, cudaStream_t stream = nullptr);
+    int conv_kernel, float eps, cudaStream_t stream = nullptr,
+    // tp>1 rank window, as in launch_qwen36_conv_split_l2norm_fused (all 0 = full width).
+    int q0 = 0, int ql = 0, int k0 = 0, int kl = 0, int v0 = 0, int vl = 0);
 
 // `state_f32` is the sequence's whole GDN state allocation and `state_off` is the layer's slot
 // within it, counted in state elements -- the same split launch_qwen36_gdn_ar_batched takes, and

@@ -22,6 +22,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   normalized buffer, which then still held an earlier layer's value.
 - **tp=2 DSpark verify shared one GDN conv-weight cache between the two cards**, so each card kept
   overwriting the other's copy. It is now per card.
+- **At most 8 requests ran at once on hosts with few CPU cores.** The HTTP server used the
+  library's default worker pool, max(8, cores - 1), and each in-flight request holds a worker for
+  its whole generation, so on a 4-core host the batch engine never saw more than 8 requests. The
+  pool is now 64 (`SPARKINFER_HTTP_THREADS` overrides).
 - **Concurrent greedy requests were never batched.** The server fills top_k/top_p from the
   checkpoint's `generation_config.json` (Qwen3.8: 20 / 0.95) for requests that omit them, and the
   packed decode declined any request with a truncation setting -- even at temperature 0, where
@@ -35,6 +39,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   forward serves every request's next token (the DSpark verify's rows path, each row on its own
   session); deterministic-mode output is byte-identical to sequential decoding.
   `SPARKINFER_TP_PACKED_ROWS=0` restores the per-request loop.
+  From 8 concurrent rows the projections run on the FP4 tensor cores (one weight read serves up
+  to 32 rows; the int8-activation kernels re-read the weights every 8 rows) and the GDN and
+  attention layers advance every row in one launch: 270 / 388 tok/s at 8 / 16 concurrent requests
+  (was 222 / 227). Activations are FP4 there, so a batched row is no longer bit-identical to the
+  same row decoded alone; `SPARKINFER_DETERMINISTIC=1` keeps the exact path
+  (`SPARKINFER_TP_DECODE_TC=0` too).
 - **The DSpark draft frees its bf16 weight copies after quantizing** (2.1 GB): at tp=2 the draft
   shares card 0 with half the target, and the copies starved the prefill arena and the draft's own
   capture buffer (`capture context: out of device memory`, after which speculation silently did

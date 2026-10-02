@@ -962,7 +962,8 @@ __global__ void conv_split_l2norm_fused_batched_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
     __nv_bfloat16* __restrict__ v,
-    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps)
+    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps,
+    int q0, int ql, int k0, int kl, int v0, int vl)
 {
     const int h  = blockIdx.x;
     const int b  = blockIdx.y;
@@ -974,25 +975,42 @@ __global__ void conv_split_l2norm_fused_batched_kernel(
     const __nv_bfloat16* qkv_row = qkv + (size_t)b * qkv_dim;
     __nv_bfloat16* conv_state = conv_states[b] + conv_off;
 
+    // tp>1 per-rank window, exactly as in conv_split_l2norm_fused_kernel: activations and state
+    // keep GLOBAL indices, only the conv_w row is remapped into the rank's reduced buffer. All
+    // window arguments 0 = full sections (wrow == d), the original batched kernel.
+    const int q0e = q0 > 0 ? q0 : 0;
+    const int qle = ql > 0 ? ql : q_heads;
+    const int k0e = k0 > 0 ? k0 : 0;
+    const int kle = kl > 0 ? kl : q_heads;
+    const int v0e = v0 > 0 ? v0 : 0;
+    const int vle = vl > 0 ? vl : v_heads;
+    int wrow = -1;
+
     bool do_norm = false;
     int d;
     __nv_bfloat16* out;
     if (h < q_heads) {
+        const int hq = h - q0e;
         d = h * head_dim + t;  out = q + (size_t)b * q_dim + d;  do_norm = true;
+        if (hq >= 0 && hq < qle) wrow = hq * head_dim + t;
     } else if (h < 2 * q_heads) {
+        const int hk = h - q_heads - k0e;
         d = q_dim + (h - q_heads) * head_dim + t;
         out = k + (size_t)b * q_dim + d - q_dim;  do_norm = true;
+        if (hk >= 0 && hk < kle) wrow = (qle + hk) * head_dim + t;
     } else {
+        const int hv = h - 2 * q_heads - v0e;
         d = 2 * q_dim + (h - 2 * q_heads) * head_dim + t;
         out = v + (size_t)b * v_dim + d - 2 * q_dim;
+        if (hv >= 0 && hv < vle) wrow = (qle + kle + hv) * head_dim + t;
     }
-    if (d >= qkv_dim) return;
+    if (d >= qkv_dim || wrow < 0) return;
 
     float y = 0.f;
     for (int p = 0; p < conv_kernel - 1; p++)
         y += q36_to_f(conv_state[(size_t)p * qkv_dim + d]) *
-             q36_to_f(conv_w[(size_t)d * conv_kernel + p]);
-    y += q36_to_f(qkv_row[d]) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+             q36_to_f(conv_w[(size_t)wrow * conv_kernel + p]);
+    y += q36_to_f(qkv_row[d]) * q36_to_f(conv_w[(size_t)wrow * conv_kernel + (conv_kernel - 1)]);
 
     for (int p = 0; p < conv_kernel - 2; p++)
         conv_state[(size_t)p * qkv_dim + d] = conv_state[(size_t)(p + 1) * qkv_dim + d];
@@ -1022,7 +1040,8 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
     const void* qkv_bf16, const void* conv_w_bf16,
     void* const* conv_states_bf16, size_t conv_off, void* q_bf16, void* k_bf16,
     void* v_bf16, int batch, int q_heads, int v_heads, int head_dim,
-    int conv_kernel, float eps, cudaStream_t stream)
+    int conv_kernel, float eps, cudaStream_t stream,
+    int q0, int ql, int k0, int kl, int v0, int vl)
 {
     if (batch < 1) return;
     conv_split_l2norm_fused_batched_kernel<<<dim3(2 * q_heads + v_heads, batch), head_dim, 0, stream>>>(
@@ -1032,7 +1051,7 @@ void launch_qwen36_conv_split_l2norm_fused_batched(
         reinterpret_cast<__nv_bfloat16*>(q_bf16),
         reinterpret_cast<__nv_bfloat16*>(k_bf16),
         reinterpret_cast<__nv_bfloat16*>(v_bf16),
-        q_heads, v_heads, head_dim, conv_kernel, eps);
+        q_heads, v_heads, head_dim, conv_kernel, eps, q0, ql, k0, kl, v0, vl);
 }
 
 void launch_qwen36_conv_split_l2norm_fused(
