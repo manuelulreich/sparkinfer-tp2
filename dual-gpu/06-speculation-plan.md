@@ -153,6 +153,17 @@ The target's hidden states at the capture layers are already identical on both c
 
 ## W. Drafter memory by window, speculation after prefix-cache hits, no 16k limit
 
+**Status: W0, W1, W3–W6 done (2026-10-02); W2 and W7 deferred.** Deviations and measurements:
+- W0 (8568720): the replay's first run exposed a prefill bug that cost more than anything here. After a prefix-cache hit, a continuation that could not get its batched scratch went to the token loop (102 s / 126 s TTFT at 22k / 28k cached on `--ctx 131072` with the drafter); it now halves and retries like a prefill from 0 (2.0 s / 3.4 s). Chat responses report `usage.speculative_tokens`.
+- W1: as planned (C = 12288 + 2 blocks, K = 4096). Under `SPARKINFER_DETERMINISTIC=1`, requests that slide (mid-generation at 12299, and on the first block of a 14k prompt) take the same steps with the same acceptance as unbounded states. C = 8192 / 6144 slid an 11.6k prompt at once and cost 4.5% more steps for 41 MB a card, so C stays.
+- W3: the join prefills each range exactly as `ingest_prompt_range` would (batched by the range's own length, else the token loop), so speculated and ordinary requests compute the same thing.
+- W4: the snapshot is the draft's newest positions before the job's last checkpoint (≤ 12288; only the kept 4096 once the prefix is past 12288, where the draft windows), attached to that entry's recurrent-state snapshot and counted in its host bytes.
+- W5: a join that declines after a hit's prefill started restores the entry's recurrent state before the job is prefilled ordinarily. With more than 4096 new rows past 12288, or no snapshot, the draft starts empty at the capture's first row.
+- W6: the join checks only the rows its first block ingests against `SPARKINFER_DSPARK_MAX_CTX`.
+- Added, not planned: from 12288 positions the group takes depth 2 (the single-session policy), and a group ends when, over its last 32 steps, it commits tokens slower than ordinary decode (measured by the engine per step size). Without that check, two concurrent long conversations speculated at 38 tok/s each against 48 plain.
+- Lossless: at `--ctx 49152`, deterministic, with the prefix cache forced on, a conversation's turns (including a hit that restored a snapshot) match a server without the drafter request for request. At 131072 identical requests differ from each other even without the drafter (prefill windows depend on free memory), and two identical hits on one entry can differ (pre-existing; follow-up).
+- Replay (`--ctx 131072`, greedy, one conversation to 60k): 13 of 13 turns speculated (before: 2 of 13), median decode 59.8 tok/s (48.5), end to end 42.9 tok/s (35.5), 112 s (129). Without the guard, four conversations: 35.6 against 28.8 tok/s end to end. Two and four conversations with the guard, and the 131072 stress runs, were not re-measured.
+
 ### Steps
 
 **W0. Multi-turn replay benchmark** (see Gates). Record today's numbers greedy and sampled before changing anything.

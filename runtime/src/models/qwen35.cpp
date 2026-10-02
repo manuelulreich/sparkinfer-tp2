@@ -933,6 +933,7 @@ struct Qwen35Model::Impl {
     int *vr_ids = nullptr, *vr_pos = nullptr, *vr_seq = nullptr, *vr_out = nullptr;
     int* h_vr = nullptr;            // pinned [4][R]: ids | positions | seqlens | argmax
     float* h_vr_maxv = nullptr;     // pinned [R]: each row's local head maximum
+    double plain_step_ms[5] = {0, 0, 0, 0, 0};   // note_plain_decode, by rows
     float* vr_snap_lin = nullptr;
     bf16* vr_snap_conv = nullptr;
     // (dual-GPU C1b) FP4 tensor-core staging for the multi-session rows path: one activation
@@ -4375,7 +4376,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     static const bool head_ar = [] {
         const char* e = getenv("SPARKINFER_TP_HEAD_ALLREDUCE"); return e && e[0] == '1';
     }();
-    if (!head_ar && n <= 64) {
+if (!head_ar && n <= 64) {
         kernels::launch_argmax(s.vr_lh, s.vr_out, n, Vr, st);
         cu(cudaMemcpyAsync(s.h_vr + 3 * R, s.vr_out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
            "tp verify local argmax");
@@ -8565,6 +8566,19 @@ void Qwen35Model::spec_group_release() {
     s.vr_seg_snap_conv.clear();
 }
 
+void Qwen35Model::note_plain_decode(int rows, double ms) {
+    if (rows < 1 || rows > 4 || !(ms > 0)) return;
+    double& avg = p_->plain_step_ms[rows];
+    avg = avg > 0 ? 0.95 * avg + 0.05 * ms : ms;
+}
+
+double Qwen35Model::plain_decode_ms(int rows) const {
+    rows = std::max(1, std::min(rows, 4));
+    for (int r = rows; r >= 1; r--)
+        if (p_->plain_step_ms[r] > 0) return p_->plain_step_ms[r];
+    return 20.0;   // tp=2 on 2x RTX 5060 Ti decodes ~50 tok/s, about the same for 1-4 sessions
+}
+
 bool Qwen35Model::spec_group_supported() const {
     return p_->dflash_draft && tp_active() && p_->tp_rank == 0 && p_->cfg.hybrid;
 }
@@ -8597,6 +8611,31 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         const int v = e ? atoi(e) : 0;
         return v < 0 ? 0 : v;
     }();
+    // From 12288 positions on, the depth the single-session path measured there (dflash_generate,
+    // "the 12288..32768 band takes depth 2"): a verify row reads the whole KV, so the deep rows
+    // cost more than they land. Measured here on an opencode-like replay (multiturn_bench.py),
+    // depth 6 at 14k-55k: 28 -> 40 ms a step for 1.8-2.8 tokens. SPARKINFER_SPEC_GROUP_LONG_DEPTH
+    // (default 2; 0 keeps depth_for's).
+    static const int kLongDepth = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_LONG_DEPTH");
+        const int v = e ? atoi(e) : 2;
+        return v < 0 ? 0 : v;
+    }();
+    // Speculation must beat ordinary decode, which costs about the same per step for one to four
+    // greedy sessions (packed). Over the group's last kGainWindow steps, gain = (tokens committed
+    // x an ordinary step's cost for those sessions, as the engine measured it) / (the steps' own
+    // time x sessions); below SPARKINFER_SPEC_GROUP_MIN_GAIN (default 1.0; 0 = off) the group
+    // ends and its sessions decode ordinarily. A window, not a short average: acceptance swings
+    // step to step, and ending is final for the request (a 10-step average ended a group whose
+    // gain was 1.5). Measured without the check at C2 on the replay: 38 tok/s per request
+    // speculating against 48 decoding ordinarily.
+    static const double kMinGain = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_MIN_GAIN");
+        return e ? std::max(0.0, atof(e)) : 1.0;
+    }();
+    constexpr int kGainWindow = 32;
+    double gain_won[kGainWindow] = {}, gain_cost[kGainWindow] = {};
+    long gain_steps = 0;
     static const bool kTiming = getenv("SPARKINFER_DSPARK_TIMING") != nullptr;
     DFlashDraftModel& draft = *s.dflash_draft;
     const DFlashDraftConfig& dc = draft.config();
@@ -8671,7 +8710,10 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         g.n = (int)prompt.size();
         if (g.n < 1 || job->max_new < 1) return false;
         const long need = (long)g.n + job->max_new + 2L * (B + 1);
-        if (need > dc.max_seq) return false;
+        // No limit on the context (plan 06, W6): the draft's state slides and its capture is at
+        // most the prompt's last 4096 rows past 12288, so nothing on the draft grows with it.
+        // SPARKINFER_DSPARK_MAX_CTX now bounds only the rows its first block ingests (checked
+        // below, once the capture's first row is known).
         std::lock_guard<std::recursive_mutex> lk(s.device_mu);
         // SPARKINFER_DSPARK_CAPTURE_MAX=N: the draft ingests at most the prompt's last N rows
         // (it then windows its attention, see DFlashDraftModel ctx_lo). The capture holds
@@ -8683,9 +8725,13 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             const char* e = getenv("SPARKINFER_DSPARK_CAPTURE_MAX");
             return e ? std::max(0, atoi(e)) : 0;
         }();
+        // A prefix-cache hit (job->start > 0) prefills, and so captures, only [start, n).
+        const int h = std::max(0, std::min(job->start, g.n - 1));
         int capture_start = 0;
         if (kCaptureMax > 0 && g.n > kCaptureMax) capture_start = g.n - kCaptureMax;
         else if (g.n >= 12288) capture_start = g.n - 4096;
+        capture_start = std::max(capture_start, h);
+        if (g.n - capture_start + 2L * (B + 1) > dc.max_seq) return false;
         // The context buffer only feeds this join's first draft (the prompt's rows); every later
         // step drafts from the session's own `cap` rows. Sizing it for the generation too held
         // ~51 KB per output token on the draft's card for nothing -- 0.8 GB at max_tokens 16k.
@@ -8694,7 +8740,9 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         if (!dflash_context_buffer() || !dflash_hidden_buffer()) return false;
         const size_t cap_bytes = (size_t)(B + 1) * s.dflash_n_cap * H * sizeof(bf16);
         if (cudaMalloc(&g.cap, cap_bytes) != cudaSuccess) { cudaGetLastError(); g.cap = nullptr; return false; }
-        g.state = draft.kv_state_create((int)need);
+        // A state slides (DFlashDraftModel::kv_state_create), so it never needs more than the
+        // sliding capacity, whatever the context: 123 MB a card instead of 20 KB a token.
+        g.state = draft.kv_state_create((int)std::min<long>(need, draft.kv_slide_capacity()));
         if (g.state < 0) { cudaFree(g.cap); return false; }
         const int budget = session_token_budget(prompt.size(), job->max_new + B, s.cfg.max_seq);
         invalidate_decode_graph();
@@ -8707,15 +8755,65 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         if (!kv_ok) { drop(g); return false; }
         activate_session(job->seq_id);
         reset_mrope_offset();
-        int next = -1, batched_done = 0;
-        const bool batched = batched_prefill_windowed_enabled(s.gguf, s.cfg, g.n, s.kv);
-        if (batched) next = prefill_batched_chunked(prompt.data(), g.n, false, &batched_done);
-        if (next < 0 && batched) {
+        int next = -1;
+        // A hit's recurrent state has moved past `start` once anything is prefilled; a job given
+        // back then is prefilled ordinarily from `start` again, so put the state back first.
+        auto undo_prefill = [&]() -> bool {
+            if (h == 0) return true;   // an ordinary prefill from 0 resets the state itself
+            if (job->start_state && restore_recurrent_state(job->seq_id, *job->start_state)) return true;
+            fprintf(stderr, "[spec-group] could not restore the prefix state of a declined join\n");
+            return false;
+        };
+        // Prefix-cache checkpoints, as step_job's prefill takes them: prefill to each, snapshot
+        // the recurrent state, continue. Without them a speculated turn left nothing in the cache
+        // and the next turn of the conversation re-prefilled all of it.
+        std::vector<std::pair<int, RecurrentStateSnapshot>> ckpts;
+        // Each range runs as ingest_prompt_range runs it -- the batched path when it is enabled
+        // for the range's length (from 0, the whole prefix), the token loop otherwise -- so a
+        // speculated request computes exactly what an ordinary one would. A batched range that
+        // declines (no scratch) declines the join instead of finishing token by token.
+        bool declined = false;
+        auto prefill_range = [&](int a, int b) -> int {
+            if (batched_prefill_windowed_enabled(s.gguf, s.cfg, a == 0 ? b : b - a, s.kv)) {
+                int d = 0;
+                const int r = a == 0 ? prefill_batched_chunked(prompt.data(), b, false, &d)
+                                     : prefill_batched_resume(prompt.data(), a, b, false, &d);
+                if (r < 0) declined = true;
+                return r;
+            }
+            int r = -1;
+            for (int i = a; i < b; i++) {
+                set_dflash_capture_row(0);
+                const bool sample = (i + 1 == b);
+                const int t = forward_token(prompt[i], i, sample);
+                dflash_stash_capture(i);
+                if (sample) r = t;
+            }
+            return r;
+        };
+        int pos = h;
+        if (job->checkpoints && job->on_checkpoint) {
+            for (int ck : *job->checkpoints) {
+                if (ck <= pos || ck >= g.n || ck % s.kv->block_size() != 0) continue;
+                if (prefill_range(pos, ck) < 0) break;
+                pos = ck;
+                RecurrentStateSnapshot snap;
+                if (snapshot_recurrent_state(job->seq_id, snap)) ckpts.emplace_back(ck, std::move(snap));
+            }
+        }
+        if (!declined) next = prefill_range(pos, g.n);
+        // Engaged from here on (or dropped): the snapshots go to the job only then.
+        auto hand_checkpoints = [&] {
+            for (auto& c : ckpts) job->on_checkpoint(c.first, c.second);
+            ckpts.clear();
+        };
+        if (declined) {
             // The batched prefill did not fit beside this join's capture rows and draft state (it
             // already narrowed its window as far as it goes). Finishing it token by token takes
             // minutes at 12k (measured: four concurrent 12k joins, ~700 s each), so give the
             // speculative state back and let the engine prefill the request ordinarily, without
-            // them. Its session is reused as it is: an ordinary prefill starts again at 0.
+            // them. Its session is reused as it is: an ordinary prefill starts again at 0 (after a
+            // prefix-cache hit, at the prefix, with its recurrent state put back below).
             fprintf(stderr, "[spec-group] join declined: the batched prefill does not fit beside "
                             "the draft (n=%d); prefilling it ordinarily\n", g.n);
             if (s.dflash_context) {
@@ -8724,18 +8822,14 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                 s.dflash_ctx_cap = 0;
             }
             drop(g);
+            if (!undo_prefill()) { fill_resume(g, true, true); hooks.on_done(job); return true; }
             return false;
         }
-        if (next < 0) {
-            for (int i = batched_done; i < g.n; i++) {
-                set_dflash_capture_row(0);
-                const bool sample = (i + 1 == g.n);
-                const int r = forward_token(prompt[i], i, sample);
-                dflash_stash_capture(i);
-                if (sample) next = r;
-            }
+        if (next < 0 || next >= s.cfg.vocab) {
+            drop(g);
+            if (!undo_prefill()) { fill_resume(g, true, true); hooks.on_done(job); return true; }
+            return false;
         }
-        if (next < 0 || next >= s.cfg.vocab) { drop(g); return false; }
         g.start = g.n;
         g.next = next;
         g.block.assign(B + 1, mask_id);
@@ -8744,9 +8838,39 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         draft.reset();
         std::vector<int> draft_ids(B + 1, 0);
         auto _td = std::chrono::steady_clock::now();
-        const bool first_ok = draft.forward_block(dflash_context_buffer(), g.n, g.block.data(),
-                                                  g.start, draft_ids.data(), nullptr, D, nullptr,
-                                                  s.dflash_ctx_start);
+        // After a prefix-cache hit the draft's context starts at the capture's first row: holding
+        // the prefix's last positions from the entry's draft snapshot when it has one (restored
+        // as far back as leaves room for the new rows), empty otherwise -- positions below are
+        // then gone and the draft windows, as after a truncated capture.
+        bool first_ok = true;
+        int ctx_rows = g.n, ctx_hidden_start = s.dflash_ctx_start;
+        if (h > 0) {
+            const auto* snap = static_cast<const DFlashDraftModel::KvSnapshot*>(
+                job->start_state && capture_start == h ? job->start_state->draft.get() : nullptr);
+            const int state_cap = (int)std::min<long>(need, draft.kv_slide_capacity());
+            int from = capture_start;
+            if (snap && snap->hi == h) {
+                from = std::max(snap->lo, g.n + 2 * (B + 1) + 1 - state_cap);
+                // From 12288 on the draft attends 2048 positions: the kept span covers them.
+                if (g.n >= 12288) from = std::max(from, g.n - draft.kv_slide_keep());
+            }
+            if (from >= h) snap = nullptr;
+            first_ok = snap ? draft.kv_start_at(from, h, snap) : false;
+            if (!first_ok) {
+                from = capture_start;
+                first_ok = draft.kv_start_at(from, from, nullptr);
+            }
+            ctx_rows = g.n - capture_start;
+            ctx_hidden_start = 0;
+            if (kTiming)
+                fprintf(stderr, "[spec-group] join after a prefix hit at %d: %d new rows, draft "
+                                "context from %d (%s)\n", h, g.n - h, from,
+                        snap && from < h ? "snapshot" : "none");
+        }
+        if (first_ok)
+            first_ok = draft.forward_block(dflash_context_buffer(), ctx_rows, g.block.data(),
+                                           g.start, draft_ids.data(), nullptr, D, nullptr,
+                                           ctx_hidden_start);
         // The prompt's capture rows (51 KB a row, ~0.6 GB at 12k) fed only this first draft;
         // every later step drafts from the session's own `cap`. Give them back now rather than
         // when the group ends, for the prefills of whatever runs meanwhile. The draft has read
@@ -8756,6 +8880,25 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             s.dflash_context = nullptr;
             s.dflash_ctx_cap = 0;
         }
+        // The draft's context at the last checkpoint goes with that prefix-cache entry (plan 06,
+        // W4), in pinned host memory: SPARKINFER_DSPARK_SNAPSHOT positions (default 12288, the
+        // span the draft attends unwindowed; 0 = off), ~10 KB a position per card. A prefix of
+        // 12288 or more is followed by a windowed draft, so only the kept span (4096) goes.
+        static const int kDraftSnap = [] {
+            const char* e = getenv("SPARKINFER_DSPARK_SNAPSHOT");
+            return e ? std::max(0, atoi(e)) : 12288;
+        }();
+        if (first_ok && kDraftSnap > 0 && !ckpts.empty()) {
+            const int ck = ckpts.back().first;
+            const int span = ck >= 12288 ? std::min(kDraftSnap, draft.kv_slide_keep()) : kDraftSnap;
+            const int lo = std::max(draft.kv_valid_lo(), ck - span);
+            auto ks = std::make_shared<DFlashDraftModel::KvSnapshot>();
+            if (ck - lo >= 2 * (B + 1) && draft.kv_snapshot(lo, ck, *ks)) {
+                ckpts.back().second.draft_bytes = ks->total_bytes();
+                ckpts.back().second.draft = std::move(ks);
+            }
+        }
+        hand_checkpoints();
         if (!first_ok) {
             // The prompt is prefilled: hand the job back engaged at its first token.
             fprintf(stderr, "[spec-group] first draft failed (n=%d)\n", g.n);
@@ -8771,8 +8914,9 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         return true;
     };
 
-    auto depth_for = [&](int S) {
-        const int want = kDepthEnv > 0 ? kDepthEnv : (S <= 1 ? 6 : 4);
+    auto depth_for = [&](int S, int ctx = 0) {
+        int want = kDepthEnv > 0 ? kDepthEnv : (S <= 1 ? 6 : 4);
+        if (kDepthEnv <= 0 && kLongDepth > 0 && ctx >= 12288) want = std::min(want, kLongDepth);
         return std::max(0, std::min(want, std::min(B, R / std::max(S, 1) - 1)));
     };
     for (SpecGroupJob* j : jobs) {
@@ -8800,9 +8944,12 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             continue;
         }
         const int S = (int)act.size();
-        const int D = depth_for(S);
+        int ctx_max = 0;
+        for (G* g : act) ctx_max = std::max(ctx_max, g->start);
+        const int D = depth_for(S, ctx_max);
         const int T = D + 1;
         if (D < 1) break;
+        const auto t_step = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::recursive_mutex> lk(s.device_mu);
             auto _td = std::chrono::steady_clock::now();
@@ -8850,6 +8997,9 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         }
         steps++;
         seg_steps += S;
+        const double step_ms = ms_since(t_step);
+        long step_tokens = 0;
+        for (int j = 0; j < S; j++) step_tokens += keep[j];
         // Commit each session's accepted prefix, exactly as dflash_generate does per step.
         for (int j = 0; j < S; j++) {
             G& g = *act[j];
@@ -8890,6 +9040,21 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                 }
                 fill_resume(g, finished, false);
                 hooks.on_done(g.job);
+            }
+        }
+        if (kMinGain > 0) {
+            const double plain = plain_decode_ms(S);
+            gain_won[gain_steps % kGainWindow] = (double)step_tokens * plain;
+            gain_cost[gain_steps % kGainWindow] = (double)S * step_ms;
+            double won = 0, cost = 0;
+            for (int i = 0; i < kGainWindow; i++) { won += gain_won[i]; cost += gain_cost[i]; }
+            const double gain_avg = won / std::max(1e-3, cost);
+            if (++gain_steps >= kGainWindow && gain_avg < kMinGain) {
+                if (kTiming)
+                    fprintf(stderr, "[spec-group] speculation does not pay here (gain %.2f at S=%d, "
+                                    "context %d, %.1f ms a step against %.1f ordinary): decoding "
+                                    "ordinarily\n", gain_avg, S, ctx_max, step_ms, plain);
+                break;
             }
         }
         // Newcomers join (or the group stops and hands everyone back).

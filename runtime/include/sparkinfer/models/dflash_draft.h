@@ -3,6 +3,7 @@
 // Loads official z-lab BF16 safetensors; reuses target embed + lm_head.
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
@@ -97,7 +98,38 @@ public:
     // allocates one holding `capacity` positions (clamped to max_seq; -1 = out of memory);
     // select makes it the cache reset/crop/seq_len/forward_block act on (-1 = the built-in one);
     // free releases it (selecting the built-in cache if it was active).
+    //
+    // A state slides: when a block does not fit, forward_block keeps the newest
+    // kv_slide_keep() positions, moves them to the front, and windows the attention (positions
+    // below them are gone). So a state of kv_slide_capacity() positions serves any context.
     int kv_state_create(int capacity);
+    // Positions a sliding state needs to behave exactly as an unbounded one for every context the
+    // draft attends unwindowed (SPARKINFER_DSPARK_KV_CAP, default 12288 + 2 x block).
+    int kv_slide_capacity() const;
+    // Positions kept when a state slides (SPARKINFER_DSPARK_KV_KEEP, default 4096).
+    int kv_slide_keep() const;
+
+    // (plan 06, W4/W5) Positions of the selected state on the host, kept with a prefix-cache entry
+    // so a later request starting from that prefix restores the draft's context instead of
+    // starting it empty.
+    struct KvSnapshot {
+        std::shared_ptr<void> host;   // pinned; per layer, K rows then V rows (this rank's heads)
+        int lo = 0, hi = 0;           // positions [lo, hi)
+        size_t bytes = 0;
+        std::shared_ptr<KvSnapshot> peer;   // rank 1's heads (split draft)
+        size_t total_bytes() const { return bytes + (peer ? peer->total_bytes() : 0); }
+    };
+    // Copy positions [lo, hi) of the selected state. false: a row is not held in every layer (see
+    // kv_valid_lo), or no pinned memory.
+    bool kv_snapshot(int lo, int hi, KvSnapshot& out);
+    // Start the selected state at `seq_len`, holding positions [from, seq_len) from `snap` (which
+    // must cover them and end at seq_len), or nothing with snap == nullptr (from == seq_len).
+    // Positions below `from` are gone: the full-attention layer windows unless from == 0.
+    // false (state unchanged): it does not fit the state's capacity.
+    bool kv_start_at(int from, int seq_len, const KvSnapshot* snap);
+    // Lowest position the selected state holds in every layer (rows below were never projected, or
+    // slid out).
+    int kv_valid_lo() const;
     bool kv_state_select(int id);
     void kv_state_free(int id);
 
@@ -164,6 +196,8 @@ private:
     bool forward_blocks_body(int n, const DraftSeg* seg, int proposals, cudaStream_t stream,
                              int mode);
     int kv_state_create_local(int capacity);
+    bool kv_snapshot_local(int lo, int hi, KvSnapshot& out);
+    bool kv_start_at_local(int from, int seq_len, const KvSnapshot* snap);
     void kv_state_free_local(int id);
 };
 

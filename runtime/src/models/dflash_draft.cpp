@@ -418,6 +418,12 @@ struct DFlashDraftModel::Impl {
     // (target_hidden_start > 0). The full-attention layer must then stay windowed for the rest of
     // the generation -- positions below it were never computed.
     int ctx_lo = 0;
+    // Position of cache row 0. > 0 once the cache has slid (forward_block): row i holds position
+    // kv_base + i, and positions below kv_base are gone (ctx_lo >= kv_base then).
+    int kv_base = 0;
+    // Lowest position held in every layer: rows a block skipped (outside every window) or that
+    // slid out are not (kv_snapshot).
+    int kv_valid_lo = 0;
     // The draft's active block width for a proposal depth (see forward_block).
     int width_for(int kProposalDepth) const {
         const Impl& s = *this;
@@ -524,7 +530,7 @@ struct DFlashDraftModel::Impl {
     // (dual-GPU) Extra KV caches, one per concurrently drafted session (kv_state_*). The active
     // cache is always the one in k_cache/v_cache/seq_len/kv_cap; a state's slot holds it while
     // it is not selected. Slot -1 is the built-in cache.
-    struct KvState { std::vector<bf16*> k, v; int seq_len = 0; int cap = 0; int ctx_lo = 0; bool live = false; };
+    struct KvState { std::vector<bf16*> k, v; int seq_len = 0; int cap = 0; int ctx_lo = 0; int base = 0; int valid_lo = 0; bool live = false; };
     std::vector<KvState> kv_states;
     KvState kv_default;
     int kv_cur = -1;
@@ -539,12 +545,16 @@ struct DFlashDraftModel::Impl {
         out.seq_len = seq_len;
         out.ctx_lo = ctx_lo;
         out.cap = kv_cap;
+        out.base = kv_base;
+        out.valid_lo = kv_valid_lo;
         KvState& in = id < 0 ? kv_default : kv_states[id];
         k_cache.swap(in.k);
         v_cache.swap(in.v);
         seq_len = in.seq_len;
         ctx_lo = in.ctx_lo;
         kv_cap = in.cap;
+        kv_base = in.base;
+        kv_valid_lo = in.valid_lo;
         kv_cur = id;
         return true;
     }
@@ -593,8 +603,10 @@ struct DFlashDraftModel::Impl {
             // layer attends a window, which forward_block applies and this pass does not.
             const int lo = cur ? ctx_lo : kv_states[g.state].ctx_lo;
             const int cap = cur ? kv_cap : kv_states[g.state].cap;
+            const int base = cur ? kv_base : kv_states[g.state].base;
+            // A state that slid (base > 0) or would slide in this block goes through forward_block.
             ok = past[j] + g.ctx_len == g.pos0 && past[j] + g.ctx_len + BW <= cap &&
-                 past[j] + g.ctx_len < 12288 && lo == 0;
+                 past[j] + g.ctx_len < 12288 && lo == 0 && base == 0;
         }
         return ok && ctx_total <= R;
     }
@@ -1032,6 +1044,8 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
 void DFlashDraftModel::reset() {
     p_->seq_len = 0;
     p_->ctx_lo = 0;
+    p_->kv_base = 0;
+    p_->kv_valid_lo = 0;
     if (p_->tp_peer) p_->tp_peer->reset();   // host state only
 }
 
@@ -1044,6 +1058,120 @@ void DFlashDraftModel::crop(int keep) {
 }
 
 int DFlashDraftModel::seq_len() const { return p_->seq_len; }
+
+// Defaults keep the draft exactly as it was without sliding: below 12288 it attends everything,
+// which a state of 12288 positions plus two blocks holds; from 12288 up (and after a truncated
+// capture) its widest window is 2048, which the 4096 kept positions always cover.
+int DFlashDraftModel::kv_slide_capacity() const {
+    static const int env = [] {
+        const char* e = getenv("SPARKINFER_DSPARK_KV_CAP");
+        return e ? atoi(e) : 0;
+    }();
+    const int two_blocks = 2 * (p_->cfg.block_size + 1);
+    const int floor = kv_slide_keep() + 2 * two_blocks;
+    const int want = env > 0 ? env : 12288 + two_blocks;
+    return std::min(p_->cfg.max_seq, std::max(want, floor));
+}
+
+int DFlashDraftModel::kv_slide_keep() const {
+    static const int env = [] {
+        const char* e = getenv("SPARKINFER_DSPARK_KV_KEEP");
+        return e ? atoi(e) : 0;
+    }();
+    return env > 0 ? env : 4096;
+}
+
+int DFlashDraftModel::kv_valid_lo() const { return std::max(p_->kv_valid_lo, p_->kv_base); }
+
+bool DFlashDraftModel::kv_snapshot(int lo, int hi, KvSnapshot& out) {
+    Impl& s = *p_;
+    out = KvSnapshot{};
+    if (!s.tp_peer) return kv_snapshot_local(lo, hi, out);
+    auto peer = std::make_shared<KvSnapshot>();
+    bool ok = false, peer_ok = false;
+    tp_run_with_peer(s.tp_peer_dev, [&] { peer_ok = s.tp_peer->kv_snapshot_local(lo, hi, *peer); },
+                     [&] { ok = kv_snapshot_local(lo, hi, out); });
+    if (!ok || !peer_ok) { out = KvSnapshot{}; return false; }
+    out.peer = std::move(peer);
+    return true;
+}
+
+bool DFlashDraftModel::kv_snapshot_local(int lo, int hi, KvSnapshot& out) {
+    Impl& s = *p_;
+    if (lo < std::max(s.kv_valid_lo, s.kv_base) || hi > s.seq_len || hi <= lo ||
+        s.k_cache.size() != (size_t)s.cfg.n_layers)
+        return false;
+    const size_t kvdim = (size_t)s.cfg.n_kv_heads * s.cfg.head_dim;
+    const size_t rows = (size_t)(hi - lo), plane = rows * kvdim * sizeof(bf16);
+    const size_t bytes = plane * 2 * s.cfg.n_layers;
+    void* host = nullptr;
+    if (cudaHostAlloc(&host, bytes, cudaHostAllocDefault) != cudaSuccess || !host) {
+        cudaGetLastError();
+        return false;
+    }
+    std::shared_ptr<void> owned(host, [](void* p) { cudaFreeHost(p); });
+    cudaStream_t st = s.tp_stream ? s.tp_stream : s.stream;
+    if (s.tp_stream) cudaStreamSynchronize(s.stream);
+    const size_t off = (size_t)(lo - s.kv_base) * kvdim;
+    char* h = static_cast<char*>(host);
+    for (int L = 0; L < s.cfg.n_layers; L++) {
+        cu(cudaMemcpyAsync(h + (2 * L) * plane, s.k_cache[L] + off, plane, cudaMemcpyDeviceToHost, st),
+           "draft kv snapshot k");
+        cu(cudaMemcpyAsync(h + (2 * L + 1) * plane, s.v_cache[L] + off, plane, cudaMemcpyDeviceToHost,
+                           st), "draft kv snapshot v");
+    }
+    if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+    out.host = std::move(owned);
+    out.lo = lo;
+    out.hi = hi;
+    out.bytes = bytes;
+    return true;
+}
+
+bool DFlashDraftModel::kv_start_at(int from, int seq_len, const KvSnapshot* snap) {
+    Impl& s = *p_;
+    if (!s.tp_peer) return kv_start_at_local(from, seq_len, snap);
+    if (snap && !snap->peer) return false;
+    bool ok = false, peer_ok = false;
+    tp_run_with_peer(s.tp_peer_dev,
+                     [&] { peer_ok = s.tp_peer->kv_start_at_local(from, seq_len,
+                                                                 snap ? snap->peer.get() : nullptr); },
+                     [&] { ok = kv_start_at_local(from, seq_len, snap); });
+    if (ok && peer_ok) return true;
+    // One rank started, the other did not: leave both empty (the caller drafts nothing then).
+    reset();
+    return false;
+}
+
+bool DFlashDraftModel::kv_start_at_local(int from, int seq_len, const KvSnapshot* snap) {
+    Impl& s = *p_;
+    if (from < 0 || seq_len < from || (!snap && from != seq_len)) return false;
+    if (snap && (from < snap->lo || seq_len != snap->hi || !snap->host)) return false;
+    // Room for the held rows and two blocks, or the very first block slides them out again.
+    const int two_blocks = 2 * (s.cfg.block_size + 1);
+    if (seq_len - from + two_blocks > s.kv_cap || s.k_cache.size() != (size_t)s.cfg.n_layers)
+        return false;
+    const size_t kvdim = (size_t)s.cfg.n_kv_heads * s.cfg.head_dim;
+    if (snap && seq_len > from) {
+        const size_t rows = (size_t)(snap->hi - snap->lo), plane = rows * kvdim * sizeof(bf16);
+        const size_t skip = (size_t)(from - snap->lo) * kvdim * sizeof(bf16);
+        const size_t n = (size_t)(seq_len - from) * kvdim * sizeof(bf16);
+        const char* h = static_cast<const char*>(snap->host.get());
+        cudaStream_t st = s.tp_stream ? s.tp_stream : s.stream;
+        for (int L = 0; L < s.cfg.n_layers; L++) {
+            cu(cudaMemcpyAsync(s.k_cache[L], h + (2 * L) * plane + skip, n, cudaMemcpyHostToDevice, st),
+               "draft kv restore k");
+            cu(cudaMemcpyAsync(s.v_cache[L], h + (2 * L + 1) * plane + skip, n,
+                               cudaMemcpyHostToDevice, st), "draft kv restore v");
+        }
+        if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+    }
+    s.kv_base = from;
+    s.kv_valid_lo = from;
+    s.ctx_lo = from;
+    s.seq_len = seq_len;
+    return true;
+}
 
 int DFlashDraftModel::kv_state_create(int capacity) {
     Impl& s = *p_;
@@ -1809,6 +1937,16 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
     // constant the band below already uses, which collapses the window ladder to one value above
     // 12288.
     static const int kLongCtxWindow = 2048;
+    // Sliding KV (kv_state_create): the block's rows go at cache row past - kv_base. When they do
+    // not fit, keep the newest kv_slide_keep() positions before the block's first query and drop
+    // the rest; positions below the new base are gone, so ctx_lo rises to it, which windows the
+    // full-attention layer as a truncated capture does (checked against the kept span below).
+    if (past < s.kv_base) return false;
+    int slide_base = s.kv_base;
+    if (past - s.kv_base + ctx_len + BW > s.kv_cap) {
+        slide_base = std::max(s.kv_base, pos0 - kv_slide_keep());
+        s.ctx_lo = std::max(s.ctx_lo, slide_base);
+    }
     int kFullWindow = kFullWindowEnv >= 0 ? kFullWindowEnv : 3 * c.sliding_window;
     if (kFullWindowEnv < 0 && kFullWindow <= 0) {
         const int total_ctx = past + ctx_len;
@@ -1836,7 +1974,53 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
         else if (std::max(s.ctx_lo, past == 0 ? target_hidden_start : 0) > 0)
             kFullWindow = kMidCtxWindow;
     }
-    if (past == 0 && target_hidden_start > 0) s.ctx_lo = target_hidden_start;
+    if (past == 0 && target_hidden_start > 0) s.ctx_lo = std::max(s.ctx_lo, target_hidden_start);
+    if (slide_base > 0) {
+        // Positions below the base are gone, so every layer must window (as after a truncated
+        // capture). With the defaults the window (2048) lies inside the kept span (4096) whenever
+        // the state slid, so a slide drops nothing the attention would read; a window wider than
+        // the kept span, or a state started past its prompt's beginning (kv_start_at), attends
+        // only what is held. SPARKINFER_DFLASH_FULL_WINDOW=0 (no window) cannot slide.
+        for (int L = 0; L < c.n_layers; L++) {
+            int win = (L < (int)c.sliding_layers.size() && c.sliding_layers[L]) ? c.sliding_window : 0;
+            if (win == 0 && kFullWindow > 0) win = kFullWindow;
+            if (win <= 0) {
+                fprintf(stderr, "[dflash] KV slide: layer %d attends the whole context, which no "
+                                "longer starts at 0 (base %d)\n", L, slide_base);
+                return false;
+            }
+        }
+    }
+    if (past + ctx_len + BW - slide_base > s.kv_cap) {
+        fprintf(stderr, "[dflash] KV overflow past=%d new=%d base=%d max=%d\n", past, ctx_len + BW,
+                slide_base, s.kv_cap);
+        return false;
+    }
+    if (slide_base > s.kv_base) {
+        // Move the kept rows [slide_base, past) to the front. RoPE was applied when they were
+        // written, so they stay valid at any row. Copies of at most `shift` rows never overlap.
+        const int shift = slide_base - s.kv_base;
+        const int keep = std::max(0, past - slide_base);
+        const size_t row = (size_t)kvdim * sizeof(bf16);
+        for (int L = 0; L < c.n_layers; L++)
+            for (int off = 0; off < keep; off += shift) {
+                const int rows = std::min(shift, keep - off);
+                cu(cudaMemcpyAsync(s.k_cache[L] + (size_t)off * kvdim,
+                                   s.k_cache[L] + (size_t)(shift + off) * kvdim, rows * row,
+                                   cudaMemcpyDeviceToDevice, st), "kv slide k");
+                cu(cudaMemcpyAsync(s.v_cache[L] + (size_t)off * kvdim,
+                                   s.v_cache[L] + (size_t)(shift + off) * kvdim, rows * row,
+                                   cudaMemcpyDeviceToDevice, st), "kv slide v");
+            }
+        static const bool kSlideLog = getenv("SPARKINFER_DSPARK_SLIDE_LOG") != nullptr;
+        if (kSlideLog && lead)
+            fprintf(stderr, "[dflash] KV slide: base %d -> %d (kept %d positions, pos0 %d)\n",
+                    s.kv_base, slide_base, keep, pos0);
+        s.kv_base = slide_base;
+    }
+    s.kv_valid_lo = std::max(s.kv_valid_lo, s.kv_base);
+    const int kv_rel = past - s.kv_base;   // cache row of position `past`
+    int ctx_skip_max = 0;   // context rows some layer did not project (kv_valid_lo)
     // fc trim: once the full-attn layer is windowed, NO layer reads target_proj older than the
     // largest window across layers, so project only that tail. Uses the same attn_gqa_kv_lo bound
     // the per-layer ingestion (#752) applies, at the LARGEST window -> surviving rows byte-identical,
@@ -1911,10 +2095,6 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
     // the same size). Project straight into the cache slice instead; the RoPE then runs in place
     // there. Same values written to the same addresses in the same order.
     const int new_len_all = ctx_len + BW;
-    if (past + new_len_all > s.kv_cap) {
-        fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, s.kv_cap);
-        return false;
-    }
     // Attention geometry for this block, hoisted: the context ingestion below needs the layer's
     // window and the block's key span to know which context rows the attention can still reach.
     const int kv_len_for_block = past + new_len_all;
@@ -1924,8 +2104,8 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
         int window_of_layer = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
                                         ? c.sliding_window : 0;
         if (window_of_layer == 0 && kFullWindow > 0) window_of_layer = kFullWindow;
-        bf16* const kdst = s.k_cache[L] + (size_t)past * kvdim;
-        bf16* const vdst = s.v_cache[L] + (size_t)past * kvdim;
+        bf16* const kdst = s.k_cache[L] + (size_t)kv_rel * kvdim;
+        bf16* const vdst = s.v_cache[L] + (size_t)kv_rel * kvdim;
         if (L == 0)
             dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
 
@@ -1976,8 +2156,11 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
             ? dflash_kernels::attn_gqa_kv_lo(BW, kv_len_for_block, c.n_q_heads, c.n_kv_heads, d,
                                              q_pos0_for_block, /*k_pos0=*/0, window_of_layer)
             : 0;
-        const int ctx_skip = ctx_kv_lo > past ? std::min(ctx_kv_lo - past, ctx_len) : 0;
+        // Context rows below the slid base have no cache row (and are outside every window).
+        const int ctx_skip = std::max(ctx_kv_lo > past ? std::min(ctx_kv_lo - past, ctx_len) : 0,
+                                      std::min(ctx_len, std::max(0, s.kv_base - past)));
         const int ctx_rows = ctx_len - ctx_skip;
+        ctx_skip_max = std::max(ctx_skip_max, ctx_skip);
         const bf16* const ctx_src = s.target_proj + (size_t)ctx_skip * H;
         bf16* const kdst_ctx = kdst + (size_t)ctx_skip * kvdim;
         bf16* const vdst_ctx = vdst + (size_t)ctx_skip * kvdim;
@@ -2072,8 +2255,9 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
                                                  s.d_yarn_inv_freq, s.yarn_att_scale);
         }
 
-        // K/V are already in the cache at offset `past` -- attend over the full past+new.
-        const int kv_len = past + new_len;
+        // K/V are already in the cache at row kv_rel -- attend over the whole cache, whose row 0
+        // holds position kv_base.
+        const int kv_len = kv_rel + new_len;
         const int window = window_of_layer;
         static int mixed_causal = [] {
             const char* e = getenv("SPARKINFER_DFLASH_MIXED_CAUSAL");
@@ -2097,8 +2281,8 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
                              c.sliding_layers[L]);
         dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
                                         BW, kv_len, c.n_q_heads, c.n_kv_heads, d,
-                                        q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st,
-                                        s.fa_m, s.fa_l, s.fa_acc);
+                                        q_pos0, /*k_pos0_cache=*/s.kv_base, window, causal, scale,
+                                        st, s.fa_m, s.fa_l, s.fa_acc);
 
         if (fast16) {
             if (w.q8_wo.q4 && dp4a_o)
@@ -2198,6 +2382,7 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
     }
     if (run_layers <= 0)
         dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, BW, H, c.rms_eps, st);
+    if (ctx_skip_max > 0) s.kv_valid_lo = std::max(s.kv_valid_lo, past + ctx_skip_max);
     if (!lead) {
         // The head and the Markov chain run on rank 0 only; this rank just keeps its cache in
         // step (the same advance-then-crop as below).

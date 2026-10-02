@@ -413,6 +413,7 @@ public:
     };
     // (dual-GPU C2) Speculative decoding of several engine sessions at once (tp=2 leader only):
     // see dflash_generate_group in qwen35.cpp. A job's resume is filled before on_done reports it.
+    struct RecurrentStateSnapshot;   // defined below (prefix cache)
     struct SpecGroupJob {
         uint64_t seq_id = 0;
         const std::vector<int>* prompt = nullptr;
@@ -420,6 +421,17 @@ public:
         std::function<bool(const int* tokens, int n)> on_tokens;   // false: this job stops
         SpecResume resume;
         void* user = nullptr;
+        // Prefix-cache checkpoints (ascending prompt positions, block-aligned; null = none): the
+        // join prefills up to each, snapshots the recurrent state there, and hands every snapshot
+        // to on_checkpoint once the job is engaged (never for a join that declined and is then
+        // prefilled ordinarily, which takes its own).
+        const std::vector<int>* checkpoints = nullptr;
+        std::function<void(int pos, RecurrentStateSnapshot& state)> on_checkpoint;
+        // A prefix-cache hit: KV for [0, start) is shared in and the recurrent state restored to
+        // `start_state` (restored again if the join gives the job back after prefilling part of
+        // the rest). Its draft snapshot, if any, seeds the draft's context.
+        int start = 0;
+        const RecurrentStateSnapshot* start_state = nullptr;
     };
     struct SpecGroupHooks {
         // Between steps, no lock held: append jobs to join; false stops the group.
@@ -428,6 +440,10 @@ public:
         std::function<void(SpecGroupJob*)> on_done;
     };
     bool spec_group_supported() const;
+    // Ordinary decode cost the engine measured for a step of `rows` sessions (an average; a
+    // default until measured), the yardstick the speculative group must beat.
+    void note_plain_decode(int rows, double ms);
+    double plain_decode_ms(int rows) const;
     void dflash_generate_group(std::vector<SpecGroupJob*> jobs, const SpecGroupHooks& hooks);
     int spec_group_verify(const int* ids, int n, const int* row_pos, const uint64_t* row_seq,
                           int seg_n, void* const* seg_capture, int* out_argmax, int* seg_keep);
@@ -686,7 +702,14 @@ public:
         // (dual-GPU) Under tensor parallelism each rank holds only its own GDN window, so the
         // leader's snapshot carries rank 1's half here (taken/restored on rank 1's device).
         std::shared_ptr<RecurrentStateSnapshot> peer;
-        size_t bytes() const { return state_bytes + conv_bytes + (peer ? peer->bytes() : 0); }
+        // The DSpark draft's context at this prefix (a DFlashDraftModel::KvSnapshot, both ranks),
+        // when a speculated request took the checkpoint: a later speculated request that starts
+        // here restores it instead of starting the draft empty. Null otherwise.
+        std::shared_ptr<void> draft;
+        size_t draft_bytes = 0;
+        size_t bytes() const {
+            return state_bytes + conv_bytes + draft_bytes + (peer ? peer->bytes() : 0);
+        }
     };
     // Copy seq_id's recurrent state into `out`. False, leaving `out` untouched, when the session is
     // unknown, its state was compacted to bf16 by packed decode (a prefill-time snapshot never is),

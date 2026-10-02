@@ -99,6 +99,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 DSpark: every turn of a long conversation speculates.** The drafter's KV state per
+  request is now a fixed 12288 + 2 blocks positions (~123 MB a card) that slides, keeping its
+  newest 4096 positions, instead of growing with the context; speculated requests take prefix-cache
+  checkpoints and keep the drafter's context with the entry (pinned host memory); a request that
+  starts from a cached prefix speculates, prefilling only the rest; and the 16k limit is gone. From
+  12288 positions a group drafts two tokens a step, and a group that commits tokens slower than
+  ordinary decode hands its requests back. Opencode-like replay (`multiturn_bench.py`,
+  `--ctx 131072`, greedy, one conversation to 60k tokens): 13 of 13 turns speculated instead of
+  2, median decode 59.8 tok/s instead of 48.5, end to end 42.9 instead of 35.5.
 - **tp=2: the DSpark draft is split across both cards** like the target: each card holds half of
   every draft layer's query heads (20 of 40), KV heads (4 of 8) and FFN columns, and the two halves
   are summed over the link after each layer's o_proj and down_proj. Card 0 still projects the

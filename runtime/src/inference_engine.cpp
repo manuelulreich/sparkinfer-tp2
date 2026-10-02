@@ -103,6 +103,9 @@ struct ContinuousBatchEngine::Job {
     // Prefix cache: tokens this job started from rather than prefilled, and the recurrent-state
     // snapshots taken at req.cache_checkpoints (offered to the cache in finish_job_impl).
     int cached_tokens = 0;
+    // The prefix-cache hit's recurrent state (and draft snapshot), for a speculative join that
+    // starts from it (SpecGroupJob::start_state). Shares the entry's pinned copies.
+    Qwen35Model::RecurrentStateSnapshot hit_state;
     int spec_tokens = 0;   // tokens produced by a speculative run (the rest, if any, decoded ordinarily)
     struct Checkpoint {
         int pos = 0;
@@ -330,12 +333,12 @@ ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() cons
 bool ContinuousBatchEngine::spec_eligible(const Request& r) {
     // Speculation is lossless only for greedy argmax, and the verify path has none of the sampler
     // extras. A constraint must stay on the per-token path where its mask is applied. Images need
-    // the vision splice ordinary prefill does; a prefix-cache hit starts past position 0, where the
-    // capture the draft reads would have a hole.
+    // the vision splice ordinary prefill does. A prefix-cache hit (prefill_start > 0) speculates
+    // in the group path only, which prefills the rest and starts the draft from the entry's
+    // snapshot (dflash_generate cannot start past 0).
     return !r.constraint && r.temperature <= 0.f && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
-           r.forced_tokens.empty() && r.vision_pos.empty() && r.prefill_start == 0 &&
-           !r.use_prefix_session;
+           r.forced_tokens.empty() && r.vision_pos.empty() && !r.use_prefix_session;
 }
 
 // Hands a speculative run's committed tokens to the job (TTFT, output, streaming callback,
@@ -429,6 +432,21 @@ void ContinuousBatchEngine::run_speculative_group(const std::vector<Job*>& first
         m->gj.max_new = job->req.max_new_tokens;
         m->gj.user = m.get();
         m->gj.on_tokens = [this, job](const int* t, int n) { return spec_emit(*job, t, n); };
+        // The same checkpoints step_job's prefill would take (spec_eligible already excludes
+        // images and forced tokens); finish_job_impl offers them to the cache.
+        if (job->req.prefill_start > 0) {
+            m->gj.start = job->req.prefill_start;
+            m->gj.start_state = &job->hit_state;
+        }
+        if (prefix_cache_ && job->req.prefix_cache) {
+            m->gj.checkpoints = &job->req.cache_checkpoints;
+            m->gj.on_checkpoint = [job](int pos, Qwen35Model::RecurrentStateSnapshot& st) {
+                Job::Checkpoint cp;
+                cp.pos = pos;
+                cp.state = std::move(st);
+                job->checkpoints.push_back(std::move(cp));
+            };
+        }
         in_group.insert(job);
         Qwen35Model::SpecGroupJob* p = &m->gj;
         members.push_back(std::move(m));
@@ -450,8 +468,9 @@ void ContinuousBatchEngine::run_speculative_group(const std::vector<Job*>& first
         for (const auto& kv : jobs_) {
             Job* j = kv.second.get();
             if (j->done || in_group.count(j)) continue;
-            if (j->spec_tried || j->phase != SeqPhase::PREFILL || j->prefill_pos != 0 ||
-                !spec_eligible(j->req) || size >= spec_group_max())
+            if (j->spec_tried || j->phase != SeqPhase::PREFILL ||
+                j->prefill_pos != j->req.prefill_start || !spec_eligible(j->req) ||
+                size >= spec_group_max())
                 return false;
             joins.push_back(make(j));
             ++size;
@@ -678,6 +697,7 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
                 if (model_->restore_recurrent_state(seq_id, hit.state)) {
                     job.req.prefill_start = hit.tokens;
                     job.cached_tokens = hit.tokens;
+                    job.hit_state = hit.state;
                 } else {
                     // Shared KV with anything but its own recurrent state is wrong output, not a
                     // slow path. Fall back to a plain session and recompute the whole prompt.
@@ -761,7 +781,8 @@ void ContinuousBatchEngine::worker_loop() {
                     }
                     if (live == 1 && !(spec_group_single() && model_->spec_group_supported()) &&
                         !only->spec_tried && only->phase == SeqPhase::PREFILL &&
-                        only->prefill_pos == 0 && spec_eligible(only->req)) {
+                        only->prefill_pos == 0 && only->req.prefill_start == 0 &&
+                        spec_eligible(only->req)) {
                         spec_job = only;
                         // Raised under mu_, which submit_locked also holds: a request submitted from
                         // here on sees it and interrupts; one submitted before made live == 2.
@@ -784,8 +805,11 @@ void ContinuousBatchEngine::worker_loop() {
                     for (const auto& kv : jobs_) {
                         Job* j = kv.second.get();
                         if (j->done) continue;
-                        if (j->spec_tried || j->phase != SeqPhase::PREFILL || j->prefill_pos != 0 ||
-                            !spec_eligible(j->req)) { all_fresh = false; break; }
+                        if (j->spec_tried || j->phase != SeqPhase::PREFILL ||
+                            j->prefill_pos != j->req.prefill_start || !spec_eligible(j->req)) {
+                            all_fresh = false;
+                            break;
+                        }
                         group.push_back(j);
                     }
                     const int lo = spec_group_single() ? 1 : 2;
@@ -1026,6 +1050,7 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
     std::vector<uint64_t> seqs;
     for (size_t off = 0; off < live.size(); off += (size_t)cap) {
         const size_t m = std::min((size_t)cap, live.size() - off);
+        const auto t_chunk = std::chrono::steady_clock::now();
         toks.clear(); pos.clear(); seqs.clear(); out.assign(m, -1);
         for (size_t i = 0; i < m; i++) {
             Job* j = live[off + i];
@@ -1047,6 +1072,10 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
             }
         }
         for (size_t i = 0; i < m; i++) live[off + i]->next_token = out[i];
+        // The speculative group's yardstick (Qwen35Model::plain_decode_ms).
+        if (off == 0 && m == live.size())
+            model_->note_plain_decode((int)m, std::chrono::duration<double, std::milli>(
+                                                  std::chrono::steady_clock::now() - t_chunk).count());
     }
     return true;
 }
@@ -1397,11 +1426,14 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         }
     }
     const int prompt_len = (int)job.req.prompt.size();
+    const auto t_tok = std::chrono::steady_clock::now();
     const int sampled = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
                                            job.req.temperature, job.req.seed,
                                            (uint64_t)job.decode_emitted,
                                            job.req.top_k, job.req.top_p,
                                            job.req.presence_penalty, job.req.frequency_penalty);
+    model_->note_plain_decode(1, std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t_tok).count());
     // Teacher-forced scoring substitutes the caller's token for the sampler's pick. The forward
     // pass above still ran in full, so the KV/GDN state this leaves behind is exactly the state
     // the supplied sequence implies -- which is the whole point: position i+1 is scored under a

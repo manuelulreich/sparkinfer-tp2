@@ -184,7 +184,8 @@ def conversation(c, cid, args, mode, files, sysprompt, rows, lock, t0):
                "new_tokens": pt - last_prompt, "cached_tokens": cached,
                "prefilled": pt - cached, "completion_tokens": ct, "ttft_ms": ttft,
                "generation_ms": gen, "decode_tps": dtps, "speculative_tokens": spec,
-               "finish": d["choices"][0].get("finish_reason"), "t": time.time() - t0}
+               "finish": d["choices"][0].get("finish_reason"), "t": time.time() - t0,
+               "text": text}
         with lock:
             rows.append(row)
             print(f"TURN {mode} conc={args._conc} conv={cid} turn={turn:2d} | prompt={pt:6d} "

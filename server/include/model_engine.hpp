@@ -270,9 +270,10 @@ public:
     // Speculative decoding: load a DSpark draft checkpoint (a directory with config.json and
     // model.safetensors) for the loaded Qwen3.8-27B target. A request that runs alone then decodes
     // speculatively, with the same tokens as ordinary greedy decode; see
-    // ContinuousBatchEngine::enable_speculative. The draft's context is capped by
-    // SPARKINFER_DSPARK_MAX_CTX (default 16384) -- its KV and projection buffers scale with it, and a
-    // request that needs more simply decodes ordinarily. Call after load().
+    // ContinuousBatchEngine::enable_speculative. SPARKINFER_DSPARK_MAX_CTX (default 16384) caps the
+    // prompt rows the draft ingests in one block (its projection buffer scales with it); at tp=2 the
+    // group path speculates at any context (sliding draft KV, windowed attention), while a lone
+    // request on one card needs prompt + max_tokens within it. Call after load().
     bool load_draft(const std::string& dir, std::string& err);
     bool speculative() const;
     struct SpeculativeStats {
