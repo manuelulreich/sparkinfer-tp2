@@ -5,6 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Fixed
+
+- **`usage.decode_tps` included the prefill.** The chat and text completion responses (streamed
+  and not) divided the output tokens by `generation_ms`, which runs from submission, so a long
+  prompt's prefill was counted as decode time: a 16k prompt reported 21 tok/s for a 52 tok/s
+  decode. It now divides by the decode window (`generation_ms - ttft_ms`), as the runtime's own
+  per-request figure always did.
+
+### Benchmarks
+
+- **`bench/scripts/run_benchmarks.sh`**: a prefill and decode ladder against a running server
+  (`--max-context`, default 16384; `--conc`, `--decode-len`, `--reps`). Unique prompts per
+  request (no prefix-cache hits), exact prompt lengths, timings from the server's `usage`.
+
 ### Two-card serving (`--tp 2`)
 
 - **Qwen3.8-27B runs across two 16 GB cards** with tensor parallelism (`--tp 2 --devices 0,1`, or

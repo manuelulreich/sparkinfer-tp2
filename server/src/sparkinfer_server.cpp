@@ -2401,8 +2401,12 @@ int main(int argc, char** argv) {
                                  if (r.ttft_ms >= 0.0 && (ttft_min < 0.0 || r.ttft_ms < ttft_min)) ttft_min = r.ttft_ms;
                                  if (r.generation_ms >= 0.0 && r.generation_ms > gen_max) gen_max = r.generation_ms;
                              }
+                             // Decode rate over the DECODE window only (first token -> last), as the runtime's own
+                             // per-request decode_tps: dividing by generation_ms, which runs from submit, folded the
+                             // prompt's prefill into it (a 16k prompt read 21 tok/s for a 52 tok/s decode).
+                             const double decode_ms_agg = gen_max - (ttft_min > 0.0 ? ttft_min : 0.0);
                              const double decode_tps_agg =
-                                 gen_max > 0.0 ? (double)agg_completion / (gen_max / 1000.0) : -1.0;
+                                 decode_ms_agg > 0.0 ? (double)agg_completion / (decode_ms_agg / 1000.0) : -1.0;
                              if (include_usage)
                                  // prompt_tokens reported ONCE (the shared prompt, not xn) --
                                  // intentionally diverges from g_prompt_tokens_total above, which
@@ -2805,8 +2809,12 @@ int main(int argc, char** argv) {
                      if (r.ttft_ms >= 0.0 && (ttft_min < 0.0 || r.ttft_ms < ttft_min)) ttft_min = r.ttft_ms;
                      if (r.generation_ms >= 0.0 && r.generation_ms > gen_max) gen_max = r.generation_ms;
                  }
+                 // Decode rate over the DECODE window only (first token -> last), as the runtime's own
+                 // per-request decode_tps: dividing by generation_ms, which runs from submit, folded the
+                 // prompt's prefill into it (a 16k prompt read 21 tok/s for a 52 tok/s decode).
+                 const double decode_ms_agg = gen_max - (ttft_min > 0.0 ? ttft_min : 0.0);
                  const double decode_tps_agg =
-                     gen_max > 0.0 ? (double)agg_completion / (gen_max / 1000.0) : -1.0;
+                     decode_ms_agg > 0.0 ? (double)agg_completion / (decode_ms_agg / 1000.0) : -1.0;
 
                  // prompt_tokens reported ONCE (the shared prompt, not xn) -- intentionally
                  // diverges from g_prompt_tokens_total above, which sums real per-branch prefill
@@ -3142,8 +3150,12 @@ int main(int argc, char** argv) {
                                  if (r.ttft_ms >= 0.0 && (ttft_min < 0.0 || r.ttft_ms < ttft_min)) ttft_min = r.ttft_ms;
                                  if (r.generation_ms >= 0.0 && r.generation_ms > gen_max) gen_max = r.generation_ms;
                              }
+                             // Decode rate over the DECODE window only (first token -> last), as the runtime's own
+                             // per-request decode_tps: dividing by generation_ms, which runs from submit, folded the
+                             // prompt's prefill into it (a 16k prompt read 21 tok/s for a 52 tok/s decode).
+                             const double decode_ms_agg = gen_max - (ttft_min > 0.0 ? ttft_min : 0.0);
                              const double decode_tps_agg =
-                                 gen_max > 0.0 ? (double)agg_completion / (gen_max / 1000.0) : -1.0;
+                                 decode_ms_agg > 0.0 ? (double)agg_completion / (decode_ms_agg / 1000.0) : -1.0;
                              if (include_usage)
                                  write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
                                                     (int)agg_completion, ttft_min, gen_max, decode_tps_agg,
@@ -3315,8 +3327,12 @@ int main(int argc, char** argv) {
                      if (r.ttft_ms >= 0.0 && (ttft_min < 0.0 || r.ttft_ms < ttft_min)) ttft_min = r.ttft_ms;
                      if (r.generation_ms >= 0.0 && r.generation_ms > gen_max) gen_max = r.generation_ms;
                  }
+                 // Decode rate over the DECODE window only (first token -> last), as the runtime's own
+                 // per-request decode_tps: dividing by generation_ms, which runs from submit, folded the
+                 // prompt's prefill into it (a 16k prompt read 21 tok/s for a 52 tok/s decode).
+                 const double decode_ms_agg = gen_max - (ttft_min > 0.0 ? ttft_min : 0.0);
                  const double decode_tps_agg =
-                     gen_max > 0.0 ? (double)agg_completion / (gen_max / 1000.0) : -1.0;
+                     decode_ms_agg > 0.0 ? (double)agg_completion / (decode_ms_agg / 1000.0) : -1.0;
 
                  nlohmann::json usage = {
                      {"prompt_tokens", (int)results[0].prompt_tokens},
