@@ -863,6 +863,9 @@ void tp_prefill_allreduce_join();
 int tp_prefill_agree_min(int v);
 // Bitwise-AND twin: each bit is an arm a rank can run; both get the set BOTH can run (tp=1: v).
 int tp_prefill_agree_and(int v);
+// Row-wise argmax over the vocab-split head: each rank passes its half's best value and local
+// index per row (n <= 64); both get the global vocab index (ties to rank 0, the lower half).
+void tp_exchange_argmax(const float* val, const int* idx, int n, int rows_per_rank, int* out);
 
 // f32 twin of tp_prefill_allreduce_bf16 (same rendezvous): the prefill seed's zero-padded
 // [vocab] logits row, summed in place so both ranks hold the full row.

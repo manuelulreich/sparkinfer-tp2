@@ -26,6 +26,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   some full-width prefill buffers and relied on the other card's columns being zero, which held
   only while the reused scratch was fresh. After certain request sequences a 16k prompt scored
   0.19 nats/token worse than on a fresh server. The buffers are now cleared every pass.
+- **A request arriving during a speculative (DSpark) generation waited for all of it.**
+  Submitting takes the device lock, which the speculative loop re-takes every step (and the lock
+  is not fair), while the signal asking the run to yield was raised only after that lock. A
+  request sent 3 s into a 1024-token run started 16 s later. It now interrupts the run first.
 - **At most 8 requests ran at once on hosts with few CPU cores.** The HTTP server used the
   library's default worker pool, max(8, cores - 1), and each in-flight request holds a worker for
   its whole generation, so on a 4-core host the batch engine never saw more than 8 requests. The
@@ -41,6 +45,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 - **tp=2 prefill of prompts whose length is not a multiple of 8** now also runs on the FP4 tensor
   cores (it fell back to int8 conversion): 919 tokens 1,479 → 2,872 tok/s, 1,047 1,699 → 3,438,
   3,074 2,949 → 3,402. Two-card serving only; `SPARKINFER_NVFP4_ANY_M=0/1` overrides.
+- **tp=2 DSpark uses the batched verify from the first token**: the engagement floor (1024
+  positions) encodes the RTX 5090's cost ratio; on two 5060 Ti a target forward is 18.6 ms against
+  23-32 ms for the 8-row verify, so the token-loop fallback below the floor was slower than plain
+  decode. HyperQwen's 8 chat prompts (1024 tokens, greedy): 57.7 → 78 tok/s single stream
+  (plain decode 54). The verify also takes each card's argmax instead of all-reducing the full
+  logits (33.1 → 31.8 ms).
 - **tp=2 concurrent decode is batched across requests**: 54 → 97 / 166 / 217 tok/s aggregate at
   2 / 4 / 8 concurrent greedy requests (1k context; was 54 at every concurrency). One row-batched
   forward serves every request's next token (the DSpark verify's rows path, each row on its own

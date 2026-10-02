@@ -929,6 +929,7 @@ struct Qwen35Model::Impl {
     float *vr_lh = nullptr, *vr_logits = nullptr;
     int *vr_ids = nullptr, *vr_pos = nullptr, *vr_seq = nullptr, *vr_out = nullptr;
     int* h_vr = nullptr;            // pinned [4][R]: ids | positions | seqlens | argmax
+    float* h_vr_maxv = nullptr;     // pinned [R]: each row's local head maximum
     float* vr_snap_lin = nullptr;
     bf16* vr_snap_conv = nullptr;
     // (dual-GPU C1b) FP4 tensor-core staging for the multi-session rows path: one activation
@@ -3667,6 +3668,11 @@ bool Qwen35Model::tp_verify_alloc() {
             s.h_vr = nullptr;
             alloc_ok = false;
         }
+        if (alloc_ok && !s.h_vr_maxv &&
+            cudaMallocHost(&s.h_vr_maxv, (size_t)R * sizeof(float)) != cudaSuccess) {
+            s.h_vr_maxv = nullptr;
+            alloc_ok = false;
+        }
         cudaGetLastError();   // a failed cudaMalloc leaves a sticky-free error in the runtime state
         alloc_ok = tp_prefill_agree_min(alloc_ok ? 1 : 0) != 0;
         if (!alloc_ok) {
@@ -3808,12 +3814,14 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     // longer bit-identical to the same row decoded alone; deterministic mode keeps the dp4a rows.
     // Rows pad to a multiple of 8 (the GEMM's row rule); every scratch buffer holds R rows and
     // rows are independent, so the padding rows compute garbage nobody reads.
-    // SPARKINFER_TP_DECODE_TC=0 disables; _MINROWS (default 8) is the smallest batch that uses it.
+    // SPARKINFER_TP_DECODE_TC=0 disables; _MINROWS (default 4) is the smallest batch that uses it.
     static const bool tc_env = [] {
         const char* e = getenv("SPARKINFER_TP_DECODE_TC"); return !(e && e[0] == '0');
     }();
     static const int tc_min = [] {
-        const char* e = getenv("SPARKINFER_TP_DECODE_TC_MINROWS"); return e ? atoi(e) : 8;
+        // 4: measured at 1k context, aggregate decode C2 93.8 (TC) vs 98.1 (dp4a), C4 173.7 vs
+        // 164.0 -- the crossover sits between 2 and 4 rows.
+        const char* e = getenv("SPARKINFER_TP_DECODE_TC_MINROWS"); return e ? atoi(e) : 4;
     }();
     const int mp = (n + 7) & ~7;
     bool tc = multi && tc_env && n >= tc_min && mp <= R && !deterministic_mode() &&
@@ -4222,6 +4230,30 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
             }
         }
     }
+    // Argmax per rank over its own vocab half, then exchange (value, index) per row on the host.
+    // This used to zero-pad an [n][V] f32 row block, place the half, all-reduce all of it across
+    // the link (8 MB at 8 rows, 32 MB at 32) and argmax the full rows -- the same index, by the
+    // lowest-index rule, for ~1.2 ms of link time per verify. SPARKINFER_TP_HEAD_ALLREDUCE=1
+    // restores it (A/B).
+    static const bool head_ar = [] {
+        const char* e = getenv("SPARKINFER_TP_HEAD_ALLREDUCE"); return e && e[0] == '1';
+    }();
+    if (!head_ar && n <= 64) {
+        kernels::launch_argmax(s.vr_lh, s.vr_out, n, Vr, st);
+        cu(cudaMemcpyAsync(s.h_vr + 3 * R, s.vr_out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+           "tp verify local argmax");
+        cu(cudaStreamSynchronize(st), "tp verify sync");
+        float vals[64];
+        int lidx[64];
+        for (int r = 0; r < n; r++) {
+            lidx[r] = s.h_vr[3 * R + r];
+            cu(cudaMemcpyAsync(&s.h_vr_maxv[r], s.vr_lh + (size_t)r * Vr + lidx[r], sizeof(float),
+                               cudaMemcpyDeviceToHost, st), "tp verify local max");
+        }
+        cu(cudaStreamSynchronize(st), "tp verify sync max");
+        for (int r = 0; r < n; r++) vals[r] = s.h_vr_maxv[r];
+        tp_exchange_argmax(vals, lidx, n, Vr, out_argmax);
+    } else {
     cu(cudaMemsetAsync(s.vr_logits, 0, (size_t)n * V * sizeof(float), st), "tp verify logits zero");
     cu(cudaMemcpy2DAsync(s.vr_logits + (size_t)s.tp_rank * Vr, (size_t)V * sizeof(float),
                          s.vr_lh, (size_t)Vr * sizeof(float), (size_t)Vr * sizeof(float), n,
@@ -4232,6 +4264,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
        "tp verify argmax");
     cu(cudaStreamSynchronize(st), "tp verify sync");
     for (int r = 0; r < n; r++) out_argmax[r] = s.h_vr[3 * R + r];
+    }
 
     if (multi) return n;   // every row is one independent decode step: all kept
     // Accepted prefix: row 0 is always kept (it is the target's own next token); row r is kept
@@ -5002,6 +5035,31 @@ int tp_prefill_agree_min(int v) {
 }
 int tp_prefill_agree_and(int v) {
     return tp_prefill_agree(v, [](int a, int b) { return a & b; });
+}
+
+// (dual-GPU) Row-wise argmax over the vocab-split head without moving the logits: each rank brings
+// its half's best (value, local index) per row; both get the global index. Rank 0 holds the lower
+// vocab half, so it wins ties -- the lowest-index rule an argmax over the concatenated row applies.
+// Host exchange through the same two-way rendezvous as tp_prefill_agree. Not tp: local result.
+static float g_tp_amax_val[2][64];
+static int g_tp_amax_idx[2][64];
+void tp_exchange_argmax(const float* val, const int* idx, int n, int rows_per_rank, int* out) {
+    const int r = tp_prefill_rank();
+    if (r < 0 || n > 64) { for (int i = 0; i < n; i++) out[i] = idx[i]; return; }
+    for (int i = 0; i < n; i++) { g_tp_amax_val[r][i] = val[i]; g_tp_amax_idx[r][i] = idx[i]; }
+    auto combine = [&] {
+        for (int i = 0; i < n; i++)
+            g_tp_amax_idx[0][i] = (g_tp_amax_val[0][i] >= g_tp_amax_val[1][i] ||
+                                   g_tp_amax_val[1][i] != g_tp_amax_val[1][i])   // NaN on rank 1
+                                      ? g_tp_amax_idx[0][i]
+                                      : g_tp_amax_idx[1][i] + rows_per_rank;
+    };
+    if (r != 0) tp_peer_rendezvous("argmax exchange");
+    else tp_leader_rendezvous("argmax exchange", combine);
+    for (int i = 0; i < n; i++) out[i] = g_tp_amax_idx[0][i];
+    // The peer reads slot 0 after the leader's post; hold the leader until it has, so the next
+    // exchange cannot overwrite slot 0 under it.
+    tp_prefill_agree_min(0);
 }
 
 void tp_prefill_allreduce_f32(float* in_out, size_t elems) {
@@ -6958,10 +7016,16 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // settles at tau 2.19, below the engage threshold, but a transient run of full blocks early in
     // the stream pushes it over and alpha 1/8 then takes ~8 steps to decay. A floor cannot be
     // spoofed by a transient, and it costs 4k nothing because 4k clears it from the first step.
-    static const int kEngageMinSeq = []{
+    // tp=2: no floor. The trade it encodes is the RTX 5090's, where a target forward is cheap next
+    // to a batched verify; on two 5060 Ti a forward is 18.6 ms against 23-32 ms for the verify, so
+    // batching pays from tau ~1.5 and the token loop between 384 and 1024 positions was pure
+    // loss (it ran ~640 of every 1024 tokens of a chat answer). Measured on HyperQwen's 8 chat
+    // prompts, 1024 tokens, greedy: 57.7 -> 79.2 tok/s. The acceptance EMA still decides above it.
+    static const int kEngageMinSeqEnv = []{
         const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_MINSEQ");
-        return e ? atoi(e) : 1024;
+        return e ? atoi(e) : -1;
     }();
+    const int kEngageMinSeq = kEngageMinSeqEnv >= 0 ? kEngageMinSeqEnv : (tp_active() ? 0 : 1024);
 
     // Speculating is a strict LOSS wherever the batched verify cannot engage.
     //

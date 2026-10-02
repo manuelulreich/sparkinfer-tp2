@@ -538,6 +538,15 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         //
         // Ordering is mu_ (held by our caller) then device_mutex(). The worker takes only
         // device_mutex() and never mu_ while stepping, so there is no cycle.
+        //
+        // A speculative run holds device_mutex() for each step and re-takes it straight away, and
+        // the mutex is not fair, so this lock used to wait out the WHOLE speculative generation --
+        // and the interrupt that makes the run yield was only raised further down, after the
+        // lock. Measured at tp=2: a request sent 3 s into a 1024-token DSpark run waited 16 s and
+        // started only when the run had finished. Raise the interrupt first, so the run hands
+        // over at its next step boundary and releases the device to this submission.
+        if (spec_running_.load(std::memory_order_relaxed))
+            spec_interrupt_.store(true, std::memory_order_relaxed);
         std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
         if (job.req.use_prefix_session) {
             seq_id = 0;
