@@ -103,6 +103,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 DSpark: prompt lookup.** Each speculative step looks up the session's last 6-12 tokens
+  in its prompt and output; on a match the continuation replaces the draft's tokens, and while a
+  copy is running (the last step landed every row and the lookup had the token after them) the
+  step verifies the draft block's full 7 rows from the lookup instead of the usual depth (2 from
+  12k of context). A file rewritten with a small edit, greedy, 2x RTX 5060 Ti: 189 -> 224 tok/s
+  at 1.7k of context, 113 -> 203 tok/s behind a 14k prefix; output byte-identical, prose and
+  the gate prompts unchanged. `SPARKINFER_NGRAM=0` turns it off.
 - **tp=2 DSpark: sampled requests speculate** (temperature > 0, `top_k` 1-64, the defaults
   opencode gets from `generation_config.json`). Each verified token is drawn exactly as decode
   draws it -- the same top-k/top-p mask and the same seeded Gumbel noise per step, from the exact

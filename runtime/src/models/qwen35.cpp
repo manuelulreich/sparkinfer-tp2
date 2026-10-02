@@ -8698,6 +8698,34 @@ bool Qwen35Model::spec_group_supported() const {
     return p_->dflash_draft && tp_active() && p_->tp_rank == 0 && p_->cfg.hybrid;
 }
 
+namespace {
+// Prompt lookup (plan 06, N): the most recent occurrence of the longest suffix (nmin..nmax
+// tokens) of h[0, len) that ends before the suffix does, and the k tokens that followed it into
+// out[]. The occurrence may overlap the suffix: a period-p repetition (a list marker, an indent)
+// matches p back, and its continuation repeats with that period past the end of the history.
+// Returns the match length (0: none).
+int ngram_lookup(const int* h, int len, int nmin, int nmax, int k, int* out) {
+    if (len < nmin + 1) return 0;
+    const int last = len - 1;
+    int best = 0, best_end = -1;
+    for (int e = last - 1; e >= nmin - 1; e--) {
+        if (h[e] != h[last]) continue;
+        int m = 1;
+        while (m < nmax && e - m >= 0 && h[e - m] == h[last - m]) m++;
+        if (m >= nmin && m > best) {
+            best = m;
+            best_end = e;
+            if (m == nmax) break;   // scanning backwards: the most recent of the longest
+        }
+    }
+    if (best == 0) return 0;
+    const int period = last - best_end;
+    for (int i = 0; i < k; i++)
+        out[i] = best_end + 1 + i < len ? h[best_end + 1 + i] : out[i - period];
+    return best;
+}
+}  // namespace
+
 // (dual-GPU C2) Speculative decoding of several engine sessions at once. Every step drafts each
 // session in turn on its own draft KV state (the draft is ~3 ms a block), then verifies all
 // blocks in ONE segmented tp pass (spec_group_verify): the weights stream once for every
@@ -8748,6 +8776,27 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         const char* e = getenv("SPARKINFER_SPEC_GROUP_MIN_GAIN");
         return e ? std::max(0.0, atof(e)) : 1.0;
     }();
+    // Prompt lookup (plan 06, N; HyperQwen's lookup-augmented drafting). Each step, a session
+    // whose last tokens (SPARKINFER_NGRAM_NMIN..NMAX, default 6..12) occurred earlier in its
+    // prompt or output takes what followed them in place of the draft's tokens. While a copy is
+    // running -- the previous step accepted every row and agreed with the lookup -- the step
+    // verifies the block's full B rows from the lookup instead of depth_for's depth (2 from
+    // 12288 on, 4 for several sessions): a copied file or quoted tool output lands up to 8
+    // tokens a step there. A step's depth is shared, so it goes long only when every session
+    // has a running copy. SPARKINFER_NGRAM=0 turns it off.
+    static const bool kNgram = [] {
+        const char* e = getenv("SPARKINFER_NGRAM");
+        return !e || atoi(e) != 0;
+    }();
+    static const int kNgramMin = [] {
+        const char* e = getenv("SPARKINFER_NGRAM_NMIN");
+        return e ? std::max(2, atoi(e)) : 6;
+    }();
+    static const int kNgramMax = [] {
+        const char* e = getenv("SPARKINFER_NGRAM_NMAX");
+        return e ? std::max(kNgramMin, atoi(e)) : std::max(kNgramMin, 12);
+    }();
+    long ng_steps = 0, ng_long_steps = 0, ng_long_tokens = 0;
     constexpr int kGainWindow = 32;
     double gain_won[kGainWindow] = {}, gain_cost[kGainWindow] = {};
     long gain_steps = 0;
@@ -8769,6 +8818,10 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         int th_len = 0;          // rows of `cap` the next draft ingests
         bool predrafted = false; // block[1..] already holds the join's first draft
         std::vector<int> block, out, draft_out;
+        std::vector<int> hist;   // prompt + out: what the lookup searches
+        std::vector<int> lk;     // this step's lookup continuation (B tokens)
+        int lk_len = 0;          // its match length (0: none)
+        bool lk_run = false;     // the last step accepted every row and the lookup agreed
         bool done = false;
     };
     std::vector<G> gs;
@@ -8947,6 +9000,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         }
         g.start = g.n;
         g.next = next;
+        if (kNgram) g.hist.assign(prompt.begin(), prompt.end());
         g.block.assign(B + 1, mask_id);
         g.block[0] = next;
         draft.kv_state_select(g.state);
@@ -9063,8 +9117,23 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         int ctx_max = 0;
         for (G* g : act) ctx_max = std::max(ctx_max, g->start);
         const int D = depth_for(S, ctx_max);
-        const int T = D + 1;
         if (D < 1) break;
+        // The lookup runs on the host against prompt + output + the pending token (tens of
+        // microseconds at 50k); the deep block needs every session's copy running.
+        int Dv = D;
+        if (kNgram) {
+            int deep = std::min(B, R / S - 1);
+            for (G* g : act) {
+                g->lk.assign(B, 0);
+                g->hist.push_back(g->next);
+                g->lk_len = ngram_lookup(g->hist.data(), (int)g->hist.size(), kNgramMin,
+                                         kNgramMax, B, g->lk.data());
+                g->hist.pop_back();
+                if (!(g->lk_len > 0 && g->lk_run)) deep = D;
+            }
+            Dv = std::max(D, deep);
+        }
+        const int T = Dv + 1;
         const auto t_step = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::recursive_mutex> lk(s.device_mu);
@@ -9094,6 +9163,14 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                     for (int i = 1; i <= D; i++) g->block[i] = g->draft_out[i];
             if (kTiming) t_draft += ms_since(_td);
             if (draft_failed) { fprintf(stderr, "[spec-group] draft failed\n"); break; }
+            if (kNgram) {
+                for (G* g : act)
+                    if (g->lk_len > 0) {
+                        ng_steps++;
+                        for (int i = 1; i <= Dv; i++) g->block[i] = g->lk[i - 1];
+                    }
+                if (Dv > D) ng_long_steps++;
+            }
             const int n = S * T;
             ids.assign(n, 0); pos.assign(n, 0); seq.assign(n, 0); argmax.assign(n, 0);
             keep.assign(S, 1); caps.assign(S, nullptr);
@@ -9156,6 +9233,12 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                     if ((int)g.out.size() < g.job->max_new) g.out.push_back(g.next);
                     eos_next = true;
                 }
+            }
+            if (kNgram) {
+                g.hist.insert(g.hist.end(), g.out.begin() + before, g.out.end());
+                // A running copy: every row landed, and the lookup also had the token after them.
+                g.lk_run = g.lk_len > 0 && kp == T && (Dv >= B || g.next == g.lk[Dv]);
+                if (Dv > D) ng_long_tokens += kp;
             }
             bool stopped = false;
             if (g.out.size() > before &&
@@ -9227,6 +9310,10 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         fprintf(stderr, "[spec-group] steps=%ld sessions/step=%.2f mean_accept=%.3f | draft %.2f "
                         "ms/step | verify %.2f ms/step\n", steps, (double)seg_steps / steps,
                 accept_sum / seg_steps, t_draft / steps, t_verify / steps);
+    if (kTiming && kNgram && steps > 0)
+        fprintf(stderr, "[spec-group] lookup: %ld of %ld session-steps matched; %ld deep steps "
+                        "committed %.2f tokens each\n", ng_steps, seg_steps,
+                ng_long_steps, ng_long_steps ? (double)ng_long_tokens / ng_long_steps : 0.0);
 }
 
 // ----- weight loading from a sparkinfer weight directory -----

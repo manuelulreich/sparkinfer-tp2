@@ -288,6 +288,8 @@ The target's hidden states at the capture layers are already identical on both c
 
 Prompt-lookup drafting: when the last few tokens appeared earlier in the conversation, propose what followed them. Agent traffic repeats a lot: file contents read back, tool output quoted, code edits that keep most lines. HyperQwen runs it beside its DFlash drafter.
 
+**Status: N1-N3 in part (2026-10-02).** Done as HyperQwen does it (lookup-augmented drafting) rather than a hash index: a host scan per step for the most recent occurrence of the longest 6..12-token suffix (overlaps allowed, so a period repeats past the end of the history). A match replaces the draft's tokens. While a copy is running -- the previous step landed every row and the lookup also had the token after them; HyperQwen measured match length alone to be a poor predictor -- the step verifies B = 7 lookup tokens instead of depth_for's depth; a step's depth is shared, so only when every session has a running copy. The drafter still drafts and ingests every step. Measured, greedy, copy of a 150-line file with a rename: 189 -> 224 tok/s at 1.7k context (depth 6 -> 7), 113 -> 203 tok/s behind a 14k prefix (depth 2 -> 7), 7.96-8.00 tokens a deep step; byte-identical; story and A* unchanged; gates pass. Not done: blocks past B + 1 = 8 rows (HyperQwen verifies 15 while copying; needs the capture buffer, the draft's ingest past 8 rows and the draft KV slack sized for it), N4 (lookup without the drafter), N5's multi-turn and cohort runs.
+
 ### Steps
 
 **N1. Proposer.**
