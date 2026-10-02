@@ -63,10 +63,12 @@ class Client:
         d["_wall_s"] = time.time() - t
         return d
 
-    def chat(self, content, max_tokens):
+    def chat(self, content, max_tokens, sampled=False):
         t = time.time()
-        d = self._req("/v1/chat/completions", {"messages": [{"role": "user", "content": content}],
-                                               "max_tokens": max_tokens, "temperature": 0})
+        body = {"messages": [{"role": "user", "content": content}], "max_tokens": max_tokens}
+        if not sampled:
+            body["temperature"] = 0
+        d = self._req("/v1/chat/completions", body)
         d["_wall_s"] = time.time() - t
         return d
 
@@ -122,6 +124,9 @@ def main():
                          "chat requests, greedy, --cohort-len tokens each, run at every --conc "
                          "level instead of the prefill/decode ladder (HyperQwen's cohort test)")
     ap.add_argument("--cohort-len", type=int, default=1024)
+    ap.add_argument("--sampled", action="store_true",
+                    help="cohort requests leave temperature/top_k/top_p to the server's defaults "
+                         "(generation_config: what opencode gets, and HyperQwen's sampled numbers)")
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED_BASE", "1000")))
     ap.add_argument("--out", default="bench_results.jsonl")
     a = ap.parse_args()
@@ -164,7 +169,7 @@ def main():
             s0 = c.metric("sparkinfer_speculative_runs_total")
             res, wall = [], 0.0
             for i in range(0, len(cprompts), C):
-                r, w = run_parallel(lambda p: c.chat(p, a.cohort_len), [(p,) for p in cprompts[i:i + C]])
+                r, w = run_parallel(lambda p: c.chat(p, a.cohort_len, a.sampled), [(p,) for p in cprompts[i:i + C]])
                 res += r; wall += w
             s1 = c.metric("sparkinfer_speculative_runs_total")
             for d in res: log("cohort", a.cohort_len, C, d)
