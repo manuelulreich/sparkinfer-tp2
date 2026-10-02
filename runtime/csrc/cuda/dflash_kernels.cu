@@ -1205,7 +1205,7 @@ __global__ void k_gemv_batched_fused3_q4_dp4a(
         const unsigned char* __restrict__ Q2,
         const __half2* __restrict__ D0, const __half2* __restrict__ D1, const __half2* __restrict__ D2,
         bf16* __restrict__ y0, bf16* __restrict__ y1, bf16* __restrict__ y2,
-        int N0, int N1, int N2, int K) {
+        int N0, int N1, int N2, int K, int nb = BATCH) {
     __shared__ float red[KSPLIT][ROWS][BATCH];
     const int total = N0 + N1 + N2;
     const int warp = threadIdx.x >> 5;
@@ -1245,6 +1245,7 @@ __global__ void k_gemv_batched_fused3_q4_dp4a(
             }
 #pragma unroll
             for (int b = 0; b < BATCH; b++) {
+                if (b >= nb) break;   // a partial batch (the multi-session draft's last chunk)
                 const si_q81_blk* xb = xq + (size_t)b * KB + kb;
                 const float2 dsf = __half22float2(xb->ds);
                 // FOUR-byte loads, not uint4: a q8_1 block is 36 bytes with ds first, so qs sits at
@@ -1281,7 +1282,7 @@ __global__ void k_gemv_batched_fused3_q4_dp4a(
         __syncthreads();
         if (warp == 0 && lane < ROWS * BATCH) {
             const int r = lane / BATCH, b = lane % BATCH;
-            if (r < nr) {
+            if (r < nr && b < nb) {
                 float o = 0.f;
 #pragma unroll
                 for (int w = 0; w < KSPLIT; w++) o += red[w][r][b];
@@ -1410,6 +1411,39 @@ void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
     else if (batch == 7) SI_DP4A_F3(7);
     else                 SI_DP4A_F3(8);
 #undef SI_DP4A_F3
+}
+
+// Any row count (the multi-session draft: sessions x block width): chunks of 16 rows on a
+// 16-row instantiation (2 weight rows per warp group, so the accumulators stay in registers), the
+// weights streamed once per chunk instead of once per session. A row count of 8 or less takes the
+// exact-width launcher above unchanged.
+void launch_gemv_batched_q4_dp4a_fused3_rows(const void* xq81,
+                                             const void* Q0, const void* Q1, const void* Q2,
+                                             const void* D0, const void* D1, const void* D2,
+                                             void* y0, void* y1, void* y2,
+                                             int N0, int N1, int N2, int K, cudaStream_t stream,
+                                             int rows) {
+    if (rows <= 8) {
+        launch_gemv_batched_q4_dp4a_fused3(xq81, Q0, Q1, Q2, D0, D1, D2, y0, y1, y2, N0, N1, N2,
+                                           K, stream, rows);
+        return;
+    }
+    const int total = N0 + N1 + N2;
+    if (total <= 0 || (K & 31)) return;
+    constexpr int ROWS = 2, KS = 2, BATCH = 16;
+    const int nblk = (total + ROWS - 1) / ROWS;
+    const auto* xp = reinterpret_cast<const si_q81_blk*>(xq81);
+    const size_t xrow = (size_t)(K / 32);
+    for (int r0 = 0; r0 < rows; r0 += BATCH) {
+        const int nb = rows - r0 < BATCH ? rows - r0 : BATCH;
+        auto off = [&](void* y, int N) -> bf16* {
+            return y ? (bf16*)y + (size_t)r0 * N : nullptr;
+        };
+        k_gemv_batched_fused3_q4_dp4a<BATCH, ROWS, KS><<<dim3(nblk), dim3(KS * 32), 0, stream>>>(
+            xp + (size_t)r0 * xrow, (const unsigned char*)Q0, (const unsigned char*)Q1,
+            (const unsigned char*)Q2, (const __half2*)D0, (const __half2*)D1, (const __half2*)D2,
+            off(y0, N0), off(y1, N1), off(y2, N2), N0, N1, N2, K, nb);
+    }
 }
 
 void launch_gemv_batched_q4_fused3(const void* x,

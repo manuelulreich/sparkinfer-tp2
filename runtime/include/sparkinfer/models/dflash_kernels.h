@@ -95,6 +95,13 @@ void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
                                         void* y0, void* y1, void* y2,
                                         int N0, int N1, int N2, int K, cudaStream_t stream,
                                         int batch);
+// Any row count (chunks of 16): the multi-session draft's projections.
+void launch_gemv_batched_q4_dp4a_fused3_rows(const void* xq81,
+                                             const void* Q0, const void* Q1, const void* Q2,
+                                             const void* D0, const void* D1, const void* D2,
+                                             void* y0, void* y1, void* y2,
+                                             int N0, int N1, int N2, int K, cudaStream_t stream,
+                                             int rows);
 void launch_gemv_batched_q4_fused3(const void* x,
                                    const void* Q0, const void* Q1, const void* Q2,
                                    const void* D0, const void* D1, const void* D2,

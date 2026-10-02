@@ -120,6 +120,19 @@ public:
                        int proposals = 0, float* out_confidence = nullptr,
                        int target_hidden_start = 0);
 
+    // (dual-GPU) One block for each of n sessions (each on its own kv_state), projections and
+    // head batched across them; falls back to forward_block per session where it cannot.
+    struct DraftSeg {
+        int state = -1;
+        const void* target_hidden = nullptr;
+        int ctx_len = 0;
+        int target_hidden_start = 0;
+        const int* ids = nullptr;   // [block_size]
+        int pos0 = 0;
+        int* out_argmax = nullptr;  // [block_size + 1]; [1..proposals] written
+    };
+    bool forward_blocks(int n, const DraftSeg* seg, int proposals, cudaStream_t stream = nullptr);
+
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.
     const float* last_logits() const;

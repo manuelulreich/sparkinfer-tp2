@@ -8561,7 +8561,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         bf16* cap = nullptr;     // [B + 1][n_cap * H] capture rows of the last verify
         int th_len = 0;          // rows of `cap` the next draft ingests
         bool predrafted = false; // block[1..] already holds the join's first draft
-        std::vector<int> block, out;
+        std::vector<int> block, out, draft_out;
         bool done = false;
     };
     std::vector<G> gs;
@@ -8726,19 +8726,29 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         {
             std::lock_guard<std::recursive_mutex> lk(s.device_mu);
             auto _td = std::chrono::steady_clock::now();
-            bool draft_failed = false;
+            // Every session that needs a block drafts in ONE batched draft pass.
+            std::vector<DFlashDraftModel::DraftSeg> dsegs;
+            std::vector<G*> dg;
             for (G* g : act) {
                 if (g->predrafted) { g->predrafted = false; continue; }
                 g->block.assign(B + 1, mask_id);
                 g->block[0] = g->next;
-                draft.kv_state_select(g->state);
-                if (!draft.forward_block(g->cap, g->th_len, g->block.data(), g->start,
-                                         draft_ids.data(), nullptr, D, nullptr, 0)) {
-                    draft_failed = true;
-                    break;
-                }
-                for (int i = 1; i <= D; i++) g->block[i] = draft_ids[i];
+                g->draft_out.assign(B + 1, 0);
+                DFlashDraftModel::DraftSeg ds;
+                ds.state = g->state;
+                ds.target_hidden = g->cap;
+                ds.ctx_len = g->th_len;
+                ds.ids = g->block.data();
+                ds.pos0 = g->start;
+                ds.out_argmax = g->draft_out.data();
+                dsegs.push_back(ds);
+                dg.push_back(g);
             }
+            bool draft_failed = !dsegs.empty() &&
+                                !draft.forward_blocks((int)dsegs.size(), dsegs.data(), D);
+            if (!draft_failed)
+                for (G* g : dg)
+                    for (int i = 1; i <= D; i++) g->block[i] = g->draft_out[i];
             if (kTiming) t_draft += ms_since(_td);
             if (draft_failed) { fprintf(stderr, "[spec-group] draft failed\n"); break; }
             const int n = S * T;

@@ -92,6 +92,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 group speculation drafts every session in one batched draft pass**
+  (`DFlashDraftModel::forward_blocks`): one embedding, fc and per-layer projection pass over all
+  sessions' rows (16-row q4 GEMV tiles), per-session KV append and attention, one head pass.
+  Proposals are the per-session draft's (same acceptance). Draft GPU time at 4 concurrent
+  requests 8.4 -> 6.9 ms per step; the wall-clock draft only 5% shorter (the pass is now
+  launch-bound). End to end, HyperQwen cohort, 512 tokens, two alternated runs per arm, e2e tok/s:
+  C2 148.2 vs 139.7, C4 208.0 vs 207.9. `SPARKINFER_DFLASH_MULTI=0` drafts one session at a time.
+
 - **Multi-step GDN kernels for the speculative group verify**: the conv and the recurrence walk
   all of a session's verify positions in ONE launch per layer with the state on chip, read-only;
   after acceptance a commit pass advances each session by exactly its accepted steps. No GDN
