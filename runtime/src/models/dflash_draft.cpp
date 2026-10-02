@@ -48,7 +48,10 @@ inline void cu(cudaError_t e, const char* what) {
     const bool fatal = note_cuda_error(e);
     static std::atomic<int> logged{0};
     const int n = logged.fetch_add(1, std::memory_order_relaxed);
-    if (n < 20 || fatal)
+    // Fatal lines print too, but only the first few: once the context is gone every call in
+    // flight fails the same way, and a stress run wrote 2.4 GB of them before it drained.
+    static std::atomic<int> fatal_logged{0};
+    if (n < 20 || (fatal && fatal_logged.fetch_add(1, std::memory_order_relaxed) < 8))
         fprintf(stderr, "[dflash] %s: %s%s\n", what, cudaGetErrorString(e),
                 fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
     else if (n == 20)
@@ -401,11 +404,15 @@ struct DFlashDraftModel::Impl {
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
     int seq_len = 0;
+    // First position the cache holds: > 0 when the context was ingested from a truncated capture
+    // (target_hidden_start > 0). The full-attention layer must then stay windowed for the rest of
+    // the generation -- positions below it were never computed.
+    int ctx_lo = 0;
     int kv_cap = 0;   // positions k_cache/v_cache hold (cfg.max_seq for the built-in cache)
     // (dual-GPU) Extra KV caches, one per concurrently drafted session (kv_state_*). The active
     // cache is always the one in k_cache/v_cache/seq_len/kv_cap; a state's slot holds it while
     // it is not selected. Slot -1 is the built-in cache.
-    struct KvState { std::vector<bf16*> k, v; int seq_len = 0; int cap = 0; bool live = false; };
+    struct KvState { std::vector<bf16*> k, v; int seq_len = 0; int cap = 0; int ctx_lo = 0; bool live = false; };
     std::vector<KvState> kv_states;
     KvState kv_default;
     int kv_cur = -1;
@@ -424,13 +431,16 @@ struct DFlashDraftModel::Impl {
     bool quant_ready = false;
 
     bool quant_failed = false;   // a quantized copy could not be allocated (device memory)
-    void ensure_quant() {
-        if (quant_ready) return;
+    void quant_pending() {
         for (auto& pq : pending_quant) {
             *pq.dst = make_q8(pq.w, pq.N, pq.K);
             if (!(pq.dst->q4 && pq.dst->dm) && !(pq.dst->q && pq.dst->s)) quant_failed = true;
         }
         pending_quant.clear();
+    }
+    void ensure_quant() {
+        if (quant_ready) return;
+        quant_pending();
         quant_ready = true;
         release_unused_bf16();
     }
@@ -443,7 +453,8 @@ struct DFlashDraftModel::Impl {
     // shares card 0 with half the target, and holding them starved the prefill arena and the
     // draft's own capture buffer. Not when SPARKINFER_DFLASH_BLOCK_WIDTH forces a width (the
     // fallback could then run), nor with SPARKINFER_DFLASH_KEEP_BF16=1 (A/B).
-    void release_unused_bf16() {
+    size_t bf16_freed = 0;   // bf16 bytes released so far (cfg.eager_quant releases per layer)
+    void release_unused_bf16(bool report = true) {
         static const bool keep = [] {
             const char* e = getenv("SPARKINFER_DFLASH_KEEP_BF16");
             const char* w = getenv("SPARKINFER_DFLASH_BLOCK_WIDTH");
@@ -455,8 +466,8 @@ struct DFlashDraftModel::Impl {
         const size_t qd = (size_t)cfg.n_q_heads * cfg.head_dim, H = cfg.hidden,
                      I = cfg.intermediate;
         for (auto& lw : layers) {
-            if (!(has(lw.q8_wq) && has(lw.q8_wo) && has(lw.q8_gate) && has(lw.q8_up) &&
-                  has(lw.q8_down)))
+            if (!lw.wq || !(has(lw.q8_wq) && has(lw.q8_wo) && has(lw.q8_gate) && has(lw.q8_up) &&
+                            has(lw.q8_down)))
                 continue;
             release(lw.wq); lw.wq = nullptr;
             release(lw.wo); lw.wo = nullptr;
@@ -465,20 +476,35 @@ struct DFlashDraftModel::Impl {
             release(lw.down); lw.down = nullptr;
             freed += (2 * qd * H + 3 * I * H) * sizeof(bf16);
         }
-        if (freed)
+        bf16_freed += freed;
+        if (report && bf16_freed)
             fprintf(stderr, "[dflash] released the bf16 q/o/gate/up/down copies (%.2f GB): the "
-                            "quantized mirrors serve every block width in use\n", freed / 1e9);
+                            "quantized mirrors serve every block width in use\n", bf16_freed / 1e9);
     }
 
+    // A copy that could not be allocated comes back empty (the caller then reports quant_failed)
+    // and its kernel is not launched: quantizing into a null buffer was an illegal address, which
+    // lost the context on a card too full for the draft -- and so the whole server, where the
+    // load check would have declined speculative decoding cleanly a moment later.
     Q8W make_q8(bf16* w, int N, int K) {
         Q8W o;
         if (draft_w_bits() == 4) {
             o.q4 = alloc<unsigned char>((size_t)N * (K / 2));
             o.dm = alloc<short>((size_t)N * (K / 32) * 2);   // __half2 per 32-weight block
+            if (!(o.q4 && o.dm)) {
+                release(o.q4); release(o.dm);
+                cudaGetLastError();
+                return Q8W{};
+            }
             dflash_kernels::launch_quantize_w_q4(w, o.q4, o.dm, N, K, stream);
         } else {
             o.q = alloc<signed char>((size_t)N * K);
             o.s = alloc<float>((size_t)N * (K / 32));
+            if (!(o.q && o.s)) {
+                release(o.q); release(o.s);
+                cudaGetLastError();
+                return Q8W{};
+            }
             dflash_kernels::launch_quantize_w_q8(w, o.q, o.s, N, K, stream);
         }
         cudaStreamSynchronize(stream);
@@ -732,7 +758,7 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
     }
 }
 
-void DFlashDraftModel::reset() { p_->seq_len = 0; }
+void DFlashDraftModel::reset() { p_->seq_len = 0; p_->ctx_lo = 0; }
 
 
 void DFlashDraftModel::crop(int keep) {
@@ -780,11 +806,13 @@ bool DFlashDraftModel::kv_state_select(int id) {
     out.k.swap(s.k_cache);
     out.v.swap(s.v_cache);
     out.seq_len = s.seq_len;
+    out.ctx_lo = s.ctx_lo;
     out.cap = s.kv_cap;
     Impl::KvState& in = id < 0 ? s.kv_default : s.kv_states[id];
     s.k_cache.swap(in.k);
     s.v_cache.swap(in.v);
     s.seq_len = in.seq_len;
+    s.ctx_lo = in.ctx_lo;
     s.kv_cap = in.cap;
     s.kv_cur = id;
     return true;
@@ -958,6 +986,14 @@ bool DFlashDraftModel::load(const std::string& dir) {
             s.pending_quant.push_back({lw.gate, I,   H,  &lw.q8_gate});
             s.pending_quant.push_back({lw.up,   I,   H,  &lw.q8_up});
             s.pending_quant.push_back({lw.down, H,   I,  &lw.q8_down});
+            if (s.cfg.eager_quant) {
+                s.quant_pending();
+                if (s.quant_failed) {
+                    fprintf(stderr, "[dflash] quantized copies of layer %d do not fit\n", L);
+                    return false;
+                }
+                s.release_unused_bf16(false);
+            }
         }
     }
 
@@ -1447,7 +1483,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // that. So a single threshold now covers everything from 12288 up.
         if (total_ctx >= kMidCtxMinSeq)
             kFullWindow = total_ctx < kMidCtxMaxSeq ? kMidCtxWindow : kLongCtxWindow;
+        // A truncated capture (the tp group path keeps a prompt's last 4096 rows) windows the
+        // full-attention layer at any length: rows below ctx_lo were never ingested. 2048 is the
+        // window both measured bands above settled on.
+        else if (std::max(s.ctx_lo, past == 0 ? target_hidden_start : 0) > 0)
+            kFullWindow = kMidCtxWindow;
     }
+    if (past == 0 && target_hidden_start > 0) s.ctx_lo = target_hidden_start;
     // fc trim: once the full-attn layer is windowed, NO layer reads target_proj older than the
     // largest window across layers, so project only that tail. Uses the same attn_gqa_kv_lo bound
     // the per-layer ingestion (#752) applies, at the LARGEST window -> surviving rows byte-identical,

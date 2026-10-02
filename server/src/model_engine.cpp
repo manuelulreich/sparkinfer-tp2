@@ -1292,6 +1292,11 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     const char* e = getenv("SPARKINFER_DSPARK_MAX_CTX");
     sparkinfer::DFlashDraftConfig dcfg;
     dcfg.max_seq = std::min(impl_->cfg.max_seq, e ? std::max(1024, atoi(e)) : 16384);
+    // At tp>1 the quantized copies are built right below anyway; building them per layer during
+    // the load keeps its peak near the steady state on the draft's card (the bf16 copies of every
+    // layer were all resident at once before, ~2.5 GB on DSpark, and that peak -- not the ~2 GB
+    // the draft holds afterwards -- was what capped --ctx).
+    dcfg.eager_quant = !impl_->tp_models.empty();
     auto draft = std::make_unique<sparkinfer::DFlashDraftModel>(dcfg);
     if (!draft->load(dir)) {
         // The usual cause is device memory, not the checkpoint: the target's KV pool is sized for

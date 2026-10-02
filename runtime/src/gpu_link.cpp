@@ -62,6 +62,7 @@
 
 #include "sparkinfer/gpu_link.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -488,6 +489,11 @@ size_t GpuLink::max_bytes() const { return impl_ ? impl_->max_bytes : 0; }
 bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype, bool is_max) {
   const char* op = is_max ? "maxreduce" : "allreduce";
   auto fail = [&](const char* why, cudaError_t e) -> bool {
+    // Rate-limited: after a lost context every op fails here, once per layer per step.
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n == 20) GLINK_LOG("[gpu_link] (further op failures suppressed)\n");
+    if (n >= 20) return false;
     if (e == cudaSuccess)
       GLINK_LOG("[gpu_link] %s: %s\n", op, why);
     else

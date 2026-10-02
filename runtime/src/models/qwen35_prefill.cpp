@@ -631,6 +631,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // o_proj below is not stream-capturable, so a tp pass must neither capture nor replay the
     // static prefill graph (one-shot note).
     const bool tp_active = s.gdn_window.v_count > 0;
+    bool tp_side_ok = true;
     if (tp_active) {
         static bool tp_prefill_eager_noted = false;
         if (!tp_prefill_eager_noted) {
@@ -638,6 +639,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             fprintf(stderr, "[tp] tp=2 prefill is EAGER-only (the o_proj all-reduce is not "
                             "stream-capturable; graph capture/replay bypassed)\n");
         }
+        // The one-shot GDN conv repad (a few MB, kept for the process) is taken here, before the
+        // scratch arena sizes itself against what is free: primed after it, on a card the arena
+        // had filled, its allocation failed and the copy into the null buffer lost the context.
+        gdn_conv_repad_prime(s, c, st);
+        // Same for the async all-reduce's side stream and events. Not fatal here: a rank without
+        // them falls back below, where the arena check agrees the decline with the other rank.
+        tp_side_ok = tp_prefill_ar_side_prepare();
     }
     const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash && pos0 == 0 &&
                           !multi && !tp_active;
@@ -1047,6 +1055,27 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         for (size_t i = 0; i < dbg_pos.size(); i++)
             if (dbg_pos[i] == pos0) { dbg_pos.erase(dbg_pos.begin() + i); a.ok = false; break; }
     }
+    // fp8/nvfp4 KV: the attention's bf16 history plane is taken here too, with the arena, so it
+    // cannot fail on one rank alone mid-pass (see kernels::prefill_kvq_reserve). Sized for all
+    // KV heads: the attention launch below passes the rank's share only on the tp wide branch.
+    if (a.ok && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer &&
+        !kernels::prefill_kvq_reserve(pos0 + N, c.n_kv_heads, c.head_dim, s.kv->block_size()))
+        a.ok = false;
+    // Headroom: the arena used to take the card down to a few MB, and whatever the pass or the
+    // engine allocated next -- a session's state, the draft's capture rows, a CUDA stream --
+    // failed on that card alone, mid-pass (at tp=2 the ranks' collectives then no longer pair
+    // up and the context is lost). Below the floor the pass declines here, where both ranks
+    // agree, and the retry takes a smaller window. SPARKINFER_PREFILL_HEADROOM_MB (default 384;
+    // tp only -- a single card has nothing to fall out of step with).
+    if (a.ok && tp_active) {
+        static const size_t kHeadroom = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_HEADROOM_MB");
+            return (size_t)(e ? std::max(0, atoi(e)) : 384) << 20;
+        }();
+        size_t fb = 0, tb = 0;
+        if (kHeadroom && cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb < kHeadroom) a.ok = false;
+    }
+    if (!tp_side_ok) a.ok = false;
     if (tp_active) a.ok = tp_prefill_agree_min(a.ok ? 1 : 0) != 0;   // both ranks fall back, or neither
     if (!a.ok) {
         // Report the numbers, not just the fact: this fallback costs ~50x at long context and the
@@ -3017,7 +3046,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     // its own positions from zero, attending only to itself. Its q/k/v rows are
                     // already contiguous, so the per-prompt calls just take the slice.
                     const int segs = multi ? nseg : 1;
-                    for (int i = 0; i < segs; ++i) {
+                    bool attn_ok = true;
+                    for (int i = 0; i < segs && attn_ok; ++i) {
                         const size_t o = multi ? (size_t)s.multi_off[i] : 0;
                         const int len = multi ? s.multi_len[i] : N;
                         const int* bt = multi ? (w.swa ? s.kv->block_table_win(s.multi_seq_ids[i])
@@ -3027,14 +3057,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             (tp_wide ? tp_vf : vf) + o * aw_kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
                             bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w, kvf);
-                        if (!kernels::launch_prefill_attn_int8_paged((tp_wide ? tp_qb : qb) + o * aw_qdim, kpool, vpool,
+                        attn_ok = kernels::launch_prefill_attn_int8_paged((tp_wide ? tp_qb : qb) + o * aw_qdim, kpool, vpool,
                                 kscale, vscale, bt, (tp_wide ? tp_att : att) + o * aw_qdim, len, tp_wide ? c.n_q_heads / aw_ranks : c.n_q_heads, tp_wide ? c.n_kv_heads / aw_ranks : c.n_kv_heads,
-                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0, kvf)) {
-                            a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
-                            fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
-                                            "pos0=%d\n", c.head_dim, win_blocks, pos0);
-                            return -1;
-                        }
+                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0, kvf);
+                    }
+                    // At tp the ranks decline together or not at all: one rank returning here
+                    // alone left the other inside the layer loop, and their next all-reduces no
+                    // longer paired up (context lost).
+                    if (tp_active) attn_ok = tp_prefill_agree_min(attn_ok ? 1 : 0) != 0;
+                    if (!attn_ok) {
+                        a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
+                        fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
+                                        "pos0=%d\n", c.head_dim, win_blocks, pos0);
+                        return -1;
                     }
                 }
             }
@@ -4589,9 +4624,17 @@ void gdn_conv_repad_prime(const Qwen35PrefillCtx& s, const Qwen35Config& c, cuda
     if (g_gdn_conv_repad_dev == nullptr || g_gdn_conv_repad_bytes < need) {
         if (g_gdn_conv_repad_dev)
             pf_cu(cudaFree(g_gdn_conv_repad_dev), "gdn repad dev free");
-        pf_cu(cudaMalloc(&g_gdn_conv_repad_dev, need), "gdn repad dev alloc");
+        g_gdn_conv_repad_dev = nullptr;
+        g_gdn_conv_repad_bytes = 0;
+        for (auto& e : g_gdn_conv_repad) { e.primed = false; e.dev = nullptr; }  // slices moved
+        if (cudaMalloc(&g_gdn_conv_repad_dev, need) != cudaSuccess) {
+            // Unprimed is a supported state (every consumer checks gdn_conv_repad_dev(L) and
+            // repads per layer instead); a null slice handed on is not.
+            cudaGetLastError();
+            g_gdn_conv_repad_dev = nullptr;
+            return;
+        }
         g_gdn_conv_repad_bytes = need;
-        for (auto& e : g_gdn_conv_repad) e.primed = false;  // slices moved: re-prime all
     }
     size_t off = 0;
     for (int L = 0; L < c.n_layers; ++L) {

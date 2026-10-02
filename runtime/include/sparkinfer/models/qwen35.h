@@ -879,6 +879,11 @@ void tp_prefill_allreduce_bf16(void* in_out, size_t elems);
 // Returns a ticket (-1 when not tp): tp_prefill_allreduce_wait(ticket) orders the compute stream
 // after that op (and every op posted before it); join waits for all of them.
 int tp_prefill_allreduce_bf16_async(void* in_out, size_t elems);
+// Create the calling rank's async all-reduce side stream + events now (idempotent). The
+// prefill calls it before its scratch arena takes the card's free memory: created lazily on the
+// first all-reduce, a stream that could not be created was an invalid handle on one rank.
+// false = not created (the caller declines the pass on both ranks).
+bool tp_prefill_ar_side_prepare();
 void tp_prefill_allreduce_wait(int ticket);
 void tp_prefill_allreduce_join();
 // (dual-GPU) Both ranks of a mirrored pass pass their own value at the same point; both get the

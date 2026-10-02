@@ -34,6 +34,11 @@ struct DFlashDraftConfig {
     // UNVERIFIED carry-over (no DFlash accuracy/SPEC_AGREE evaluation has run yet) -- if Muse
     // Glimmer draft proposals look wrong, check this flag first.
     bool rope_normal = false;
+    // (dual-GPU) Build the quantized weight copies during load, layer by layer, and drop each
+    // layer's dead bf16 copies straight away -- the load peak is then one layer's bf16 above the
+    // steady state instead of every layer's. For a server that would call ensure_quant() at load
+    // anyway (tp>1); the default keeps the deferred build (see Impl::pending_quant).
+    bool eager_quant = false;
 
     // YaRN rotary scaling (RadixArk/Qwen3.8-27B-DSpark ships rope_type: "yarn"). factor <= 1
     // disables it and the draft uses plain theta^(-2i/d), so existing checkpoints are unaffected.

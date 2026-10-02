@@ -2277,13 +2277,8 @@ __global__ void pf_iota_kernel(int* p, int n) {
 }
 }  // namespace
 
-static bool prefill_attn_kvq_dequant(
-    const void* q, const void* k_pool, const void* v_pool,
-    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
-    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, float scale, int win_blocks, cudaStream_t stream, int q_pos0, int kv_fmt) {
-    if (win_blocks > 0 || head_dim % 8 != 0) return false;   // full attention only
-    const int total = q_pos0 + n_tokens;
+// Grow the thread's dequant plane + identity table to cover `total` tokens of history.
+static bool kvq_ensure(int total, int n_kv_heads, int head_dim, int block_size, cudaStream_t stream) {
     const int n_blk = (total + block_size - 1) / block_size;
     const size_t plane = (size_t)n_blk * block_size * n_kv_heads * head_dim;   // elements
     const size_t bytes = 2 * plane * sizeof(__nv_bfloat16);
@@ -2301,8 +2296,33 @@ static bool prefill_attn_kvq_dequant(
         pf_iota_kernel<<<(cap + 255) / 256, 256, 0, stream>>>(g_kvdq_ident, cap);
         g_kvdq_ident_n = cap;
     }
+    return true;
+}
+
+bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size) {
+    if (total_tokens <= 0 || n_kv_heads <= 0 || head_dim <= 0 || block_size <= 0) return true;
+    // The identity table is filled on the legacy stream; the pass's stream orders after it
+    // through the synchronous cudaMalloc/cudaFree semantics of the arena that follows.
+    const bool ok = kvq_ensure(total_tokens, n_kv_heads, head_dim, block_size, nullptr);
+    if (ok) cudaStreamSynchronize(nullptr);
+    return ok;
+}
+
+static bool prefill_attn_kvq_dequant(
+    const void* q, const void* k_pool, const void* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, float scale, int win_blocks, cudaStream_t stream, int q_pos0, int kv_fmt) {
+    if (win_blocks > 0 || head_dim % 8 != 0) return false;   // full attention only
+    const int total = q_pos0 + n_tokens;
+    const int n_blk = (total + block_size - 1) / block_size;
+    const size_t plane = (size_t)n_blk * block_size * n_kv_heads * head_dim;   // elements
+    if (!kvq_ensure(total, n_kv_heads, head_dim, block_size, stream)) return false;
     __nv_bfloat16* kd = reinterpret_cast<__nv_bfloat16*>(g_kvdq);
     __nv_bfloat16* vd = kd + plane;
+    // The launch check below must see THIS launch: a non-sticky error some earlier call left
+    // pending (a declined cudaMalloc elsewhere in the pass) made it decline on one rank alone.
+    cudaGetLastError();
     const dim3 grid(total, n_kv_heads);
     const int thr = head_dim / 8 < 32 ? 32 : (head_dim / 8 > 128 ? 128 : head_dim / 8);
     auto ks = reinterpret_cast<const __half*>(k_scale);

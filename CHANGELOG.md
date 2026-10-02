@@ -33,6 +33,24 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **tp=2 with the DSpark draft: out-of-memory no longer takes the server down, and `--ctx 131072`
+  now fits.** Measured on 2x RTX 5060 Ti, Qwen3.8-27B + DSpark:
+  - The draft's quantized copies were built after every layer's bf16 weights were resident
+    (~2.5 GB peak on the draft's card); a failed copy was then quantized into a null buffer
+    (illegal address, context lost) before the load check could decline. Built per layer during
+    the load now, and a copy that does not fit is skipped: the largest `--ctx` that loads with
+    the draft went from 65536 to 131072 (int8 or nvfp4 KV).
+  - Under concurrent long prompts the prefill arena left a few MB on the draft's card, and the
+    next lazy allocation (the GDN conv repad, the all-reduce side stream, the fp8/nvfp4 attention
+    plane) failed on that card alone, mid-pass; the ranks' all-reduces then no longer paired up
+    and the context was lost. Those are taken before the arena now, the arena keeps 384 MB free
+    (`SPARKINFER_PREFILL_HEADROOM_MB`), and a prefill attention decline is agreed by both ranks.
+    An opencode-like stress run (4 concurrent 12k prompts, a 63k prompt, 2 concurrent 30k
+    prompts) at `--ctx 131072` completes for int8 and nvfp4 KV; before, nvfp4 lost the context.
+  - A lost context logged every failing call: one run wrote 2.4 GB of log. Rate-limited.
+  - The group speculation's capture buffer is sized for the prompt only (it was sized for
+    prompt + max_tokens, ~51 KB per token on the draft's card).
+
 - **tp=2 bf16-KV prefill attention fell back to the scalar kernel on one card.** The bf16
   tensor-core prefill attention raised its shared-memory limit once per process instead of once
   per device, so the second card's launch failed and the pass took the tiled fallback at half

@@ -239,5 +239,10 @@ bool launch_prefill_attn_int8_paged(
 // kv_fmt 2 (fp8) / 3 (nvfp4) above: the history [0, q_pos0 + n_tokens) is dequantized from the
 // pool into a bf16 scratch plane (identity block table) and run through
 // launch_prefill_attn_bf16_paged; full attention only (win_blocks must be 0).
+// That plane grows on demand, which at tp>1 could fail on one card only -- in the middle of the
+// layer loop, after which the ranks' all-reduces no longer pair up. prefill_kvq_reserve sizes it
+// (on the calling thread, which owns it) for a pass up to `total_tokens` of history, so the
+// windowed prefill can take it with its arena, where the ranks agree. false = it does not fit.
+bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size);
 
 }} // namespace sparkinfer::kernels

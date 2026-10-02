@@ -84,7 +84,10 @@ inline void cu(cudaError_t e, const char* what) {
     // 21,535 identical lines in one burst and buried the first, real error.
     static std::atomic<int> logged{0};
     const int n = logged.fetch_add(1, std::memory_order_relaxed);
-    if (n < 20 || fatal)
+    // Fatal lines print too, but only the first few: once the context is gone every call in
+    // flight fails the same way, and a stress run wrote 2.4 GB of them before it drained.
+    static std::atomic<int> fatal_logged{0};
+    if (n < 20 || (fatal && fatal_logged.fetch_add(1, std::memory_order_relaxed) < 8))
         fprintf(stderr, "[qwen35] %s: %s%s\n", what, cudaGetErrorString(e),
                 fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
     else if (n == 20)
@@ -5143,17 +5146,38 @@ void tp_prefill_allreduce_wait(int ticket) {
        "tp prefill ar wait");
 }
 
+bool tp_prefill_ar_side_prepare() {
+    const int r = tp_prefill_rank();
+    if (r < 0) return true;
+    TpArSide& sd = g_tp_ar_side[r];
+    if (sd.side) return true;
+    // Created by the rank's own thread, on its own (current) device; all or nothing.
+    cudaStream_t side = nullptr;
+    cudaEvent_t ready = nullptr, done[TpArSide::kRing] = {};
+    bool ok = cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaEventCreateWithFlags(&ready, cudaEventDisableTiming) == cudaSuccess;
+    for (cudaEvent_t& e : done)
+        ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        for (cudaEvent_t e : done) if (e) cudaEventDestroy(e);
+        if (ready) cudaEventDestroy(ready);
+        if (side) cudaStreamDestroy(side);
+        return false;
+    }
+    sd.side = side;
+    sd.ready = ready;
+    for (int i = 0; i < TpArSide::kRing; i++) sd.done[i] = done[i];
+    return true;
+}
+
 int tp_prefill_allreduce_bf16_async(void* in_out, size_t elems) {
     if (!in_out || elems == 0) return -1;
     const int r = tp_prefill_rank();
     if (r < 0) return -1;
     TpArSide& sd = g_tp_ar_side[r];
-    if (!sd.side) {   // created by the rank's own thread, on its own (current) device
-        cu(cudaStreamCreateWithFlags(&sd.side, cudaStreamNonBlocking), "tp ar side stream");
-        cu(cudaEventCreateWithFlags(&sd.ready, cudaEventDisableTiming), "tp ar ready event");
-        for (cudaEvent_t& e : sd.done)
-            cu(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "tp ar done event");
-    }
+    if (!sd.side && !tp_prefill_ar_side_prepare())
+        cu(cudaErrorMemoryAllocation, "tp ar side stream");
     cu(cudaEventRecord(sd.ready, g_tp_prefill_stream[r]), "tp ar ready record");
     cu(cudaStreamWaitEvent(sd.side, sd.ready, 0), "tp ar side wait");
     g_tp_prefill_buf[r] = in_out;
@@ -8596,10 +8620,24 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         const long need = (long)g.n + job->max_new + 2L * (B + 1);
         if (need > dc.max_seq) return false;
         std::lock_guard<std::recursive_mutex> lk(s.device_mu);
+        // SPARKINFER_DSPARK_CAPTURE_MAX=N: the draft ingests at most the prompt's last N rows
+        // (it then windows its attention, see DFlashDraftModel ctx_lo). The capture holds
+        // n_cap * H bf16 per row (51 KB on the 27B) on the draft's card -- 0.6 GB for a whole
+        // 12k prompt. Off by default: measured below 12288 (6-10k-token prompts, 384 tokens, 6
+        // prompts), N=4096 cost acceptance 2.97 -> 2.37 and 97 -> 81 tok/s; the old context does
+        // buy acceptance there. For a card too tight to hold the capture at all.
+        static const int kCaptureMax = [] {
+            const char* e = getenv("SPARKINFER_DSPARK_CAPTURE_MAX");
+            return e ? std::max(0, atoi(e)) : 0;
+        }();
         int capture_start = 0;
-        if (g.n >= 12288) capture_start = g.n - 4096;
+        if (kCaptureMax > 0 && g.n > kCaptureMax) capture_start = g.n - kCaptureMax;
+        else if (g.n >= 12288) capture_start = g.n - 4096;
+        // The context buffer only feeds this join's first draft (the prompt's rows); every later
+        // step drafts from the session's own `cap` rows. Sizing it for the generation too held
+        // ~51 KB per output token on the draft's card for nothing -- 0.8 GB at max_tokens 16k.
         set_dflash_capture(true, dc.target_layer_ids, B + 1, capture_start,
-                           std::min(s.cfg.max_seq, g.n + job->max_new + B + 1));
+                           std::min(s.cfg.max_seq, g.n + 1));
         if (!dflash_context_buffer() || !dflash_hidden_buffer()) return false;
         const size_t cap_bytes = (size_t)(B + 1) * s.dflash_n_cap * H * sizeof(bf16);
         if (cudaMalloc(&g.cap, cap_bytes) != cudaSuccess) { cudaGetLastError(); g.cap = nullptr; return false; }
