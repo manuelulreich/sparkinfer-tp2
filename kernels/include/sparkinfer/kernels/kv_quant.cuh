@@ -50,7 +50,7 @@ __device__ __forceinline__ unsigned kvq_f2e2m1(float x) {
 __device__ __forceinline__ float kvq_e2m1f(unsigned nib) {
     // magnitudes for codes 0..7: 0 .5 1 1.5 2 3 4 6
     const unsigned m = nib & 7u;
-    const float v = (m < 4u) ? 0.5f * (float)m : (float)(1u << (m - 2u)) * ((m & 1u) ? 1.5f : 1.0f);
+    const float v = (m < 2u) ? 0.5f * (float)m : (float)(1u << ((m >> 1) - 1u)) * ((m & 1u) ? 1.5f : 1.0f);
     return (nib & 8u) ? -v : v;
 }
 

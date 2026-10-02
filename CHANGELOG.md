@@ -7,16 +7,29 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
-- **FP8 (e4m3) KV cache for the Qwen3.5/3.6/3.8 hybrids: `SPARKINFER_KV_DTYPE=bf16|int8|fp8`.**
-  Same layout as the int8 cache (one byte per element plus one fp16 scale per token and KV head,
-  here amax/448), so the pool size is unchanged. Decode at long context runs a new f16
-  tensor-core flash-decode kernel that widens the e4m3 codes in registers (Q and P stay f16, so the
-  KV format is the only quantization); prefill dequantizes the attended history into a bf16 plane
-  and runs the bf16 tensor-core prefill attention. Qwen3.8-27B at tp=2 on 2x RTX 5060 Ti: decode
-  54.1 / 52.1 tok/s at 128 / 16k context (int8 54.1 / 51.4), prefill 3438 / 3052 tok/s at 3k / 16k
-  (int8 3492 / 3371), continuation KL against bf16 KV about equal to int8's. int8 stays the
-  default; `SPARKINFER_KV_INT8` keeps working when `SPARKINFER_KV_DTYPE` is unset.
-  `SPARKINFER_FAMMA_F8=0` keeps fp8 decode on the dequant-to-shared-memory tile kernel.
+- **FP8 (e4m3) and NVFP4 KV cache for the Qwen3.5/3.6/3.8 hybrids:
+  `SPARKINFER_KV_DTYPE=bf16|int8|fp8|nvfp4`.** fp8 uses the int8 cache's layout (one byte per
+  element plus one fp16 scale per token and KV head, here amax/448). nvfp4 stores each head
+  vector as e2m1 nibbles plus one e4m3 scale per 16 elements, with the fp16 per-head scale as the
+  second level: 9/16 byte per element, 0.28 GiB instead of int8's 0.50 GiB for a 32k pool. Decode
+  at long context runs a new f16 tensor-core flash-decode kernel that widens the codes in
+  registers (Q and P stay f16, so the KV format is the only quantization); prefill dequantizes the
+  attended history into a bf16 plane and runs the bf16 tensor-core prefill attention.
+  Qwen3.8-27B, tp=2 on 2x RTX 5060 Ti (decode 128 / 16k ctx, prefill 3k / 16k tokens, tok/s;
+  KL = top-5 continuation KL against bf16 KV in deterministic mode at 1k / 4k / 16k):
+
+  | KV    | decode 128 | decode 16k | prefill 3k | prefill 16k | KL vs bf16            |
+  |-------|-----------:|-----------:|-----------:|------------:|-----------------------|
+  | bf16  | 54.0       | 48.3       | 3440       | 3053        | 0                     |
+  | int8  | 54.1       | 51.4       | 3492       | 3371        | 0.012 / 0.018 / 0.014 |
+  | fp8   | 54.1       | 52.1       | 3438       | 3052        | 0.014 / 0.016 / 0.012 |
+  | nvfp4 | 54.0       | 50.8       | 3435       | 3052        | 0.018 / 0.025 / 0.018 |
+
+  int8 stays the default (its int8 tensor-core prefill attention is still the fastest);
+  `SPARKINFER_KV_INT8` keeps working when `SPARKINFER_KV_DTYPE` is unset. The pool's token
+  capacity is unchanged (it stays bf16-denominated); fp8/nvfp4 only allocate less.
+  `SPARKINFER_FAMMA_F8=0` keeps fp8/nvfp4 decode on the dequant-to-shared-memory tile kernel
+  (16k decode 48.5 / 46.0 tok/s).
 
 ### Fixed
 
