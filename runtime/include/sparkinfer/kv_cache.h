@@ -21,6 +21,12 @@ struct KVCacheConfig {
     KVLayout layout = KVLayout::PAGED;
     bool fp8_kv = false;        // FP8 KV cache compression
     bool int8_kv = false;       // int8 (Q8-style) KV cache; halves the long-context KV read
+    // KV element format (see KVDtype below). -1 = derive from int8_kv (the old switch, unchanged).
+    // KV_FP8 shares the int8 layout byte for byte (one byte per element + one fp16 scale per
+    // (token, kv_head) head vector) with e4m3 codes instead of int8 ones. KV_NVFP4 packs each head
+    // vector as head_dim/2 bytes of e2m1 nibbles followed by head_dim/16 e4m3 block scales
+    // (9/16 byte per element), with the per-(token, kv_head) fp16 scale as the second-level scale.
+    int kv_dtype = -1;
     // Hybrid stacks (Qwen3.5/3.6/3.8) give paged KV to the FULL-ATTENTION layers only -- the
     // Gated-DeltaNet layers carry a recurrent state instead and never touch these pools. Sizing
     // the pool for every layer therefore over-allocates by n_layers/n_attn_layers (4x on
@@ -70,6 +76,19 @@ struct KVCacheConfig {
 // full_attn_interval = k, layer L is a linear (Gated-DeltaNet) layer -- which carries a recurrent
 // state and never touches paged KV -- unless (L+1) % k == 0. Returns an empty map for non-hybrid
 // models, which KVCacheManager reads as the identity (every layer gets a slot).
+enum KVDtype : int { KV_BF16 = 0, KV_INT8 = 1, KV_FP8 = 2, KV_NVFP4 = 3 };
+// Bytes of pool storage for `elems` KV elements in format fmt (elems a multiple of 16).
+inline size_t kv_dtype_bytes(int fmt, size_t elems) {
+    switch (fmt) {
+        case KV_INT8: case KV_FP8: return elems;
+        case KV_NVFP4: return elems / 16 * 9;
+        default: return elems * 2;
+    }
+}
+inline const char* kv_dtype_name(int fmt) {
+    switch (fmt) { case KV_INT8: return "int8"; case KV_FP8: return "fp8"; case KV_NVFP4: return "nvfp4"; default: return "bf16"; }
+}
+
 inline std::vector<int> hybrid_kv_layer_slots(int num_layers, bool hybrid, int full_attn_interval) {
     if (!hybrid || full_attn_interval <= 0 || num_layers <= 0) return {};
     std::vector<int> slot((size_t)num_layers, -1);
@@ -176,7 +195,13 @@ public:
     // int8 KV (Q8-style int8 + per-(token,kv_head) fp16 scale). When int8_kv(), k_pool/v_pool hold
     // int8 and k_scale_pool/v_scale_pool hold one __half scale per head vector.
     // Per-layer scale pointer = (__half*)k_scale_pool() + scale_layer_base_elems(layer).
+    // int8_kv() stays true ONLY for the int8 format, so every int8-only path keeps its gate.
+    // kv_dtype() is the format; quant_kv() is "has the scale pools" (int8, fp8, nvfp4);
+    // kv_bytes(elems) converts a layer_base_elems()/element offset into a byte offset.
     bool int8_kv() const;
+    int kv_dtype() const;
+    bool quant_kv() const { return kv_dtype() != KV_BF16; }
+    size_t kv_bytes(size_t elems) const { return kv_dtype_bytes(kv_dtype(), elems); }
     void* k_scale_pool() const;
     void* v_scale_pool() const;
     size_t scale_layer_stride_elems() const;

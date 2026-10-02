@@ -1999,11 +1999,25 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
     const size_t sm = (size_t)RQH * BM * qld * sizeof(__nv_bfloat16)
                     + (size_t)(PSPLIT ? 2 : 1) * RQH * BM * pld * sizeof(__nv_bfloat16)
                     + (size_t)(SBLK + (VINT8 ? 4 : 3) * RQH * BM) * sizeof(float);
-    static int cfg = 0;
+    // PER-DEVICE latch, like launch_attn_gqa above: the attribute is a per-device setting, and a
+    // process-wide latch left the second tp rank's card unconfigured, so its launch failed with
+    // cudaErrorInvalidValue and the pass fell to the tiled scalar kernel (half the prefill rate
+    // at tp=2, depending on which rank's thread got here first).
+    constexpr int kMaxDevices = 16;
+    static int cfg_dev[kMaxDevices] = {0};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) return false;
+    int& cfg = cfg_dev[dev];
     if (!cfg) {
         if (cudaFuncSetAttribute(pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT, VINT8>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) != cudaSuccess)
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) != cudaSuccess) {
+            // Over this device's smem ceiling (the RQH=3 wide tier on a 99 KB sm_120 part).
+            // Clear the (non-sticky) error, or the caller's next, smaller tier sees it in its
+            // cudaPeekAtLastError() and declines too -- dropping the whole pass to the tiled
+            // scalar kernel at half the speed.
+            cudaGetLastError();
             return false;
+        }
         cfg = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);

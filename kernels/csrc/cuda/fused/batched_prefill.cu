@@ -17,8 +17,11 @@
 #include <mma.h>
 
 #include <cstdlib>
+#include <cstdio>
 
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/kernels/kv_quant.cuh"
+#include "sparkinfer/kernels/scratch_epoch.h"
 #include "sparkinfer/kernels/prefill_attn_mma.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/prefill_gdn_chunk.h"
@@ -1187,7 +1190,7 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
     int block_size, int max_blocks_per_seq, int pos0,
-    const int* __restrict__ mrope_pos, int mrope_sec_h, int mrope_sec_w) {
+    const int* __restrict__ mrope_pos, int mrope_sec_h, int mrope_sec_w, int kv_fmt) {
     const int tok  = blockIdx.x;                    // token (grid.x avoids 65535 grid.y cap)
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
@@ -1293,15 +1296,9 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
         s_red[0] = aa;
     }
     __syncthreads();
-    const float d  = s_red[0] / 127.0f;
-    const int   qi = (s_red[0] == 0.f) ? 0 : (int)roundf(val / d);
-    if (is_k) {
-        k_pool[dst + t] = (signed char)qi;
-        if (t == 0) k_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    } else {
-        v_pool[dst + t] = (signed char)qi;
-        if (t == 0) v_scale[ctok * n_kv_heads + hh] = __float2half(d);
-    }
+    // int8 / fp8 / nvfp4 store (kv_quant.cuh); kv_fmt 1 is the original int8 arithmetic.
+    kvq_store(kv_fmt, is_k ? (void*)k_pool : (void*)v_pool, is_k ? k_scale : v_scale, dst,
+              ctok * n_kv_heads + hh, head_dim, t, val, s_red[0]);
 }
 
 // ============================================================================
@@ -2144,7 +2141,7 @@ void launch_prefill_qknorm_rope_kv_int8(
     signed char* k_pool, signed char* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream, int pos0, const int* mrope_pos, int mrope_sec_h, int mrope_sec_w) {
+    cudaStream_t stream, int pos0, const int* mrope_pos, int mrope_sec_h, int mrope_sec_w, int kv_fmt) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     // Dispatched on a TEMPLATE parameter, not a runtime branch: with mrope_pos null the compiler
@@ -2157,7 +2154,7 @@ void launch_prefill_qknorm_rope_kv_int8(
             reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
             reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
             block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-            block_size, max_blocks_per_seq, pos0, mrope_pos, mrope_sec_h, mrope_sec_w);
+            block_size, max_blocks_per_seq, pos0, mrope_pos, mrope_sec_h, mrope_sec_w, kv_fmt);
     else
         pf_qknorm_rope_kv_int8_kernel<false><<<grid, head_dim, shmem, stream>>>(
             reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
@@ -2165,7 +2162,7 @@ void launch_prefill_qknorm_rope_kv_int8(
             reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
             reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
             block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-            block_size, max_blocks_per_seq, pos0, nullptr, 0, 0);
+            block_size, max_blocks_per_seq, pos0, nullptr, 0, 0, kv_fmt);
 }
 
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL RoPE (rotary_dim>0) / NoPE
@@ -2237,12 +2234,113 @@ void launch_prefill_qknorm_rope_kv_bf16_vi8(
             max_blocks_per_seq, pos0, nullptr, 0, 0);
 }
 
+// ============================================================================
+// fp8 / nvfp4 KV prefill attention. There is no e4m3/e2m1 tensor-core twin of the int8 prefill
+// attention: the pass instead dequantizes the history it attends over -- tokens
+// [0, q_pos0 + n_tokens) of this sequence -- into a bf16 plane laid out as a paged pool whose
+// logical block b sits at physical block b (an identity block table), and runs the bf16
+// tensor-core prefill attention over it. The plane is one layer's history, rebuilt per layer per
+// pass (like the int8 path's V repack), and grows on demand; growing frees the old plane, so it
+// bumps the prefill scratch epoch for any captured whole-prefill graph.
+// ============================================================================
+namespace {
+thread_local void*  g_kvdq = nullptr;
+thread_local size_t g_kvdq_bytes = 0;
+thread_local int*   g_kvdq_ident = nullptr;
+thread_local int    g_kvdq_ident_n = 0;
+
+template <int FMT>
+__global__ void pf_kv_dequant_kernel(const void* __restrict__ k_pool, const void* __restrict__ v_pool,
+                                     const __half* __restrict__ k_scale, const __half* __restrict__ v_scale,
+                                     const int* __restrict__ block_table,
+                                     __nv_bfloat16* __restrict__ kd, __nv_bfloat16* __restrict__ vd,
+                                     int n_kv_heads, int head_dim, int block_size) {
+    const int t = blockIdx.x, h = blockIdx.y;
+    const int phys = block_table[t / block_size];
+    const size_t srow = ((size_t)phys * block_size + t % block_size) * n_kv_heads + h;
+    const size_t drow = (size_t)t * n_kv_heads + h;
+    const float ks = __half2float(k_scale[srow]), vs = __half2float(v_scale[srow]);
+    for (int d = threadIdx.x * 8; d < head_dim; d += blockDim.x * 8) {
+        float kf[8], vf[8];
+        kvq_load8<FMT>(k_pool, srow * head_dim + d, head_dim, ks, kf);
+        kvq_load8<FMT>(v_pool, srow * head_dim + d, head_dim, vs, vf);
+        __align__(16) __nv_bfloat16 kb[8], vb[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) { kb[j] = __float2bfloat16(kf[j]); vb[j] = __float2bfloat16(vf[j]); }
+        *reinterpret_cast<uint4*>(kd + drow * head_dim + d) = *reinterpret_cast<const uint4*>(kb);
+        *reinterpret_cast<uint4*>(vd + drow * head_dim + d) = *reinterpret_cast<const uint4*>(vb);
+    }
+}
+__global__ void pf_iota_kernel(int* p, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = i;
+}
+}  // namespace
+
+static bool prefill_attn_kvq_dequant(
+    const void* q, const void* k_pool, const void* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, float scale, int win_blocks, cudaStream_t stream, int q_pos0, int kv_fmt) {
+    if (win_blocks > 0 || head_dim % 8 != 0) return false;   // full attention only
+    const int total = q_pos0 + n_tokens;
+    const int n_blk = (total + block_size - 1) / block_size;
+    const size_t plane = (size_t)n_blk * block_size * n_kv_heads * head_dim;   // elements
+    const size_t bytes = 2 * plane * sizeof(__nv_bfloat16);
+    if (bytes > g_kvdq_bytes) {
+        if (g_kvdq) { cudaFree(g_kvdq); g_kvdq = nullptr; g_kvdq_bytes = 0; note_prefill_scratch_moved(); }
+        if (cudaMalloc(&g_kvdq, bytes) != cudaSuccess) { cudaGetLastError(); g_kvdq = nullptr; return false; }
+        g_kvdq_bytes = bytes;
+    }
+    if (n_blk > g_kvdq_ident_n) {
+        if (g_kvdq_ident) { cudaFree(g_kvdq_ident); g_kvdq_ident = nullptr; g_kvdq_ident_n = 0; note_prefill_scratch_moved(); }
+        const int cap = n_blk + 256;
+        if (cudaMalloc(&g_kvdq_ident, (size_t)cap * sizeof(int)) != cudaSuccess) {
+            cudaGetLastError(); g_kvdq_ident = nullptr; return false;
+        }
+        pf_iota_kernel<<<(cap + 255) / 256, 256, 0, stream>>>(g_kvdq_ident, cap);
+        g_kvdq_ident_n = cap;
+    }
+    __nv_bfloat16* kd = reinterpret_cast<__nv_bfloat16*>(g_kvdq);
+    __nv_bfloat16* vd = kd + plane;
+    const dim3 grid(total, n_kv_heads);
+    const int thr = head_dim / 8 < 32 ? 32 : (head_dim / 8 > 128 ? 128 : head_dim / 8);
+    auto ks = reinterpret_cast<const __half*>(k_scale);
+    auto vs = reinterpret_cast<const __half*>(v_scale);
+    if (kv_fmt == 2)
+        pf_kv_dequant_kernel<2><<<grid, thr, 0, stream>>>(k_pool, v_pool, ks, vs, block_table, kd, vd,
+                                                          n_kv_heads, head_dim, block_size);
+    else if (kv_fmt == 3)
+        pf_kv_dequant_kernel<3><<<grid, thr, 0, stream>>>(k_pool, v_pool, ks, vs, block_table, kd, vd,
+                                                          n_kv_heads, head_dim, block_size);
+    else
+        return false;
+    if (cudaPeekAtLastError() != cudaSuccess) { cudaGetLastError(); return false; }
+    if (launch_prefill_attn_mma_bf16(q, kd, vd, g_kvdq_ident, attn, n_tokens, n_q_heads, n_kv_heads,
+                                     head_dim, block_size, n_blk, scale, stream, q_pos0))
+        return true;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        fprintf(stderr, "[prefill] fp8/nvfp4 KV: bf16 tensor-core attention declined (n=%d pos0=%d, "
+                        "err=%s) -- tiled fallback\n", n_tokens, q_pos0,
+                cudaGetErrorString(cudaPeekAtLastError()));
+    }
+    return launch_prefill_attn_bf16_paged(q, kd, vd, g_kvdq_ident, attn, n_tokens, n_q_heads,
+                                          n_kv_heads, head_dim, block_size, n_blk, scale, stream,
+                                          q_pos0);
+}
+
 bool launch_prefill_attn_int8_paged(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream,
-    int q_pos0) {
+    int q_pos0, int kv_fmt) {
+    if (kv_fmt == 2 || kv_fmt == 3)
+        return prefill_attn_kvq_dequant(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+                                        n_tokens, n_q_heads, n_kv_heads, head_dim, block_size,
+                                        scale, win_blocks, stream, q_pos0, kv_fmt);
     // int8 tensor-core prefill attention: same mask + online softmax as the scalar path below,
     // run on the wmma int8 cores (the scalar kernels are compute-bound at ~8 TFLOP/s). Honours the
     // caller's per-layer window (zero means global/full). SPARKINFER_PREFILL_ATTN_MMA=0 falls through.

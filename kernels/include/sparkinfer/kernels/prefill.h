@@ -163,7 +163,8 @@ void launch_prefill_qknorm_rope_kv_int8(
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
     cudaStream_t stream = nullptr,
     int pos0 = 0,
-    const int* mrope_pos = nullptr, int mrope_sec_h = 0, int mrope_sec_w = 0);
+    const int* mrope_pos = nullptr, int mrope_sec_h = 0, int mrope_sec_w = 0,
+    int kv_fmt = 1);
 
 // Muse Glimmer bf16-KV counterpart: QK-norm + NORMAL (consecutive-pair, LLAMA_ROPE_TYPE_NORM)
 // RoPE when rotary_dim>0 (SWA layers), or NoPE when rotary_dim==0 (global layers) + bf16 KV
@@ -234,6 +235,9 @@ bool launch_prefill_attn_int8_paged(
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
-    cudaStream_t stream = nullptr, int q_pos0 = 0);
+    cudaStream_t stream = nullptr, int q_pos0 = 0, int kv_fmt = 1);
+// kv_fmt 2 (fp8) / 3 (nvfp4) above: the history [0, q_pos0 + n_tokens) is dequantized from the
+// pool into a bf16 scratch plane (identity block table) and run through
+// launch_prefill_attn_bf16_paged; full attention only (win_blocks must be 0).
 
 }} // namespace sparkinfer::kernels

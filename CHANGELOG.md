@@ -5,7 +5,26 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Added
+
+- **FP8 (e4m3) KV cache for the Qwen3.5/3.6/3.8 hybrids: `SPARKINFER_KV_DTYPE=bf16|int8|fp8`.**
+  Same layout as the int8 cache (one byte per element plus one fp16 scale per token and KV head,
+  here amax/448), so the pool size is unchanged. Decode at long context runs a new f16
+  tensor-core flash-decode kernel that widens the e4m3 codes in registers (Q and P stay f16, so the
+  KV format is the only quantization); prefill dequantizes the attended history into a bf16 plane
+  and runs the bf16 tensor-core prefill attention. Qwen3.8-27B at tp=2 on 2x RTX 5060 Ti: decode
+  54.1 / 52.1 tok/s at 128 / 16k context (int8 54.1 / 51.4), prefill 3438 / 3052 tok/s at 3k / 16k
+  (int8 3492 / 3371), continuation KL against bf16 KV about equal to int8's. int8 stays the
+  default; `SPARKINFER_KV_INT8` keeps working when `SPARKINFER_KV_DTYPE` is unset.
+  `SPARKINFER_FAMMA_F8=0` keeps fp8 decode on the dequant-to-shared-memory tile kernel.
+
 ### Fixed
+
+- **tp=2 bf16-KV prefill attention fell back to the scalar kernel on one card.** The bf16
+  tensor-core prefill attention raised its shared-memory limit once per process instead of once
+  per device, so the second card's launch failed and the pass took the tiled fallback at half
+  the prefill rate (3072 tokens: 1560 instead of 3440 tok/s), depending on thread timing. A
+  refused wide tier also left its error pending, which made the next tier decline as well.
 
 - **`usage.decode_tps` included the prefill.** The chat and text completion responses (streamed
   and not) divided the output tokens by `generation_ms`, which runs from submission, so a long

@@ -65,6 +65,7 @@ struct KVCacheManager::Impl {
     size_t layer_stride = 0;         // elements per layer in each pool
     size_t scale_layer_stride = 0;   // int8 path: fp16 scales per layer (= layer_stride / head_dim)
     bool int8_kv = false;
+    int kv_dtype = 0;                // KVDtype
     void* k_pool = nullptr;
     void* v_pool = nullptr;
     int n_slots = 0;
@@ -148,7 +149,9 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     // int8 KV (Q8-style, per-token per-kv-head fp16 scale): 1 byte/elem + one scale per head vector,
     // halving the long-context KV read for the tensor-core flash-decode. Opt-in via cfg.int8_kv (the
     // Qwen3 example mains set it from SPARKINFER_KV_INT8, default on); other consumers stay bf16.
-    impl_->int8_kv = cfg.int8_kv;
+    impl_->kv_dtype = cfg.kv_dtype >= 0 ? cfg.kv_dtype : (cfg.int8_kv ? KV_INT8 : KV_BF16);
+    impl_->int8_kv = impl_->kv_dtype == KV_INT8;
+    const bool quant = impl_->kv_dtype != KV_BF16;   // has the per-(token, kv_head) scale pools
     // The TP head window (WP-7): which slice of the model's KV heads THIS pool covers. 0 = all
     // (the tp=1 default, the whole-heads single pool, byte-identical to the old layout); otherwise
     // the rank's contiguous window per the tp table's K/V convention. An out-of-range window is a
@@ -168,7 +171,8 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
         impl_->kv_head_count = 0;
     }
     const int heads_here = impl_->kv_head_count > 0 ? impl_->kv_head_count : cfg.num_kv_heads;
-    const int elem_bytes = impl_->int8_kv ? 1 : (int)sizeof(unsigned short);
+    // Bytes per element: 2 bf16, 1 int8/fp8, 9/16 nvfp4 (all sizes below are elems * this).
+    const double elem_bytes = (double)kv_dtype_bytes(impl_->kv_dtype, 16) / 16.0;
     const size_t elems_per_block = (size_t)cfg.block_size * heads_here * cfg.head_dim;
     // total_blocks sized against the bf16 budget so callers/capacity are unchanged; int8 just mallocs
     // fewer bytes (+ the small scale pools).
@@ -253,9 +257,9 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
         impl_->win_base_elems =
             (size_t)(impl_->n_full_slots + (alloc_slices - n_slots)) * impl_->layer_stride;
     }
-    cu(cudaMalloc(&impl_->k_pool, pool_elems * elem_bytes), "malloc k_pool");
-    cu(cudaMalloc(&impl_->v_pool, pool_elems * elem_bytes), "malloc v_pool");
-    if (impl_->int8_kv) {
+    cu(cudaMalloc(&impl_->k_pool, kv_dtype_bytes(impl_->kv_dtype, pool_elems)), "malloc k_pool");
+    cu(cudaMalloc(&impl_->v_pool, kv_dtype_bytes(impl_->kv_dtype, pool_elems)), "malloc v_pool");
+    if (quant) {
         // one fp16 scale per (token slot, kv_head): scale stride = layer_stride / head_dim.
         impl_->scale_layer_stride = impl_->layer_stride / cfg.head_dim;
         const size_t win_scale_stride = win_stride / cfg.head_dim;
@@ -513,6 +517,7 @@ int* KVCacheManager::block_table_win(uint64_t seq_id) const {
     return impl_->d_win_tables + (size_t)it->second * impl_->max_blocks_per_seq;
 }
 bool   KVCacheManager::int8_kv() const { return impl_->int8_kv; }
+int    KVCacheManager::kv_dtype() const { return impl_->kv_dtype; }
 void*  KVCacheManager::k_scale_pool() const { return impl_->k_scale; }
 void*  KVCacheManager::v_scale_pool() const { return impl_->v_scale; }
 size_t KVCacheManager::scale_layer_stride_elems() const { return impl_->scale_layer_stride; }
