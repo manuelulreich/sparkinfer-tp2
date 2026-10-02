@@ -934,6 +934,12 @@ struct Qwen35Model::Impl {
     int* h_vr = nullptr;            // pinned [4][R]: ids | positions | seqlens | argmax
     float* h_vr_maxv = nullptr;     // pinned [R]: each row's local head maximum
     double plain_step_ms[5] = {0, 0, 0, 0, 0};   // note_plain_decode, by rows
+    // (plan 06, P) Sampled verify rows: this rank's top-k candidates per row, the merged ones,
+    // and the per-row sampler parameters. Device [R][64] / [R], and one pinned host block.
+    float *vr_tk_v = nullptr, *vr_mg_v = nullptr, *vr_smp_temp = nullptr, *vr_smp_topp = nullptr;
+    int *vr_tk_i = nullptr, *vr_mg_i = nullptr, *vr_smp_topk = nullptr, *vr_smp_out = nullptr;
+    unsigned long long *vr_smp_seed = nullptr, *vr_smp_step = nullptr;
+    char* h_vr_smp = nullptr;
     float* vr_snap_lin = nullptr;
     bf16* vr_snap_conv = nullptr;
     // (dual-GPU C1b) FP4 tensor-core staging for the multi-session rows path: one activation
@@ -3680,6 +3686,24 @@ bool Qwen35Model::tp_verify_alloc() {
         s.vr_pos = s.vr_ids + R; s.vr_seq = s.vr_ids + 2 * R; s.vr_out = s.vr_ids + 3 * R;
         s.vr_snap_lin = (float*)va(ls * sizeof(float));
         s.vr_snap_conv = (bf16*)va(cs * sizeof(bf16));
+        {
+            const size_t K = dflash_kernels::kRowsTopkMax;
+            s.vr_tk_v = (float*)va((size_t)R * K * sizeof(float));
+            s.vr_tk_i = (int*)va((size_t)R * K * sizeof(int));
+            s.vr_mg_v = (float*)va((size_t)R * K * sizeof(float));
+            s.vr_mg_i = (int*)va((size_t)R * K * sizeof(int));
+            s.vr_smp_temp = (float*)va((size_t)R * sizeof(float));
+            s.vr_smp_topp = (float*)va((size_t)R * sizeof(float));
+            s.vr_smp_topk = (int*)va((size_t)R * sizeof(int));
+            s.vr_smp_out = (int*)va((size_t)R * sizeof(int));
+            s.vr_smp_seed = (unsigned long long*)va((size_t)R * sizeof(unsigned long long));
+            s.vr_smp_step = (unsigned long long*)va((size_t)R * sizeof(unsigned long long));
+            if (alloc_ok && !s.h_vr_smp &&
+                cudaMallocHost(&s.h_vr_smp, (size_t)R * K * 16 + (size_t)R * 32) != cudaSuccess) {
+                s.h_vr_smp = nullptr;
+                alloc_ok = false;
+            }
+        }
         if (alloc_ok && !s.h_vr && cudaMallocHost(&s.h_vr, (size_t)4 * R * sizeof(int)) != cudaSuccess) {
             s.h_vr = nullptr;
             alloc_ok = false;
@@ -3754,7 +3778,8 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
 // is chosen per row.
 int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
                                  const uint64_t* row_seq, void* capture_dst, int* out_argmax,
-                                 int seg_n, void* const* seg_capture, int* seg_keep) {
+                                 int seg_n, void* const* seg_capture, int* seg_keep,
+                                 const SpecSampleRow* row_sample) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     const bool multi = row_seq != nullptr;
     // (dual-GPU C2) Segmented: seg_n sessions each verify T = n / seg_n consecutive positions,
@@ -4376,7 +4401,62 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     static const bool head_ar = [] {
         const char* e = getenv("SPARKINFER_TP_HEAD_ALLREDUCE"); return e && e[0] == '1';
     }();
-if (!head_ar && n <= 64) {
+    // (plan 06, P) Sampled rows: each rank's exact top-k of its half, merged over both (identical
+    // on both ranks), then the decode sampler's draw from those candidates -- the same kernel on
+    // the same inputs on each rank, so both keep the same tokens. Greedy rows of the same verify
+    // take the merged best, which is the argmax the exchange below would give.
+    int smp_k = 0;
+    if (row_sample)
+        for (int r = 0; r < n; r++)
+            if (row_sample[r].temperature > 0.f)
+                smp_k = std::max(smp_k, std::min(row_sample[r].top_k, dflash_kernels::kRowsTopkMax));
+    if (smp_k > 0 && s.h_vr_smp && n <= kTpVerifyRows) {
+        const int K = dflash_kernels::kRowsTopkMax;
+        dflash_kernels::launch_rows_topk(s.vr_lh, n, Vr, smp_k, s.vr_tk_v, s.vr_tk_i, st);
+        float* h_v = reinterpret_cast<float*>(s.h_vr_smp);
+        int* h_i = reinterpret_cast<int*>(h_v + (size_t)R * K);
+        float* h_mv = reinterpret_cast<float*>(h_i + (size_t)R * K);
+        int* h_mi = reinterpret_cast<int*>(h_mv + (size_t)R * K);
+        char* h_par = reinterpret_cast<char*>(h_mi + (size_t)R * K);
+        float* h_temp = reinterpret_cast<float*>(h_par);
+        float* h_topp = h_temp + R;
+        int* h_topk = reinterpret_cast<int*>(h_topp + R);
+        int* h_out = h_topk + R;
+        unsigned long long* h_seed = reinterpret_cast<unsigned long long*>(h_out + R);
+        unsigned long long* h_step = h_seed + R;
+        cu(cudaMemcpyAsync(h_v, s.vr_tk_v, (size_t)n * K * sizeof(float), cudaMemcpyDeviceToHost, st),
+           "tp verify topk v");
+        cu(cudaMemcpyAsync(h_i, s.vr_tk_i, (size_t)n * K * sizeof(int), cudaMemcpyDeviceToHost, st),
+           "tp verify topk i");
+        cu(cudaStreamSynchronize(st), "tp verify topk sync");
+        tp_exchange_topk(h_v, h_i, n, Vr, h_mv, h_mi);
+        for (int r = 0; r < n; r++) {
+            const SpecSampleRow& p = row_sample[r];
+            h_temp[r] = p.temperature;
+            h_topk[r] = p.top_k;
+            h_topp[r] = p.top_p;
+            h_seed[r] = p.seed;
+            h_step[r] = p.step;
+        }
+        cu(cudaMemcpyAsync(s.vr_mg_v, h_mv, (size_t)n * K * sizeof(float), cudaMemcpyHostToDevice, st),
+           "tp verify cand v");
+        cu(cudaMemcpyAsync(s.vr_mg_i, h_mi, (size_t)n * K * sizeof(int), cudaMemcpyHostToDevice, st),
+           "tp verify cand i");
+        cu(cudaMemcpyAsync(s.vr_smp_temp, h_temp, (size_t)n * sizeof(float), cudaMemcpyHostToDevice, st), "smp temp");
+        cu(cudaMemcpyAsync(s.vr_smp_topp, h_topp, (size_t)n * sizeof(float), cudaMemcpyHostToDevice, st), "smp topp");
+        cu(cudaMemcpyAsync(s.vr_smp_topk, h_topk, (size_t)n * sizeof(int), cudaMemcpyHostToDevice, st), "smp topk");
+        cu(cudaMemcpyAsync(s.vr_smp_seed, h_seed, (size_t)n * sizeof(unsigned long long),
+                           cudaMemcpyHostToDevice, st), "smp seed");
+        cu(cudaMemcpyAsync(s.vr_smp_step, h_step, (size_t)n * sizeof(unsigned long long),
+                           cudaMemcpyHostToDevice, st), "smp step");
+        dflash_kernels::launch_rows_sample_candidates(s.vr_mg_v, s.vr_mg_i, n, K, s.vr_smp_temp,
+                                                      s.vr_smp_topk, s.vr_smp_topp, s.vr_smp_seed,
+                                                      s.vr_smp_step, s.vr_smp_out, st);
+        cu(cudaMemcpyAsync(h_out, s.vr_smp_out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+           "smp out");
+        cu(cudaStreamSynchronize(st), "tp verify sample sync");
+        for (int r = 0; r < n; r++) out_argmax[r] = h_out[r];
+    } else if (!head_ar && n <= 64) {
         kernels::launch_argmax(s.vr_lh, s.vr_out, n, Vr, st);
         cu(cudaMemcpyAsync(s.h_vr + 3 * R, s.vr_out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
            "tp verify local argmax");
@@ -5281,6 +5361,41 @@ void tp_exchange_argmax(const float* val, const int* idx, int n, int rows_per_ra
     for (int i = 0; i < n; i++) out[i] = g_tp_amax_idx[0][i];
     // The peer reads slot 0 after the leader's post; hold the leader until it has, so the next
     // exchange cannot overwrite slot 0 under it.
+    tp_prefill_agree_min(0);
+}
+
+// Slots for tp_exchange_topk, as for tp_exchange_argmax: each rank writes its own before arriving.
+static float g_tp_tk_val[2][32 * dflash_kernels::kRowsTopkMax];
+static int g_tp_tk_idx[2][32 * dflash_kernels::kRowsTopkMax];
+void tp_exchange_topk(const float* val, const int* idx, int n, int rows_per_rank, float* out_v,
+                      int* out_i) {
+    const int K = dflash_kernels::kRowsTopkMax;
+    const int r = tp_prefill_rank();
+    if (r < 0 || n > 32) {
+        for (int i = 0; i < n * K; i++) { out_v[i] = val[i]; out_i[i] = idx[i]; }
+        return;
+    }
+    for (int i = 0; i < n * K; i++) {
+        g_tp_tk_val[r][i] = val[i];
+        g_tp_tk_idx[r][i] = idx[i] == INT_MAX ? INT_MAX : idx[i] + r * rows_per_rank;
+    }
+    if (r != 0) tp_peer_rendezvous("topk exchange");
+    else tp_leader_rendezvous("topk exchange", [] {});
+    // Both halves are published: merge them here, the same way on each rank.
+    auto better = [](float av, int ai, float bv, int bi) { return av > bv || (av == bv && ai < bi); };
+    for (int row = 0; row < n; row++) {
+        const float* v0 = g_tp_tk_val[0] + row * K;
+        const int* i0 = g_tp_tk_idx[0] + row * K;
+        const float* v1 = g_tp_tk_val[1] + row * K;
+        const int* i1 = g_tp_tk_idx[1] + row * K;
+        int a = 0, b = 0;
+        for (int k = 0; k < K; k++) {
+            const bool take0 = b >= K || (a < K && better(v0[a], i0[a], v1[b], i1[b]));
+            out_v[row * K + k] = take0 ? v0[a] : v1[b];
+            out_i[row * K + k] = take0 ? i0[a++] : i1[b++];
+        }
+    }
+    // The peer has read both slots once the leader passes this: the next exchange may overwrite.
     tp_prefill_agree_min(0);
 }
 
@@ -8545,13 +8660,13 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
 // batched_forward), only the leader captures. Returns n, or -1 when declined (nothing changed).
 int Qwen35Model::spec_group_verify(const int* ids, int n, const int* row_pos,
                                    const uint64_t* row_seq, int seg_n, void* const* seg_capture,
-                                   int* out_argmax, int* seg_keep) {
+                                   int* out_argmax, int* seg_keep, const SpecSampleRow* row_sample) {
     if (!tp_active() || seg_n < 1 || n < 1) return -1;
     std::vector<int> peer_out(n), peer_keep(seg_n);
     TP_MIRROR(spec_group_verify(ids, n, row_pos, row_seq, seg_n, nullptr, peer_out.data(),
-                                peer_keep.data()));
+                                peer_keep.data(), row_sample));
     return tp_rows_forward(ids, n, 0, row_pos, row_seq, nullptr, out_argmax, seg_n, seg_capture,
-                           seg_keep);
+                           seg_keep, row_sample);
 }
 
 // Frees the per-segment GDN snapshots of the segmented verify (both ranks).
@@ -8930,6 +9045,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
 
     std::vector<int> ids, pos, argmax, keep, draft_ids(B + 1, 0);
     std::vector<uint64_t> seq;
+    std::vector<SpecSampleRow> smp;
     std::vector<void*> caps;
     while (group_ok) {
         // Active sessions of this step.
@@ -8989,9 +9105,26 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                     seq[t * S + j] = act[j]->job->seq_id;
                 }
             }
+            // Sampled sessions: each row draws its token as decode would at that step (the
+            // request's count of tokens emitted before it: the first, from the prefill, is 0).
+            smp.clear();
+            for (int j = 0; j < S && smp.empty(); j++)
+                if (act[j]->job->temperature > 0.f) smp.resize(n);
+            for (int j = 0; j < S && !smp.empty(); j++) {
+                const SpecGroupJob& jb = *act[j]->job;
+                for (int t = 0; t < T; t++) {
+                    SpecSampleRow& rs = smp[t * S + j];
+                    rs.temperature = jb.temperature;
+                    rs.top_k = jb.top_k;
+                    rs.top_p = jb.top_p;
+                    rs.seed = jb.seed;
+                    rs.step = (unsigned long long)(act[j]->start + t + 1 - act[j]->n);
+                }
+            }
             auto _tv = std::chrono::steady_clock::now();
             const int r = spec_group_verify(ids.data(), n, pos.data(), seq.data(), S, caps.data(),
-                                            argmax.data(), keep.data());
+                                            argmax.data(), keep.data(),
+                                            smp.empty() ? nullptr : smp.data());
             if (kTiming) t_verify += ms_since(_tv);
             if (r != n) { fprintf(stderr, "[spec-group] verify declined (S=%d T=%d)\n", S, T); break; }
         }
@@ -9043,7 +9176,11 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             }
         }
         if (kMinGain > 0) {
-            const double plain = plain_decode_ms(S);
+            // Ordinary decode packs greedy sessions into one step; with a sampled one among them
+            // every session takes its own (ContinuousBatchEngine::step_jobs_packed declines).
+            bool any_sampled = false;
+            for (G* g : act) any_sampled |= g->job->temperature > 0.f;
+            const double plain = any_sampled ? S * plain_decode_ms(1) : plain_decode_ms(S);
             gain_won[gain_steps % kGainWindow] = (double)step_tokens * plain;
             gain_cost[gain_steps % kGainWindow] = (double)S * step_ms;
             double won = 0, cost = 0;

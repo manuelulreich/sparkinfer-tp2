@@ -38,6 +38,23 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
 int attn_gqa_kv_lo(int q_len, int kv_len, int n_q, int n_kv, int d,
                    int q_pos0, int k_pos0, int window);
 
+// (plan 06, P) Speculative sampling at tp=2.
+// Exact top-k (k <= kRowsTopkMax) of each f32 row x[r][0..V), ordered by value descending, ties by
+// the lower index (the order the sampler's stable descending sort gives); NaN counts as -inf.
+// out_v / out_i: [n_rows][kRowsTopkMax], local indices; slots past k are -inf / INT_MAX.
+constexpr int kRowsTopkMax = 64;
+void launch_rows_topk(const float* x, int n_rows, int V, int k, float* out_v, int* out_i,
+                      cudaStream_t stream);
+// One token per row from its m candidates (ordered as launch_rows_topk orders them, global ids),
+// as the decode sampler draws it from the full row: top_k / top_p (softmax at temperature 1) mask,
+// then argmax of logit / T + Gumbel noise keyed by (seed, token id, step) -- the same Philox draw,
+// so a row sampled here equals the token ordinary decode samples at that step. temp <= 0: the
+// first candidate (argmax). Per-row parameters, device arrays of n_rows.
+void launch_rows_sample_candidates(const float* cand_v, const int* cand_i, int n_rows, int m,
+                                   const float* temp, const int* top_k, const float* top_p,
+                                   const unsigned long long* seed, const unsigned long long* step,
+                                   int* out, cudaStream_t stream);
+
 // In-place RoPE on [seq, n_heads, d] bf16. positions[i] = pos0 + i.
 void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0,
                      float theta, cudaStream_t stream);

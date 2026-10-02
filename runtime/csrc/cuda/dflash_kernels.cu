@@ -2,6 +2,8 @@
 #include "sparkinfer/models/dflash_kernels.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2310,6 +2312,142 @@ void launch_confidence_head_rows(const void* hidden, int hidden_stride,
     k_confidence_head_rows<<<rows, threads, threads * sizeof(float), stream>>>(
         (const bf16*)hidden, hidden_stride, latent, latent_stride,
         (const bf16*)w, bias, H, rank, row0, out_confidence);
+}
+
+// ---- speculative sampling (plan 06, P) ---------------------------------------------------------
+namespace {
+constexpr int kTkThreads = 1024;
+constexpr int kTkLocal = 4;                       // per-thread candidates in the first pass
+constexpr int kTkSlots = kTkThreads * kTkLocal;   // 4096
+
+__device__ __forceinline__ bool tk_better(float av, int ai, float bv, int bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+// Bitonic sort of kTkSlots (value, index) pairs in shared memory, best first.
+__device__ void tk_sort(float* v, int* ix) {
+    for (int size = 2; size <= kTkSlots; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = threadIdx.x; i < kTkSlots; i += kTkThreads) {
+                const int j = i ^ stride;
+                if (j <= i) continue;
+                const bool best_first = (i & size) == 0;
+                const bool swap = best_first ? tk_better(v[j], ix[j], v[i], ix[i])
+                                             : tk_better(v[i], ix[i], v[j], ix[j]);
+                if (swap) {
+                    const float tv = v[i]; v[i] = v[j]; v[j] = tv;
+                    const int ti = ix[i]; ix[i] = ix[j]; ix[j] = ti;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Pass 1: every thread keeps its best kTkLocal; the k-th best of those 4096 is a lower bound tau
+// on the row's k-th best. Pass 2 collects every element >= tau (the row's top k plus whatever a
+// thread could not keep), sorts them and writes the first k.
+__global__ void __launch_bounds__(kTkThreads) k_rows_topk(const float* __restrict__ x, int V, int k,
+                                                           float* __restrict__ out_v,
+                                                           int* __restrict__ out_i) {
+    __shared__ float sv[kTkSlots];
+    __shared__ int si[kTkSlots];
+    __shared__ int s_cnt;
+    __shared__ float s_tau;
+    const float* L = x + (size_t)blockIdx.x * V;
+    float lv[kTkLocal];
+    int li[kTkLocal];
+#pragma unroll
+    for (int j = 0; j < kTkLocal; j++) { lv[j] = -INFINITY; li[j] = INT_MAX; }
+    for (int v = threadIdx.x; v < V; v += kTkThreads) {
+        float a = L[v];
+        if (a != a) a = -INFINITY;
+        if (!tk_better(a, v, lv[kTkLocal - 1], li[kTkLocal - 1])) continue;
+        int p = kTkLocal - 1;
+        while (p > 0 && tk_better(a, v, lv[p - 1], li[p - 1])) { lv[p] = lv[p - 1]; li[p] = li[p - 1]; --p; }
+        lv[p] = a;
+        li[p] = v;
+    }
+#pragma unroll
+    for (int j = 0; j < kTkLocal; j++) { sv[threadIdx.x * kTkLocal + j] = lv[j]; si[threadIdx.x * kTkLocal + j] = li[j]; }
+    __syncthreads();
+    tk_sort(sv, si);
+    if (threadIdx.x == 0) { s_tau = sv[k - 1]; s_cnt = 0; }
+    __syncthreads();
+    const float tau = s_tau;
+    for (int i = threadIdx.x; i < kTkSlots; i += kTkThreads) { sv[i] = -INFINITY; si[i] = INT_MAX; }
+    __syncthreads();
+    for (int v = threadIdx.x; v < V; v += kTkThreads) {
+        float a = L[v];
+        if (a != a) a = -INFINITY;
+        // tau == -inf: the row has fewer than k finite values; keep only those.
+        if (a > tau || (a == tau && tau != -INFINITY)) {
+            const int slot = atomicAdd(&s_cnt, 1);
+            if (slot < kTkSlots) { sv[slot] = a; si[slot] = v; }
+        }
+    }
+    __syncthreads();
+    tk_sort(sv, si);
+    for (int j = threadIdx.x; j < kRowsTopkMax; j += kTkThreads) {
+        out_v[(size_t)blockIdx.x * kRowsTopkMax + j] = j < k ? sv[j] : -INFINITY;
+        out_i[(size_t)blockIdx.x * kRowsTopkMax + j] = j < k ? si[j] : INT_MAX;
+    }
+}
+
+// One thread per row: m candidates are few, and the top_p prefix sum is taken in order.
+__global__ void k_rows_sample_candidates(const float* __restrict__ cv, const int* __restrict__ ci,
+                                         int n_rows, int m, const float* __restrict__ temp,
+                                         const int* __restrict__ top_k,
+                                         const float* __restrict__ top_p,
+                                         const unsigned long long* __restrict__ seed,
+                                         const unsigned long long* __restrict__ step,
+                                         int* __restrict__ out) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_rows) return;
+    const float* v = cv + (size_t)r * m;
+    const int* ix = ci + (size_t)r * m;
+    const float T = temp[r];
+    if (T <= 0.f) { out[r] = ix[0]; return; }
+    int k = top_k[r];
+    if (k <= 0 || k > m) k = m;
+    float cum[kRowsTopkMax];
+    float run = 0.f;
+    for (int i = 0; i < k; i++) { run += __expf(v[i] - v[0]); cum[i] = run; }
+    const float p = top_p[r];
+    const bool p_active = p >= 0.f && p < 1.f;
+    const float total = cum[k - 1];
+    const float inv_t = 1.f / T;
+    float best = -INFINITY;
+    int bi = ix[0];
+    for (int i = 0; i < k; i++) {
+        if (i > 0 && p_active && !(cum[i - 1] < p * total)) break;
+        if (ix[i] == INT_MAX || v[i] == -INFINITY) break;
+        curandStatePhilox4_32_10_t st;
+        curand_init(seed[r], (unsigned long long)ix[i], step[r], &st);
+        const float u = fminf(curand_uniform(&st), 0.99999994f);
+        const float g = -logf(-logf(u));
+        const float val = v[i] * inv_t + g;
+        if (val > best || (val == best && ix[i] < bi)) { best = val; bi = ix[i]; }
+    }
+    out[r] = bi;
+}
+}  // namespace
+
+void launch_rows_topk(const float* x, int n_rows, int V, int k, float* out_v, int* out_i,
+                      cudaStream_t stream) {
+    if (n_rows <= 0 || V <= 0) return;
+    k = k < 1 ? 1 : (k > kRowsTopkMax ? kRowsTopkMax : k);
+    if (k > V) k = V;
+    k_rows_topk<<<n_rows, kTkThreads, 0, stream>>>(x, V, k, out_v, out_i);
+}
+
+void launch_rows_sample_candidates(const float* cand_v, const int* cand_i, int n_rows, int m,
+                                   const float* temp, const int* top_k, const float* top_p,
+                                   const unsigned long long* seed, const unsigned long long* step,
+                                   int* out, cudaStream_t stream) {
+    if (n_rows <= 0 || m <= 0 || m > kRowsTopkMax) return;
+    k_rows_sample_candidates<<<(n_rows + 31) / 32, 32, 0, stream>>>(cand_v, cand_i, n_rows, m, temp,
+                                                                   top_k, top_p, seed, step, out);
 }
 
 } // namespace dflash_kernels

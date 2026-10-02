@@ -99,6 +99,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 DSpark: sampled requests speculate** (temperature > 0, `top_k` 1-64, the defaults
+  opencode gets from `generation_config.json`). Each verified token is drawn exactly as decode
+  draws it -- the same top-k/top-p mask and the same seeded Gumbel noise per step, from the exact
+  top 64 of each card's vocabulary half -- so the output equals ordinary sampled decode
+  (byte-identical under `SPARKINFER_DETERMINISTIC=1`). `SPARKINFER_SPEC_SAMPLING=0` turns it off.
 - **tp=2 DSpark: every turn of a long conversation speculates.** The drafter's KV state per
   request is now a fixed 12288 + 2 blocks positions (~123 MB a card) that slides, keeping its
   newest 4096 positions, instead of growing with the context; speculated requests take prefix-cache

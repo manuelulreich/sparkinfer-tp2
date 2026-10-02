@@ -228,6 +228,8 @@ The target's hidden states at the capture layers are already identical on both c
 
 ## P. Speculative sampling (temperature > 0)
 
+**Status: done (2026-10-02), with a different accept rule than planned.** The decode sampler is Gumbel-max with Philox noise keyed by (seed, token id, step = tokens emitted before). The verify draws each row's token with that same noise, from the exact global top-k (each card's top-64 merged on the host, then a one-thread-per-row kernel run identically on both cards), and accepts a proposal when it equals the drawn token. A point-mass draft is accepted with probability p(x) either way, so acceptance is the same as the rejection rule's, but the output is exactly what ordinary sampled decode emits for that seed (checked byte for byte at `--ctx 32768`, deterministic, on a short story and a 13.7k-token tool prompt). The top-p prefix sum is sequential here and a CUB scan in decode, so a token on the top-p boundary can in rare cases differ by rounding. `top_k` in [1, 64], no penalties or logit_bias; `SPARKINFER_SPEC_SAMPLING=0` turns it off. Measured acceptance at temperature 1 on a story: ~1.5 tokens a step over 30 ms steps, about break-even with plain decode, so the group's gain check hands such requests back; on the tool prompt (depth 2) gain ~1.7. Sampled multi-turn throughput not yet measured.
+
 **Rule.** The DSpark draft is greedy, so each proposal is a single token x (the draft distribution q is a point mass).
 - With the target's processed distribution p (temperature, top-k, top-p, exactly as non-speculative sampling builds it), row t accepts x with probability p(x).
 - On rejection, sample from p with x removed, renormalised.

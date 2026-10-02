@@ -432,6 +432,12 @@ public:
         // the rest). Its draft snapshot, if any, seeds the draft's context.
         int start = 0;
         const RecurrentStateSnapshot* start_state = nullptr;
+        // Sampling (plan 06, P): temperature > 0 draws each verified token as decode would
+        // (SpecSampleRow); 0 is greedy.
+        float temperature = 0.f;
+        int top_k = 0;
+        float top_p = 1.f;
+        unsigned long long seed = 0;
     };
     struct SpecGroupHooks {
         // Between steps, no lock held: append jobs to join; false stops the group.
@@ -445,8 +451,19 @@ public:
     void note_plain_decode(int rows, double ms);
     double plain_decode_ms(int rows) const;
     void dflash_generate_group(std::vector<SpecGroupJob*> jobs, const SpecGroupHooks& hooks);
+    // (plan 06, P) How a verify row picks its token: temperature <= 0 is greedy (argmax); above,
+    // the decode sampler's draw (top_k in [1, 64], top_p, Gumbel noise of seed at `step`, the
+    // request's count of tokens emitted before this one), so a speculated sampled request emits
+    // what ordinary decode would.
+    struct SpecSampleRow {
+        float temperature = 0.f;
+        int top_k = 0;
+        float top_p = 1.f;
+        unsigned long long seed = 0, step = 0;
+    };
     int spec_group_verify(const int* ids, int n, const int* row_pos, const uint64_t* row_seq,
-                          int seg_n, void* const* seg_capture, int* out_argmax, int* seg_keep);
+                          int seg_n, void* const* seg_capture, int* out_argmax, int* seg_keep,
+                          const SpecSampleRow* row_sample = nullptr);
     void spec_group_release();
 
     std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
@@ -876,7 +893,8 @@ private:
     int verify_rows_tp(const int* ids, int n, int start_pos, void* capture_dst, int* out_argmax);
     int tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
                         const uint64_t* row_seq, void* capture_dst, int* out_argmax,
-                        int seg_n = 0, void* const* seg_capture = nullptr, int* seg_keep = nullptr);
+                        int seg_n = 0, void* const* seg_capture = nullptr, int* seg_keep = nullptr,
+                        const SpecSampleRow* row_sample = nullptr);
     bool tp_verify_alloc();
     void reserve_tp_verify_local(bool* ok);
     // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or
@@ -917,6 +935,10 @@ int tp_prefill_agree_and(int v);
 // Row-wise argmax over the vocab-split head: each rank passes its half's best value and local
 // index per row (n <= 64); both get the global vocab index (ties to rank 0, the lower half).
 void tp_exchange_argmax(const float* val, const int* idx, int n, int rows_per_rank, int* out);
+// (plan 06, P) Each rank's per-row candidates ([n][64], best first, local ids) -> the merged best
+// 64 per row over both halves (global ids), identical on both ranks.
+void tp_exchange_topk(const float* val, const int* idx, int n, int rows_per_rank, float* out_v,
+                      int* out_i);
 
 // (dual-GPU) Sum a bf16 buffer across the two ranks in place, posted on the caller's `stream`
 // (both ranks call it at the same point of a mirrored pass, each with its own buffer and stream;

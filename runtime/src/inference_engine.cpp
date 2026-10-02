@@ -336,7 +336,16 @@ bool ContinuousBatchEngine::spec_eligible(const Request& r) {
     // the vision splice ordinary prefill does. A prefix-cache hit (prefill_start > 0) speculates
     // in the group path only, which prefills the rest and starts the draft from the entry's
     // snapshot (dflash_generate cannot start past 0).
-    return !r.constraint && r.temperature <= 0.f && r.presence_penalty == 0.f &&
+    // Sampling (temperature > 0) speculates in the group path only, drawing each verified token
+    // as decode would (Qwen35Model::SpecSampleRow), so its output is what decode would emit; its
+    // candidates are each row's top 64, hence top_k in [1, 64] (SPARKINFER_SPEC_SAMPLING=0: off).
+    static const bool kSpecSampling = [] {
+        const char* e = getenv("SPARKINFER_SPEC_SAMPLING");
+        return !(e && e[0] == '0');
+    }();
+    const bool sampling_ok = r.temperature <= 0.f ||
+                             (kSpecSampling && r.top_k >= 1 && r.top_k <= 64);
+    return !r.constraint && sampling_ok && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
            r.forced_tokens.empty() && r.vision_pos.empty() && !r.use_prefix_session;
 }
@@ -434,6 +443,10 @@ void ContinuousBatchEngine::run_speculative_group(const std::vector<Job*>& first
         m->gj.on_tokens = [this, job](const int* t, int n) { return spec_emit(*job, t, n); };
         // The same checkpoints step_job's prefill would take (spec_eligible already excludes
         // images and forced tokens); finish_job_impl offers them to the cache.
+        m->gj.temperature = job->req.temperature;
+        m->gj.top_k = job->req.top_k;
+        m->gj.top_p = job->req.top_p;
+        m->gj.seed = job->req.seed;
         if (job->req.prefill_start > 0) {
             m->gj.start = job->req.prefill_start;
             m->gj.start_state = &job->hit_state;
@@ -782,7 +795,7 @@ void ContinuousBatchEngine::worker_loop() {
                     if (live == 1 && !(spec_group_single() && model_->spec_group_supported()) &&
                         !only->spec_tried && only->phase == SeqPhase::PREFILL &&
                         only->prefill_pos == 0 && only->req.prefill_start == 0 &&
-                        spec_eligible(only->req)) {
+                        only->req.temperature <= 0.f && spec_eligible(only->req)) {
                         spec_job = only;
                         // Raised under mu_, which submit_locked also holds: a request submitted from
                         // here on sees it and interrupts; one submitted before made live == 2.
