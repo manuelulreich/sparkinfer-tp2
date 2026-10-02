@@ -33,6 +33,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **A request without `max_tokens` is no longer cut off at 256 tokens.** The server already
+  treated a missing limit as "until the model stops, up to `SPARKINFER_MAX_OUTPUT_TOKENS`" (#1088),
+  but the request parser defaulted the field to 256, so that rule never applied: a thinking model's
+  answers stopped mid-reasoning with an empty `content` and `finish_reason: "length"`.
 - **A prefix-cache hit no longer falls into the token loop when the card is short of memory.**
   The prefill that continues a cached prefix (every agent turn) retried with windows only when
   the continuation was longer than the window; a shorter one, or a window that declined too, went

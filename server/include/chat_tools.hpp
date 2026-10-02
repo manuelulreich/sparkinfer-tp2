@@ -157,7 +157,10 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
 struct RequestControls {
     bool stream = false;
     bool include_usage = false;
-    int max_tokens = 256;
+    // 0 = the request set no limit (max_tokens / max_completion_tokens absent): the server then
+    // generates until the model stops, up to SPARKINFER_MAX_OUTPUT_TOKENS (#1088). This was 256,
+    // which made that rule unreachable -- every request without a limit stopped at 256 tokens.
+    int max_tokens = 0;
     std::vector<std::string> stop;
     // <= 0 (default) is plain greedy argmax, byte-identical to pre-sampling behavior.
     float temperature = 0.f;

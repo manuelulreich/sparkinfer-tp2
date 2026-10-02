@@ -1376,6 +1376,22 @@ bool test_request_controls_sampling_set_flags() {
     return true;
 }
 
+bool test_request_controls_max_tokens_unset() {
+    // #1088: an omitted limit must reach the server as "unset" (0), which generates up to the output
+    // cap. It used to default to 256, so a thinking model's answers stopped mid-reasoning.
+    RequestControls omitted;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", omitted, err));
+    CHECK(omitted.max_tokens == 0);
+    RequestControls explicit_limit;
+    CHECK(parse_request_controls(R"({"max_tokens":300})", explicit_limit, err));
+    CHECK(explicit_limit.max_tokens == 300);
+    RequestControls completion_limit;
+    CHECK(parse_request_controls(R"({"max_completion_tokens":512})", completion_limit, err));
+    CHECK(completion_limit.max_tokens == 512);
+    return true;
+}
+
 bool test_request_controls_temperature_validation() {
     RequestControls controls;
     std::string err;
@@ -2135,6 +2151,7 @@ int main() {
     if (!test_response_format_text_is_a_prompt_noop()) return 1;
     if (!test_validate_response_format_json_object()) return 1;
     if (!test_validate_response_format_json_schema()) return 1;
+    if (!test_request_controls_max_tokens_unset()) return 1;
     if (!test_request_controls_temperature_validation()) return 1;
     if (!test_request_controls_sampling_set_flags()) return 1;
     if (!test_truncated_tool_turn_keeps_reasoning()) return 1;
