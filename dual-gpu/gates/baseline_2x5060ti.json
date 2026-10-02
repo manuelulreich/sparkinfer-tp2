@@ -2,10 +2,10 @@
   "perf": {
     "decode_tps": 54.5,
     "prefill_tps_3072": 3494.4,
-    "prefill_tps_3074": 2950.3,
+    "prefill_tps_3074": 3401.3,
     "dspark_tps_count": 231.0,
     "dspark_tps_list": 77.9
   },
-  "recorded": "2026-10-02 09:11",
+  "recorded": "2026-10-02 11:33",
   "note": "tp=2 no-regression baseline (27B NVFP4 + DSpark, 2x RTX 5060 Ti, PCIe Gen3 x8 P2P); re-record per box/driver, never loosen"
 }

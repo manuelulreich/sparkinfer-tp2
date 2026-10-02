@@ -22,6 +22,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   normalized buffer, which then still held an earlier layer's value.
 - **tp=2 DSpark verify shared one GDN conv-weight cache between the two cards**, so each card kept
   overwriting the other's copy. It is now per card.
+- **tp=2 prefill could read stale scratch.** The two-card GDN path writes only its own columns of
+  some full-width prefill buffers and relied on the other card's columns being zero, which held
+  only while the reused scratch was fresh. After certain request sequences a 16k prompt scored
+  0.19 nats/token worse than on a fresh server. The buffers are now cleared every pass.
 - **At most 8 requests ran at once on hosts with few CPU cores.** The HTTP server used the
   library's default worker pool, max(8, cores - 1), and each in-flight request holds a worker for
   its whole generation, so on a 4-core host the batch engine never saw more than 8 requests. The
@@ -34,6 +38,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 prefill of prompts whose length is not a multiple of 8** now also runs on the FP4 tensor
+  cores (it fell back to int8 conversion): 919 tokens 1,479 → 2,872 tok/s, 1,047 1,699 → 3,438,
+  3,074 2,949 → 3,402. Two-card serving only; `SPARKINFER_NVFP4_ANY_M=0/1` overrides.
 - **tp=2 concurrent decode is batched across requests**: 54 → 97 / 166 / 217 tok/s aggregate at
   2 / 4 / 8 concurrent greedy requests (1k context; was 54 at every concurrency). One row-batched
   forward serves every request's next token (the DSpark verify's rows path, each row on its own

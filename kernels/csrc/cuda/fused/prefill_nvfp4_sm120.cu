@@ -1,3 +1,4 @@
+#include <atomic>
 #include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
 
@@ -703,12 +704,27 @@ bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
 }
 } // namespace
 
+// The m % 8 row rule is the activation operand's TMA alignment, but the GEMM bounds-checks the
+// M edge itself: m = 3/13/1046/1047 match a CPU matmul at the same ~0.145 FP4 error as aligned
+// m (nvfp4_gemm_check), with compute-sanitizer clean. Lifting it is opt-in per process:
+// prefill_nvfp4_set_any_m() (tp=2 turns it on, where it is worth +18% prefill on a 3074-token
+// prompt) or SPARKINFER_NVFP4_ANY_M=1/0, which overrides either way. tp=1 is unchanged.
+static std::atomic<bool> g_nvfp4_any_m{false};
+void prefill_nvfp4_set_any_m(bool on) { g_nvfp4_any_m.store(on, std::memory_order_relaxed); }
+static bool nvfp4_any_m() {
+    static const int env = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_ANY_M");
+        return e ? (e[0] == '1' ? 1 : 0) : -1;
+    }();
+    return env >= 0 ? env == 1 : g_nvfp4_any_m.load(std::memory_order_relaxed);
+}
 bool prefill_nvfp4_supported(int m, int n, int k) {
     int dev=0, major=0, minor=0;
     return cudaGetDevice(&dev) == cudaSuccess &&
            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
-           major == 12 && minor == 0 && m > 0 && !(m & 7) && !(n & 127) && !(k & 127);
+           major == 12 && minor == 0 && m > 0 && (!(m & 7) || nvfp4_any_m()) &&
+           !(n & 127) && !(k & 127);
 }
 size_t prefill_nvfp4_data_bytes(int r, int c) { return ((size_t)r*c + 1)/2; }
 size_t prefill_nvfp4_scale_bytes_a(int m, int k) {

@@ -1061,6 +1061,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (s.scratch_oom_out) *s.scratch_oom_out = true;
         return -1;
     }
+    // (dual-GPU) The tp GDN branch writes only THIS rank's column windows of the full-width rows
+    // below (launch_gather_rows) and relies on the other rank's windows staying zero -- the conv
+    // runs unwindowed over the whole row against a weight repad that is zero there. "Zero" held
+    // only while the arena slot was fresh memory: these are reused across passes, and a slot an
+    // int8 pass used for something else hands back arbitrary bf16 bit patterns, NaN/Inf among
+    // them, which survive the zero weights. Measured: a 16k prompt scored -2.74 mean logprob after
+    // a 919- and a 4029-token request, -2.55 on a fresh server and with these cleared. About 37 KB
+    // per prompt token of memset, ~0.3 ms per 3k-token pass.
+    if (tp_active && c.hybrid) {
+        pf_cu(cudaMemsetAsync(b8, 0, (size_t)N * wide * sizeof(bf16), st), "zero b8");
+        pf_cu(cudaMemsetAsync(lz, 0, (size_t)N * lvdim * sizeof(bf16), st), "zero lz");
+        pf_cu(cudaMemsetAsync(la, 0, (size_t)N * vh * sizeof(bf16), st), "zero la");
+        pf_cu(cudaMemsetAsync(lb, 0, (size_t)N * vh * sizeof(bf16), st), "zero lb");
+    }
     // Both terms, on both dense paths: the N-row projections and the FC-row FFN chunk each have to
     // fit, and neither one bounds the other once FC and N can differ.
     const int a_wide_k = imax(H, imax(qdim, lvdim));   // widest K quantized with N rows

@@ -3379,6 +3379,9 @@ void Qwen35Model::tp_attach(GpuLink* link, int my_rank, const std::vector<Qwen35
     {
         const int slot = (s.device == link->device_a()) ? 0 : 1;
         g_tp_prefill_link = link;
+        // FP4 prefill at any row count (not just m % 8 == 0): a prompt whose length is not a
+        // multiple of 8 otherwise runs every projection through the int8 conversion path.
+        kernels::prefill_nvfp4_set_any_m(true);
         g_tp_prefill_dev[slot] = s.device;
         g_tp_prefill_stream[slot] = s.stream;
     }

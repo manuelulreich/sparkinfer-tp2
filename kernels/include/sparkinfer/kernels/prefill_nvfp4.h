@@ -7,6 +7,8 @@ namespace sparkinfer::kernels {
 
 // Experimental SM120 native block-scaled NVFP4 dense GEMM support.
 bool prefill_nvfp4_supported(int m, int n, int k);
+// Accept any m > 0 instead of m % 8 == 0 (process-wide; see the definition). Off by default.
+void prefill_nvfp4_set_any_m(bool on);
 size_t prefill_nvfp4_data_bytes(int rows, int cols);
 size_t prefill_nvfp4_scale_bytes_a(int m, int k);
 size_t prefill_nvfp4_scale_bytes_b(int n, int k);
