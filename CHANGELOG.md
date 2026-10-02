@@ -22,9 +22,23 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   normalized buffer, which then still held an earlier layer's value.
 - **tp=2 DSpark verify shared one GDN conv-weight cache between the two cards**, so each card kept
   overwriting the other's copy. It is now per card.
+- **Concurrent greedy requests were never batched.** The server fills top_k/top_p from the
+  checkpoint's `generation_config.json` (Qwen3.8: 20 / 0.95) for requests that omit them, and the
+  packed decode declined any request with a truncation setting -- even at temperature 0, where
+  truncation cannot change the result. So concurrent greedy decode ran one forward per sequence on
+  one card and two. Truncation is now ignored for packing at temperature 0.
 
 ### Performance
 
+- **tp=2 concurrent decode is batched across requests**: 54 → 97 / 166 / 217 tok/s aggregate at
+  2 / 4 / 8 concurrent greedy requests (1k context; was 54 at every concurrency). One row-batched
+  forward serves every request's next token (the DSpark verify's rows path, each row on its own
+  session); deterministic-mode output is byte-identical to sequential decoding.
+  `SPARKINFER_TP_PACKED_ROWS=0` restores the per-request loop.
+- **The DSpark draft frees its bf16 weight copies after quantizing** (2.1 GB): at tp=2 the draft
+  shares card 0 with half the target, and the copies starved the prefill arena and the draft's own
+  capture buffer (`capture context: out of device memory`, after which speculation silently did
+  nothing). `SPARKINFER_DFLASH_KEEP_BF16=1` keeps them.
 - **tp=2 prefill: ~2,200 → ~3,500 tok/s** (2× RTX 5060 Ti, 1k–4k tokens; 3,400 at 8k–16k).
   The GDN and FFN projections now run on the FP4 tensor cores at tp=2 as they do on one card
   (they were converted to int8 on every pass), the GDN conv weights are prepared once instead of
@@ -35,6 +49,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Benchmarks
 
+- `simple_bench.py --cohort FILE`: HyperQwen's cohort test (chat prompts from a JSONL, greedy,
+  `--cohort-len` tokens, at each `--conc`), so the two engines are compared on the same prompts.
+  `SPARKINFER_DSPARK_TIMING=1` now also reports the serving path's DSpark acceptance and step costs.
 - **`bench/scripts/run_benchmarks.sh`**: a prefill and decode ladder against a running server
   (`--max-context`, default 16384; `--conc`, `--decode-len`, `--reps`). Unique prompts per
   request (no prefix-cache hits), exact prompt lengths, timings from the server's `usage`.
