@@ -3823,9 +3823,17 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         // 164.0 -- the crossover sits between 2 and 4 rows.
         const char* e = getenv("SPARKINFER_TP_DECODE_TC_MINROWS"); return e ? atoi(e) : 4;
     }();
+    // A single session's DSpark verify (rows = consecutive positions) takes the same form: the
+    // verify is then W4A4 like the packed decode, so its accepted tokens are no longer the
+    // dp4a-decode's bit for bit -- outside deterministic mode only, as the packed decode.
+    // Measured (HyperQwen cohort, 512 tokens, C1): verify 31.9 -> 25.2 ms, 77.4 -> 98.4 tok/s at
+    // the same mean accept. SPARKINFER_TP_VERIFY_TC=0 keeps the dp4a verify.
+    static const bool verify_tc_env = [] {
+        const char* e = getenv("SPARKINFER_TP_VERIFY_TC"); return !(e && e[0] == '0');
+    }();
     const int mp = (n + 7) & ~7;
-    bool tc = multi && tc_env && n >= tc_min && mp <= R && !deterministic_mode() &&
-              s.vr_tc_state >= 0;
+    bool tc = (multi || verify_tc_env) && tc_env && n >= tc_min && mp <= R &&
+              !deterministic_mode() && s.vr_tc_state >= 0;
     if (tc && s.vr_tc_state == 0) {
         const int kmax_tc = std::max(std::max(H, fl), std::max(qdim_l, Kw));
         size_t ws = kernels::prefill_nvfp4_workspace_bytes_f32(R, Vr, H);
@@ -3986,7 +3994,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     static const bool ma_env = [] {
         const char* e = getenv("SPARKINFER_TP_ROWS_ATTN_BATCHED"); return !(e && e[0] == '0');
     }();
-    bool ma = tc && mb && ma_env;
+    bool ma = tc && (mb || !multi) && ma_env;
     const int mbs = s.kv->max_blocks_per_seq();
     if (ma && s.vr_ma_state == 0) {
         const size_t fa = (size_t)R * n_q * Impl::MAX_NSPLITS;

@@ -42,6 +42,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 DSpark verify runs on the FP4 tensor cores** (single request; it used the dp4a row
+  GEMVs): verify 31.9 → 25.2 ms per 7-row block, HyperQwen cohort C1 77.4 → 98.4 tok/s at the same
+  mean acceptance (~2.8), gate `dspark_count` 240 → 295. W4A4 like the batched decode, so outside
+  deterministic mode only (the lossless gate is unchanged); `SPARKINFER_TP_VERIFY_TC=0` restores
+  the dp4a verify.
 - **tp=2 prefill of prompts whose length is not a multiple of 8** now also runs on the FP4 tensor
   cores (it fell back to int8 conversion): 919 tokens 1,479 → 2,872 tok/s, 1,047 1,699 → 3,438,
   3,074 2,949 → 3,402. Two-card serving only; `SPARKINFER_NVFP4_ANY_M=0/1` overrides.
