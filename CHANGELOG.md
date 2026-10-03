@@ -15,7 +15,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   cached beside the checkpoint (`SPARKINFER_DFLASH2_NVFP4_CACHE`). Lossless (tp2 gates 7/7).
   DSpark -> DFlash2: gate counting 275 -> 303 tok/s, list prose 83.5 -> 111.7; a 60k-context
   opencode turn greedy 76.8 -> 100.0 tok/s (3.56 tokens a step; HyperQwen's vLLM DFlash2 102),
-  sampled 50.8 -> 76.6 (2.73 a step; HyperQwen 114 with rejection sampling).
+  sampled 50.8 -> 91-94.5 (3.27-3.37 a step; HyperQwen 114 at 3.74 over a 216-token sample).
+  For a sampled request the selector walks with the request's own sampler (top_k, top_p, and
+  the Philox Gumbel noise the verify row will draw that position with), so a proposal lands
+  whenever the drafter's distribution agrees with the target's -- 2.73 -> 3.3 tokens a step --
+  while the output stays exactly ordinary sampled decode (deterministic mode: byte-identical).
 
 - **tp=2: DSpark speculates on tool-calling requests.** A request with tools is decoded under
   the tool grammar, and constrained requests never speculated -- so an agent (opencode sends

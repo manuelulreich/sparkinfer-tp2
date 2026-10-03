@@ -218,7 +218,19 @@ was merged and tested here.**
   | DFlash2 | **100.0 tok/s, 3.56/step**, 30.3 ms verify + 4.3 ms draft | **76.6 tok/s, 2.73/step** |
   | HyperQwen | 102.2 tok/s, 3.42/step | 113.9 tok/s, 3.74/step |
 
-**B5 (next): the sampled gap is the acceptance rule.**
+**B5 done (2026-10-03).**
+- `DraftWalk` is per session: `DraftSeg::walk`, and `set_walk` for the join's first draft.
+- `k_dflash2_select` draws each step as `k_rows_sample_candidates` does: top_k, top_p, and
+  argmax of score/T + g(seed, token, step0 + l), where step0 = start + 1 - n.
+- 60k replay, sampled: 2.73 -> 3.27 / 3.37 tokens a step (two seeds), 76.6 -> 91.0 / 94.5 tok/s.
+  Greedy is unchanged.
+- Exactness: int8, deterministic, two tool turns, greedy and two seeds: byte-identical to
+  non-speculative decode. The hashes are also the same as DSpark's.
+- Short tool turns, sampled: 4.8-5.3 tokens a step.
+- Rejection sampling (vLLM's rule) would add at most the remaining gap to ~3.7. It is not
+  needed now.
+
+Original B5 reasoning:
 - vLLM accepts with rejection sampling (Σ min(p, q) per token). We accept while the draft
   equals the verify row's own draw, which keeps output identical to ordinary sampled decode.
 - With a greedy walk, that accepts a token with probability p(argmax).

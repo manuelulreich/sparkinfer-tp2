@@ -9166,6 +9166,20 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         s.final_seqlen_hint = -1;
     }
 
+    // A sampled session's draft walk (DFlash2) draws each proposal with the noise its verify row
+    // will: block[i] sits at the request's step start + i - n, so the walk's first proposal
+    // (block[1]) is at start + 1 - n.
+    auto walk_of = [](const SpecGroupJob& job, int start, int n) {
+        DFlashDraftModel::DraftWalk w;
+        if (job.temperature > 0.f) {
+            w.temperature = job.temperature;
+            w.top_k = job.top_k;
+            w.top_p = job.top_p;
+            w.seed = job.seed;
+            w.step0 = (unsigned long long)(start + 1 - n);
+        }
+        return w;
+    };
     auto fill_resume = [&](G& g, bool finished, bool failed) {
         SpecResume& r = g.job->resume;
         r = SpecResume{};
@@ -9369,10 +9383,12 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                                 "context from %d (%s)\n", h, g.n - h, from,
                         snap && from < h ? "snapshot" : "none");
         }
-        if (first_ok)
+        if (first_ok) {
+            draft.set_walk(walk_of(*job, g.start, g.n));
             first_ok = draft.forward_block(dflash_context_buffer(), ctx_rows, g.block.data(),
                                            g.start, draft_ids.data(), nullptr, D, nullptr,
                                            ctx_hidden_start);
+        }
         // The prompt's capture rows (51 KB a row, ~0.6 GB at 12k) fed only this first draft;
         // every later step drafts from the session's own `cap`. Give them back now rather than
         // when the group ends, for the prefills of whatever runs meanwhile. The draft has read
@@ -9510,6 +9526,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                 ds.ids = g->block.data();
                 ds.pos0 = g->start;
                 ds.out_argmax = g->draft_out.data();
+                ds.walk = walk_of(*g->job, g->start, g->n);
                 dsegs.push_back(ds);
                 dg.push_back(g);
             }

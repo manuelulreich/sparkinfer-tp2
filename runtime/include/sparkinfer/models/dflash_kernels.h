@@ -73,12 +73,17 @@ void launch_dflash2_conv(const void* x, const void* coef, const void* base, void
 // cand_v[...]; hp[l * hp_stride + r] is the selector's hidden projection of the row backing it.
 //   score(l, j) = u(cand_v) + bf16(sum_r bf16(pred[prev][r] * hp[l][r]) * succ[cand_i][r])
 // with u = bf16(v) * multiplier, then softcap * tanh(u / softcap) when softcap > 0, and prev the
-// token picked at step l - 1 (*anchor, a device int, for step 0). Each step takes its best score
-// (ties to the lower j); out[l] = its id. k <= 32. Candidates outside [0, vocab) score -inf.
+// token picked at step l - 1 (*anchor, a device int, for step 0). temp <= 0: each step takes its
+// best score (ties to the lower j). Above: each step draws as launch_rows_sample_candidates does
+// over the scores (top_k, top_p at temperature 1, argmax of score / temp + the Philox Gumbel noise
+// of (seed, token id, step0 + l))). out[l] = the id. k <= 32. Candidates outside [0, vocab) score
+// -inf.
 void launch_dflash2_select(const int* cand_i, const float* cand_v, int cand_stride,
                            const void* hp, int hp_stride, const int* anchor, const void* pred,
                            const void* succ, int vocab, int rank, int k, int steps,
-                           float multiplier, float softcap, int* out, cudaStream_t stream);
+                           float multiplier, float softcap, int* out, cudaStream_t stream,
+                           float temp = 0.f, int top_k = 0, float top_p = 1.f,
+                           unsigned long long seed = 0, unsigned long long step0 = 0);
 
 // x[i] *= s over n bf16 values.
 void launch_scale_bf16(void* x, long n, float s, cudaStream_t stream);

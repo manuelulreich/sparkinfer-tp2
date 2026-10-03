@@ -615,6 +615,7 @@ inline bool draft_nvfp4() {
 } // namespace
 
 struct DFlashDraftModel::Impl {
+    DraftWalk walk;   // DFlash2: the selector walk of the next block (set_walk; greedy after it)
     DFlashDraftConfig cfg;
     int device = 0;               // the card this instance allocated on (set at construction)
     // (dual-GPU) Split draft. On the rank-0 instance: the rank-1 slice and its device, run beside
@@ -1504,7 +1505,9 @@ struct DFlashDraftModel::Impl {
         dflash_kernels::launch_dflash2_select(d2_tk_i, d2_tk_v, TK, d2_hp + R, R, d_ids, d2_pred,
                                               d2_succ, cfg.vocab, R, K, depth,
                                               cfg.output_multiplier, cfg.logit_softcap, d_out + 1,
-                                              st);
+                                              st, walk.temperature, walk.top_k, walk.top_p,
+                                              walk.seed, walk.step0);
+        walk = DraftWalk{};
         cu(cudaMemcpyAsync(h_out + 1, d_out + 1, depth * sizeof(int), cudaMemcpyDeviceToHost, st),
            "dflash2 proposals");
         if (cudaStreamSynchronize(st) != cudaSuccess) return false;
@@ -1575,6 +1578,8 @@ void DFlashDraftModel::set_embed_split(int local_rows, const void* hi_table, int
     // The cached rows came from the previous table; they are owned allocations, so only forget them.
     p_->embed_hi_cache.clear();
 }
+
+void DFlashDraftModel::set_walk(const DraftWalk& walk) { p_->walk = walk; }
 
 void DFlashDraftModel::set_head_fp4(const void* w, const void* sf, float alpha) {
     p_->hf_w = w;
@@ -3552,6 +3557,7 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
     auto one_by_one = [&]() {
         for (int j = 0; j < n; j++) {
             if (!s.select(seg[j].state)) return false;
+            s.walk = seg[j].walk;
             if (!forward_block_body(seg[j].target_hidden, seg[j].ctx_len, seg[j].ids, seg[j].pos0,
                                     seg[j].out_argmax, stream, proposals, nullptr,
                                     seg[j].target_hidden_start))

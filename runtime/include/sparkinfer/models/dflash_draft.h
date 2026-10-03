@@ -213,7 +213,20 @@ public:
 
     // (dual-GPU) One block for each of n sessions (each on its own kv_state), projections and
     // head batched across them; falls back to forward_block per session where it cannot.
+    // DFlash2: how the selector walks its candidates for one session's block. temperature <= 0
+    // is the greedy walk. Above it, each step draws as the request's sampler does (top_k, top_p,
+    // argmax of score / T + the Gumbel noise of (seed, token, step0 + step)) -- the noise the
+    // verify draws that position with, so a proposal lands whenever the two distributions agree.
+    struct DraftWalk {
+        float temperature = 0.f;
+        int top_k = 0;
+        float top_p = 1.f;
+        unsigned long long seed = 0, step0 = 0;
+    };
+    // The walk of the next forward_block (it reverts to greedy after it).
+    void set_walk(const DraftWalk& walk);
     struct DraftSeg {
+        DraftWalk walk;
         int state = -1;
         const void* target_hidden = nullptr;
         int ctx_len = 0;

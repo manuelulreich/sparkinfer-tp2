@@ -2721,7 +2721,8 @@ __global__ void k_dflash2_select(const int* __restrict__ cand_i, const float* __
                                  const int* __restrict__ anchor, const bf16* __restrict__ pred,
                                  const bf16* __restrict__ succ, int vocab, int rank, int k,
                                  int steps, float multiplier, float softcap,
-                                 int* __restrict__ out) {
+                                 int* __restrict__ out, float temp, int top_k, float top_p,
+                                 unsigned long long seed, unsigned long long step0) {
     extern __shared__ float ph[];   // [rank]
     __shared__ float sc[kSelMaxK];
     __shared__ int prev_tok;
@@ -2756,6 +2757,36 @@ __global__ void k_dflash2_select(const int* __restrict__ cand_i, const float* __
             int best = 0;
             for (int j = 1; j < k; j++)
                 if (sc[j] > sc[best]) best = j;
+            if (temp > 0.f) {
+                // The verify's draw (k_rows_sample_candidates) over this step's scores: order them
+                // best first, keep top_k and the top_p prefix (softmax at temperature 1), take the
+                // argmax of score / temp + the Gumbel noise of (seed, token, step).
+                int ord[kSelMaxK];
+                for (int j = 0; j < k; j++) {
+                    int p = j;
+                    while (p > 0 && sc[j] > sc[ord[p - 1]]) { ord[p] = ord[p - 1]; --p; }
+                    ord[p] = j;
+                }
+                const int kk = top_k > 0 && top_k < k ? top_k : k;
+                float cum[kSelMaxK];
+                float run = 0.f;
+                for (int i = 0; i < kk; i++) { run += __expf(sc[ord[i]] - sc[ord[0]]); cum[i] = run; }
+                const bool p_active = top_p >= 0.f && top_p < 1.f;
+                const float total = cum[kk - 1];
+                const float inv_t = 1.f / temp;
+                float bv = -INFINITY;
+                int btok = INT_MAX;
+                for (int i = 0; i < kk; i++) {
+                    if (i > 0 && p_active && !(cum[i - 1] < top_p * total)) break;
+                    if (sc[ord[i]] == -INFINITY) break;
+                    const int id = cand_i[(size_t)l * cand_stride + ord[i]];
+                    curandStatePhilox4_32_10_t st;
+                    curand_init(seed, (unsigned long long)id, step0 + (unsigned long long)l, &st);
+                    const float u = fminf(curand_uniform(&st), 0.99999994f);
+                    const float val = sc[ord[i]] * inv_t - logf(-logf(u));
+                    if (val > bv || (val == bv && id < btok)) { bv = val; btok = id; best = ord[i]; }
+                }
+            }
             const int tok = cand_i[(size_t)l * cand_stride + best];
             // No valid candidate at all (a row the head could not score): keep the walk defined.
             const int t = tok >= 0 && tok < vocab ? tok : (prev_ok ? prev : 0);
@@ -2784,11 +2815,14 @@ void launch_dflash2_conv(const void* x, const void* coef, const void* base, void
 void launch_dflash2_select(const int* cand_i, const float* cand_v, int cand_stride,
                            const void* hp, int hp_stride, const int* anchor, const void* pred,
                            const void* succ, int vocab, int rank, int k, int steps,
-                           float multiplier, float softcap, int* out, cudaStream_t stream) {
+                           float multiplier, float softcap, int* out, cudaStream_t stream,
+                           float temp, int top_k, float top_p, unsigned long long seed,
+                           unsigned long long step0) {
     if (steps <= 0 || k < 1 || k > kSelMaxK || rank < 1) return;
     k_dflash2_select<<<1, 256, (size_t)rank * sizeof(float), stream>>>(
         cand_i, cand_v, cand_stride, (const bf16*)hp, hp_stride, anchor, (const bf16*)pred,
-        (const bf16*)succ, vocab, rank, k, steps, multiplier, softcap, out);
+        (const bf16*)succ, vocab, rank, k, steps, multiplier, softcap, out, temp, top_k, top_p,
+        seed, step0);
 }
 
 void launch_scale_bf16(void* x, long n, float s, cudaStream_t stream) {
