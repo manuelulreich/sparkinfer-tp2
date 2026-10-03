@@ -104,6 +104,47 @@ What this means:
 - **C4. Seats and joins.** W2 (streamed ingestion) and W7 (chunked join) from plan 06, so a joining 30k prompt does not stall the group's decode.
 - **C5. Memory on card 0.** The drafter, its session state and the verify scratch sit on card 0. At `--ctx 131072` that leaves 8–28 MB free and prefill windows shrink to 2176 (see the log in the answer to "is this expected"). Release the drafter's bf16 copies after quantizing, and move the 168 MB context-projection buffer to card 1 or shrink it (W2).
 
+## Note: balancing VRAM between the cards
+
+**Measured** at `--ctx 131072`, int8 KV, with the drafter:
+
+| | card 0 | card 1 |
+|---|---:|---:|
+| idle | 14,317 MiB | 13,755 MiB |
+| after a 25.6k-token request | 15,095 MiB | 14,457 MiB |
+
+Card 0 carries 560–640 MiB more. The KV pool is sized by the tighter card, so card 1's spare is wasted, and card 0 is the one whose prefill scratch fails first.
+
+**What sits only on card 0 (permanent):**
+
+| item | size |
+|---|---:|
+| the draft's fc projector in bf16, kept for the first block's tensor-core GEMM | 262 MB |
+| fc's Q4 copy | ~74 MB |
+| Markov head w1 (bf16 [248320, 256]) | 127 MB |
+| Markov head w2 (int8 + scales) | ~72 MB |
+| draft logits / head scratch | ~20 MB |
+| **total** | **~555 MB** (matches the measured gap) |
+
+**Transient, during a join:** the capture rows, 51 KB a prompt row. That is up to 210 MB above 12k (the last 4096 rows) and the whole prompt below 12k (up to 630 MB at 12k). This is what pushes card 0 to 8 MB free during a long prefill.
+
+**How vLLM avoids it:** its drafter is a tensor-parallel model like the target.
+- fc is a column/row-parallel linear and the heads and embedding are vocab-parallel, so no rank holds an unsharded piece.
+- The KV block count is the minimum of each rank's profiled free memory.
+
+**Steps to make card 0 ≈ card 1:**
+1. **Split fc along K across the cards (−131 MB bf16 and −37 MB Q4 on card 0, the same added on card 1).**
+   - The target hidden states at the capture layers are identical on both cards after each all-reduce, so card 1 can capture its own half of fc's input columns.
+   - Each card projects its half. The existing zero-padded all-reduce of `target_proj` becomes a real sum, with the same bytes on the link.
+   - The capture rows split the same way, halving card 0's transient.
+   - Gap after this step: ~560 → ~250 MB.
+2. **Drop fc's bf16 copy** by running the first block's projection as an NVFP4 tensor-core GEMM (as the verify and now the draft head do). That frees the 131 MB per card left by step 1. The draft's context projection changes numerically, but it only affects proposals, not output.
+3. **Markov w1 to int8 with a per-row scale** (−63 MB on card 0). It is an embedding lookup of the previous token, read once per proposal row.
+4. **Stream the capture into the draft (plan 06, W2)**, so a join holds a window of rows instead of up to 4096 (−170 MB transient).
+5. What remains (~100–150 MB: w2, head scratch) can be matched by giving card 1 a symmetric buffer that is today only on card 0 (e.g. the verify's sampling scratch), or left as is.
+
+After steps 1–3, card 0 carries ~120 MB more instead of ~560. Its prefill scratch then fails no earlier than card 1's.
+
 ## Order
 
 | # | item | expected effect | effort |
