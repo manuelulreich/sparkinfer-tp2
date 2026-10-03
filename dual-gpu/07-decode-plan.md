@@ -49,6 +49,8 @@ What this means:
   - Give the packed decode per-row sampling (the same kernel as P's per-row draw) so 2–4 sampled sessions share one weight read.
   - Expected: sampled ordinary decode at C4 ~4× faster (the same as greedy packed), and an honest guard.
 
+**A3 status: done (2026-10-03).** The block and each session's capture buffer are sized for `SPARKINFER_NGRAM_DEPTH` (default 15) lookup tokens; a step whose copy runs verifies 16 rows. No draft-side change was needed: an ingest past 8 rows takes the per-session draft path, and the draft KV need is bounded by prompt + output, not by the chunk. Copy of a 150-line file: 267 -> 399 tok/s at 1.7k, 248 -> 354 behind 14k; lossless (deterministic, greedy and sampled); prose unchanged.
+
 **A3. Prompt lookup past 8 rows** (plan 06, N, remaining). While a copy runs, verify up to 15 lookup tokens (HyperQwen's `DFLASH_TOKENS=15`, "381 tok/s while quoting").
   - Size `cap` and the draft's ingest for 16 rows. `forward_blocks` batches only ingests of ≤ 8 rows, so a longer one goes through `forward_block`, or the limit is raised. Leave 16 rows of draft KV slack.
 

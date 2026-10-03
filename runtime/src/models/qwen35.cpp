@@ -8810,10 +8810,10 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     // whose last tokens (SPARKINFER_NGRAM_NMIN..NMAX, default 6..12) occurred earlier in its
     // prompt or output takes what followed them in place of the draft's tokens. While a copy is
     // running -- the previous step accepted every row and agreed with the lookup -- the step
-    // verifies the block's full B rows from the lookup instead of depth_for's depth (2 from
-    // 12288 on, 4 for several sessions): a copied file or quoted tool output lands up to 8
-    // tokens a step there. A step's depth is shared, so it goes long only when every session
-    // has a running copy. SPARKINFER_NGRAM=0 turns it off.
+    // verifies up to kNgramDeep lookup rows instead of depth_for's depth (2 from 12288 on, 4 for
+    // several sessions): a copied file or quoted tool output lands up to 16 tokens a step there.
+    // A step's depth is shared, so it goes long only when every session has a running copy.
+    // SPARKINFER_NGRAM=0 turns it off.
     static const bool kNgram = [] {
         const char* e = getenv("SPARKINFER_NGRAM");
         return !e || atoi(e) != 0;
@@ -8826,6 +8826,13 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         const char* e = getenv("SPARKINFER_NGRAM_NMAX");
         return e ? std::max(kNgramMin, atoi(e)) : std::max(kNgramMin, 12);
     }();
+    // While a copy runs the deep block takes up to SPARKINFER_NGRAM_DEPTH lookup tokens (default 15,
+    // HyperQwen's DFLASH_TOKENS), past the draft's own block; the verify's 32 rows and each
+    // session's capture buffer are what bound it.
+    static const int kNgramDeep = [] {
+        const char* e = getenv("SPARKINFER_NGRAM_DEPTH");
+        return std::max(1, std::min(e ? atoi(e) : 15, kTpVerifyRows - 1));
+    }();
     long ng_steps = 0, ng_long_steps = 0, ng_long_tokens = 0;
     constexpr int kGainWindow = 32;
     double gain_won[kGainWindow] = {}, gain_cost[kGainWindow] = {};
@@ -8837,6 +8844,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     const int mask_id = dc.mask_token_id;
     const int H = s.cfg.hidden;
     const int R = kTpVerifyRows;
+    const int BB = kNgram ? std::max(B, kNgramDeep) : B;   // a block's proposals, lookup included
 
     struct G {
         SpecGroupJob* job = nullptr;
@@ -8844,12 +8852,12 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         int start = 0;           // committed position (prompt + emitted)
         int next = -1;           // verified, not yet emitted
         int state = -1;          // draft KV state
-        bf16* cap = nullptr;     // [B + 1][n_cap * H] capture rows of the last verify
+        bf16* cap = nullptr;     // [BB + 1][n_cap * H] capture rows of the last verify
         int th_len = 0;          // rows of `cap` the next draft ingests
         bool predrafted = false; // block[1..] already holds the join's first draft
         std::vector<int> block, out, draft_out;
         std::vector<int> hist;   // prompt + out: what the lookup searches
-        std::vector<int> lk;     // this step's lookup continuation (B tokens)
+        std::vector<int> lk;     // this step's lookup continuation (BB tokens)
         int lk_len = 0;          // its match length (0: none)
         bool lk_run = false;     // the last step accepted every row and the lookup agreed
         bool done = false;
@@ -8937,7 +8945,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         set_dflash_capture(true, dc.target_layer_ids, B + 1, capture_start,
                            std::min(s.cfg.max_seq, g.n + 1));
         if (!dflash_context_buffer() || !dflash_hidden_buffer()) return false;
-        const size_t cap_bytes = (size_t)(B + 1) * s.dflash_n_cap * H * sizeof(bf16);
+        const size_t cap_bytes = (size_t)(BB + 1) * s.dflash_n_cap * H * sizeof(bf16);
         if (cudaMalloc(&g.cap, cap_bytes) != cudaSuccess) { cudaGetLastError(); g.cap = nullptr; return false; }
         // A state slides (DFlashDraftModel::kv_state_create), so it never needs more than the
         // sliding capacity, whatever the context: 123 MB a card instead of 20 KB a token.
@@ -9032,7 +9040,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         g.start = g.n;
         g.next = next;
         if (kNgram) g.hist.assign(prompt.begin(), prompt.end());
-        g.block.assign(B + 1, mask_id);
+        g.block.assign(BB + 1, mask_id);
         g.block[0] = next;
         draft.kv_state_select(g.state);
         draft.reset();
@@ -9156,12 +9164,12 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         // microseconds at 50k); the deep block needs every session's copy running.
         int Dv = D;
         if (kNgram) {
-            int deep = std::min(B, R / S - 1);
+            int deep = std::min(BB, R / S - 1);
             for (G* g : act) {
-                g->lk.assign(B, 0);
+                g->lk.assign(BB, 0);
                 g->hist.push_back(g->next);
                 g->lk_len = ngram_lookup(g->hist.data(), (int)g->hist.size(), kNgramMin,
-                                         kNgramMax, B, g->lk.data());
+                                         kNgramMax, BB, g->lk.data());
                 g->hist.pop_back();
                 if (!(g->lk_len > 0 && g->lk_run)) deep = D;
             }
@@ -9177,7 +9185,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             std::vector<G*> dg;
             for (G* g : act) {
                 if (g->predrafted) { g->predrafted = false; continue; }
-                g->block.assign(B + 1, mask_id);
+                g->block.assign(BB + 1, mask_id);
                 g->block[0] = g->next;
                 g->draft_out.assign(B + 1, 0);
                 DFlashDraftModel::DraftSeg ds;
@@ -9271,7 +9279,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             if (kNgram) {
                 g.hist.insert(g.hist.end(), g.out.begin() + before, g.out.end());
                 // A running copy: every row landed, and the lookup also had the token after them.
-                g.lk_run = g.lk_len > 0 && kp == T && (Dv >= B || g.next == g.lk[Dv]);
+                g.lk_run = g.lk_len > 0 && kp == T && (Dv >= BB || g.next == g.lk[Dv]);
                 if (Dv > D) ng_long_tokens += kp;
             }
             bool stopped = false;

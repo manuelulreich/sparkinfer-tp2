@@ -103,6 +103,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 DSpark: prompt lookup verifies up to 15 tokens a step while a copy runs** (was the
+  draft block's 7; HyperQwen's `DFLASH_TOKENS=15`), past the draft's own block. A 150-line file
+  rewritten with a rename, greedy: 267 -> 399 tok/s at 1.7k of context, 248 -> 354 tok/s behind a
+  14k prefix (16 tokens a deep step); prose unchanged. `SPARKINFER_NGRAM_DEPTH` (default 15).
 - **tp=2 DSpark: the batched draft's head is one NVFP4 tensor-core GEMM** over the target's
   FP4 head copy (its first 65536 rows) instead of the Q4_K multirow GEMV, whose cost grows with
   the rows. Draft at C4 (cohort, 256 tokens): 7.6 -> 6.0 ms a step. `SPARKINFER_DFLASH_HEAD_FP4=0`
