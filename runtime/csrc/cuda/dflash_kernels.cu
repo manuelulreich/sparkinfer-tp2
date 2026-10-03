@@ -2660,5 +2660,114 @@ void launch_rows_sample_candidates(const float* cand_v, const int* cand_i, int n
                                                                    top_k, top_p, seed, step, out);
 }
 
+// ---- DFlash2: grouped convolution, candidate selector ------------------------------------------
+namespace {
+__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16(x)); }
+
+// One thread per output value.
+__global__ void k_dflash2_conv(const bf16* __restrict__ x, const bf16* __restrict__ coef,
+                               const bf16* __restrict__ base, bf16* __restrict__ out, int rows,
+                               int block, int H, int group, int taps, int side) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)rows * H) return;
+    const int i = (int)(idx / H), c = (int)(idx % H);
+    const int pos = i % block, G = H / group, g = c / group;
+    const bf16* cr = coef + (size_t)i * 2 * taps * G + (size_t)side * taps * G;
+    const bf16* br = base + (size_t)side * taps * H;
+    float acc = 0.f;
+    for (int t = 0; t < taps; t++) {
+        const float k = bf16r(b2f(br[(size_t)t * H + c]) + b2f(cr[(size_t)t * G + g]));
+        if (t == 0) {
+            acc = bf16r(k * b2f(x[(size_t)i * H + c]));
+        } else if (pos >= t) {
+            acc = bf16r(acc + bf16r(k * b2f(x[(size_t)(i - t) * H + c])));
+        }
+    }
+    out[(size_t)i * H + c] = f2b(acc);
+}
+
+// One CTA walks the block; per step one warp per candidate (strided) dots the predecessor-weighted
+// hidden projection against the candidate's successor code.
+constexpr int kSelMaxK = 32;
+__global__ void k_dflash2_select(const int* __restrict__ cand_i, const float* __restrict__ cand_v,
+                                 int cand_stride, const bf16* __restrict__ hp, int hp_stride,
+                                 const int* __restrict__ anchor, const bf16* __restrict__ pred,
+                                 const bf16* __restrict__ succ, int vocab, int rank, int k,
+                                 int steps, float multiplier, float softcap,
+                                 int* __restrict__ out) {
+    extern __shared__ float ph[];   // [rank]
+    __shared__ float sc[kSelMaxK];
+    __shared__ int prev_tok;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+    if (threadIdx.x == 0) prev_tok = *anchor;
+    __syncthreads();
+    for (int l = 0; l < steps; l++) {
+        const int prev = prev_tok;
+        const bool prev_ok = prev >= 0 && prev < vocab;
+        const bf16* pr = pred + (size_t)(prev_ok ? prev : 0) * rank;
+        const bf16* hr = hp + (size_t)l * hp_stride;
+        for (int r = threadIdx.x; r < rank; r += blockDim.x)
+            ph[r] = prev_ok ? bf16r(b2f(pr[r]) * b2f(hr[r])) : 0.f;
+        __syncthreads();
+        for (int j = warp; j < k; j += nwarps) {
+            const int id = cand_i[(size_t)l * cand_stride + j];
+            const bool ok = id >= 0 && id < vocab;
+            float dot = 0.f;
+            if (ok) {
+                const bf16* sr = succ + (size_t)id * rank;
+                for (int r = lane; r < rank; r += 32) dot += ph[r] * b2f(sr[r]);
+            }
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) {
+                float u = bf16r(cand_v[(size_t)l * cand_stride + j]) * multiplier;
+                if (softcap > 0.f) u = tanhf(u / softcap) * softcap;
+                sc[j] = ok ? u + bf16r(dot) : -INFINITY;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int best = 0;
+            for (int j = 1; j < k; j++)
+                if (sc[j] > sc[best]) best = j;
+            const int tok = cand_i[(size_t)l * cand_stride + best];
+            // No valid candidate at all (a row the head could not score): keep the walk defined.
+            const int t = tok >= 0 && tok < vocab ? tok : (prev_ok ? prev : 0);
+            out[l] = t;
+            prev_tok = t;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_scale_bf16(bf16* x, long n, float s) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = f2b(b2f(x[i]) * s);
+}
+}  // namespace
+
+void launch_dflash2_conv(const void* x, const void* coef, const void* base, void* out, int rows,
+                         int block, int H, int group, int taps, int side, cudaStream_t stream) {
+    if (rows <= 0 || block <= 0 || group <= 0 || H % group || taps < 1) return;
+    const long n = (long)rows * H;
+    k_dflash2_conv<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
+        (const bf16*)x, (const bf16*)coef, (const bf16*)base, (bf16*)out, rows, block, H, group,
+        taps, side);
+}
+
+void launch_dflash2_select(const int* cand_i, const float* cand_v, int cand_stride,
+                           const void* hp, int hp_stride, const int* anchor, const void* pred,
+                           const void* succ, int vocab, int rank, int k, int steps,
+                           float multiplier, float softcap, int* out, cudaStream_t stream) {
+    if (steps <= 0 || k < 1 || k > kSelMaxK || rank < 1) return;
+    k_dflash2_select<<<1, 256, (size_t)rank * sizeof(float), stream>>>(
+        cand_i, cand_v, cand_stride, (const bf16*)hp, hp_stride, anchor, (const bf16*)pred,
+        (const bf16*)succ, vocab, rank, k, steps, multiplier, softcap, out);
+}
+
+void launch_scale_bf16(void* x, long n, float s, cudaStream_t stream) {
+    if (n <= 0) return;
+    k_scale_bf16<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>((bf16*)x, n, s);
+}
+
 } // namespace dflash_kernels
 } // namespace sparkinfer
