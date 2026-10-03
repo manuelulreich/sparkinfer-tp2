@@ -75,6 +75,12 @@ public:
     const DFlashDraftConfig& config() const;
 
     // Bind shared target embed / lm_head (non-owning device pointers).
+    // (plan 07, B6) The target's NVFP4 lm_head copy (this rank's rows, row-major E2M1 + the
+    // CUTLASS SFB scales + alpha), or null. With it the head over the draft vocabulary is one
+    // tensor-core GEMM instead of the Q4_K multirow GEMV, whose cost grows with the rows (0.6 ms
+    // at 6 rows, 2.2 ms at 16). The target clears it before it frees the copy.
+    void set_head_fp4(const void* w, const void* sf, float alpha);
+
     void set_shared_weights(const void* embed_bf16_or_null,
                             const void* lm_head,
                             int lm_head_type,

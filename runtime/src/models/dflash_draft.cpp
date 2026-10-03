@@ -8,6 +8,7 @@
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/gguf.h"
 // Header-only Muse Glimmer DFlash draft config derivation (mirrors examples/qwen3_gguf_config.h's
 // museglimmer_config_from_gguf for the target model). Lives in examples/ by this codebase's
@@ -473,6 +474,43 @@ struct DFlashDraftModel::Impl {
     float* m_logits = nullptr;
     char *m_head_q8 = nullptr, *m_xq81 = nullptr;
     int *m_d_ids = nullptr, *m_d_out = nullptr, *m_h_ids = nullptr, *m_h_out = nullptr;
+
+    // (B6) Draft head as one NVFP4 tensor-core GEMM over the target's FP4 head copy (rows
+    // 0..Vd-1: a whole-atom prefix of its row-major data and N-outer SFB scales).
+    const void* hf_w = nullptr;
+    const void* hf_sf = nullptr;
+    float hf_alpha = 1.f;
+    void *hf_a = nullptr, *hf_as = nullptr, *hf_ws = nullptr;
+    bf16* hf_x = nullptr;   // [kMultiRows][H] gathered rows (multi path)
+    int hf_state = 0;       // 0 untried, 1 ready, -1 off
+    // logits rows [0, m) (and garbage rows up to m rounded to 8, which `out` must hold) from the
+    // m contiguous bf16 rows at x. False: not taken, nothing launched.
+    bool head_fp4(const bf16* x, int m, float* out, int Vd, cudaStream_t st) {
+        static const bool env = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_HEAD_FP4"); return !(e && e[0] == '0');
+        }();
+        if (!env || m <= 0 || m > kMultiRows || !head_fp4_ready(Vd)) return false;
+        const int H = cfg.hidden, mp = (m + 7) & ~7;
+        return kernels::launch_prefill_nvfp4_quant_a(x, hf_a, hf_as, mp, H, st) &&
+               kernels::launch_prefill_nvfp4_gemm_f32(hf_a, hf_as, hf_w, hf_sf, out, mp, Vd, H,
+                                                      hf_ws, st, hf_alpha);
+    }
+    bool head_fp4_ready(int Vd) {
+        if (!hf_w || !hf_sf || Vd % 128) return false;
+        const int H = cfg.hidden;
+        if (hf_state == 0) {
+            const size_t ws = kernels::prefill_nvfp4_workspace_bytes_f32(kMultiRows, Vd, H);
+            bool ok = kernels::prefill_nvfp4_supported(kMultiRows, Vd, H) &&
+                      cudaMalloc(&hf_a, kernels::prefill_nvfp4_data_bytes(kMultiRows, H)) == cudaSuccess &&
+                      cudaMalloc(&hf_as, kernels::prefill_nvfp4_scale_bytes_a(kMultiRows, H)) == cudaSuccess &&
+                      cudaMalloc(&hf_ws, ws ? ws : 16) == cudaSuccess &&
+                      cudaMalloc(&hf_x, (size_t)kMultiRows * H * sizeof(bf16)) == cudaSuccess;
+            if (!ok) cudaGetLastError();
+            hf_state = ok ? 1 : -1;
+        }
+        return hf_state == 1;
+    }
+
     bool multi_alloc() {
         if (m_ready || m_failed) return m_ready;
         const int R = kMultiRows;
@@ -976,6 +1014,12 @@ void DFlashDraftModel::set_embed_split(int local_rows, const void* hi_table, int
     p_->embed_hi_dev = p_->embed_rows ? hi_device : -1;
     // The cached rows came from the previous table; they are owned allocations, so only forget them.
     p_->embed_hi_cache.clear();
+}
+
+void DFlashDraftModel::set_head_fp4(const void* w, const void* sf, float alpha) {
+    p_->hf_w = w;
+    p_->hf_sf = sf;
+    p_->hf_alpha = alpha;
 }
 
 void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head,
@@ -2467,7 +2511,12 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
     }();
     const int head_row0 = kRowShift ? 0 : 1;
     bool head_done = false;
-    if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
+    // The tensor-core head reads 8 rows from head_row0 (the depth padded to the mma's 8); xn and
+    // logits hold BW >= 8 rows.
+    if (BW >= 8 + head_row0 && kProposalDepth <= 8)
+        head_done = s.head_fp4(s.xn + (size_t)head_row0 * H, kProposalDepth,
+                               s.logits + (size_t)head_row0 * Vd, Vd, st);
+    if (!head_done && head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
         // Score only the proposal rows the verifier can consume. One row-batched quantize launch
         // instead of kProposalDepth tiny ones (8 CTAs each, so launch latency dominated them).
         // DSpark's Markov chain consumes base-logit rows [0, depth): row 0 plus the anchor token
@@ -2913,7 +2962,16 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
         kernels::launch_quantize_q8_1_rows(s.m_xn + (size_t)j * BW * H,
                                            s.m_head_q8 + (size_t)j * depth * q8row, H, depth, H, st);
     const int hrows = n * depth;
-    for (int r0 = 0; r0 < hrows; r0 += 16) {
+    bool head_tc = false;
+    if (hrows <= Impl::kMultiRows - 7 && s.head_fp4_ready(Vd)) {
+        bool ok = true;
+        for (int j = 0; ok && j < n; j++)
+            ok = cudaMemcpyAsync(s.hf_x + (size_t)j * depth * H, s.m_xn + (size_t)j * BW * H,
+                                 (size_t)depth * H * sizeof(bf16), cudaMemcpyDeviceToDevice,
+                                 st) == cudaSuccess;
+        head_tc = ok && s.head_fp4(s.hf_x, hrows, s.m_logits, Vd, st);
+    }
+    for (int r0 = 0; !head_tc && r0 < hrows; r0 += 16) {
         const int m = std::min(16, hrows - r0);
         if (!kernels::launch_gemv_q4k_dp4a_multirow_f32(s.m_head_q8 + (size_t)r0 * q8row, s.lm_head,
                                                         s.m_logits + (size_t)r0 * Vd, Vd, H, m, st))

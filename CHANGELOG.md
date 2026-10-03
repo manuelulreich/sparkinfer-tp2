@@ -103,6 +103,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 DSpark: the batched draft's head is one NVFP4 tensor-core GEMM** over the target's
+  FP4 head copy (its first 65536 rows) instead of the Q4_K multirow GEMV, whose cost grows with
+  the rows. Draft at C4 (cohort, 256 tokens): 7.6 -> 6.0 ms a step. `SPARKINFER_DFLASH_HEAD_FP4=0`
+  turns it off.
 - **tp=2 DSpark: a fresh prompt of 16k tokens or more speculates.** Its first draft passed the
   whole prompt as context, past the draft's 16384 maximum, and failed, so such a request decoded
   without the drafter. It now starts the draft's context where the capture starts (as after a

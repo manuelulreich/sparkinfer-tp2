@@ -62,6 +62,8 @@ What this means:
   - Also fold in `fa_split_gqa_mma_i8_kernel`, the int8 hd256 path, if that is what runs.
   - Expected at 30k: the step's attention cost becomes ~one row's instead of T rows'. That lets depth_for keep 6 above 12k instead of 2. On the replay, turns at 14k–55k drop from ~40 ms back toward ~28 ms at depth 6, and accept 2.8 instead of 1.8 tokens. This is the largest win for opencode's long conversations.
 
+**B2 status: tried, no gain, reverted (2026-10-03).** A side stream issued `prefetch.global.L2::evict_last` over the first 4 / 8 / 16 MB of the next GEMM's weights (FFN gate during the attention all-reduce, the next layer's first projection during the FFN all-reduce). Cohort, 256 tokens, step-weighted verify: C1 23.14 -> 23.05 / 23.04 ms, C4 28.81 -> 28.82 / 27.91 (noise). Either the lines do not survive until the GEMM's CTAs reach them or the GEMM's read order does not start where the prefetch did; not pursued further.
+
 **B2. Hide the all-reduce behind the next layer's weight stream.** The all-reduce waits on the link: 22 µs at 7 rows, 53 µs at 20 rows, ~139 of them a step. In that time the card can stream the next GEMM's weights into L2: 53 µs × 448 GB/s ≈ 24 MB, and the 5060 Ti has a 32 MB L2 (20 MB can be set aside as persisting). A layer's gate+up slice is ~50 MB per card, so the first ~40% of it (or all of a smaller projection) can be in L2 before the GEMM starts. Issue an L2 prefetch (`cp.async.bulk.prefetch.L2` / `prefetch.global.L2`) of the next weight tiles at the start of each all-reduce wait, and have the GEMM read those tiles first.
   - Numerics: unchanged (only memory traffic).
   - Expected: most of the 12% (C1) to 18% (C4) all-reduce time, and with it the main per-row cost.
@@ -81,6 +83,8 @@ What this means:
   - Run sessions × heads across more CTAs.
   - For T ≥ 6, use the chunked (WY) form the prefill uses.
   - Expected: −1 to −2 ms a step at C4.
+
+**B6 status: the head done (2026-10-03).** The profile's `si_mmvq_q4k_multirow` (0.6 ms at C1, 2.2 ms at C4) was the DRAFT head, not the verify's (the verify already uses the NVFP4 head copy). The batched draft now runs it as one NVFP4 tensor-core GEMM over the first 65536 rows of card 0's FP4 head (a whole-atom prefix of its data and N-outer SFB scales): draft at C4 7.6 -> 6.0 ms. The single-session draft keeps the GEMV (its block is narrower than the 8-row GEMM tile). A smaller draft vocabulary (32768) was measured as a net loss (acceptance 2.87 -> 2.73 for -0.4 ms). The drafter's own linears are still dp4a GEMVs.
 
 **B6. Drafter GEMMs for many rows.** At C4 the drafter's dp4a GEMVs are 73 µs (38 at C1), because 4 sessions × 8 rows = 32 rows is past where a GEMV stays weight-bound. Switch the drafter's linears to an MMA GEMM at ≥ 16 rows.
   - Expected: draft 8.6 → ~4 ms at C4.

@@ -6180,6 +6180,7 @@ static bool release_bonsai_shadow(Impl& s) {
 void Qwen35Model::release_lm_head_fp4() {
     Impl& s = *p_;
     if (!s.lm_head_fp4_payload && !s.lm_head_fp4_sf_buf) return;
+    if (s.dflash_draft) s.dflash_draft->set_head_fp4(nullptr, nullptr, 1.f);
     s.w.lm_head_fp4 = nullptr;
     s.w.lm_head_fp4_sf = nullptr;
     if (s.lm_head_fp4_payload) cudaFree(s.lm_head_fp4_payload);
@@ -8874,6 +8875,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         if (tp_draft_peer)
             draft.set_embed_split(s.cfg.vocab / 2, tp_draft_peer->embed_weights(),
                                   tp_draft_peer->tp_rank_view().device);
+        draft.set_head_fp4(s.w.lm_head_fp4, s.w.lm_head_fp4_sf, s.w.lm_head_fp4_alpha);
         draft.ensure_quant();
         s.final_seqlen_hint = -1;
     }
