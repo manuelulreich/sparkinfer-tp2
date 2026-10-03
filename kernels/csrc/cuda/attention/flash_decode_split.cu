@@ -2147,6 +2147,235 @@ void launch_flash_decode_split(
                                    num_q_heads, n_splits, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
     (void)head_dim;
 }
+
+// ============================================================================
+// (plan 07, B1) Verify rows in pairs: the int8 tensor-core split above with TWO rows of one session
+// in one CTA. The 6:1 group fills only 6 of the wmma's 16 M rows, so the second row's 6 q-heads ride
+// in rows 6..11 for free, and the staged K/V tiles -- the whole cost at long context -- are read once
+// for both. Bit-exact against fa_split_gqa_mma_i8_kernel run on each row: every per-row quantity (Q
+// quantization, softmax state, P' scale) is per M row, and each row keeps its own split range
+// [split * ceil(len / n_splits), ...). Rows whose ranges start together share a pass; a row whose
+// chunk differs (its length crossed a multiple of n_splits) gets its own pass, during which the other
+// row is masked out entirely and so is an exact no-op (corr = 1, sum 0, P' = 0). A masked key adds an
+// exact zero to every accumulator, so the shorter row's extra tail keys change nothing.
+// pairs[2 * p], pairs[2 * p + 1]: the rows of CTA column p (the second -1 = none). The two rows must
+// share one block table (same session); K/V and scales are read through the first row's.
+template <int HEAD_DIM, int GQA>
+__global__ void __launch_bounds__(256, 2) fa_split_gqa_mma_i8_pair_kernel(
+    const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
+    const signed char* __restrict__ v_pool, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens, const int* __restrict__ pairs,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int block_size, int max_blocks, int n_splits,
+    const __half* __restrict__ k_scale, const __half* __restrict__ v_scale
+) {
+    using namespace nvcuda::wmma;
+    static_assert(2 * GQA <= 16, "two rows' q-heads must fit the 16-row mma");
+    constexpr int KH = HEAD_DIM / 16;
+    constexpr int LR = 2 * GQA;   // M rows that can be live
+    const int split = blockIdx.x % n_splits, kvh = blockIdx.x / n_splits;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const int seqA = pairs[2 * blockIdx.y], seqB = pairs[2 * blockIdx.y + 1];
+    const int nrows = seqB >= 0 ? 2 : 1;
+    int st[2], en[2];
+    #pragma unroll
+    for (int v = 0; v < 2; v++) {
+        const int sq = v == 0 ? seqA : seqB;
+        const int sl = (v < nrows) ? seq_lens[sq] : 0;
+        const int chunk = (sl + n_splits - 1) / n_splits;
+        st[v] = split * chunk;
+        en[v] = (v < nrows) ? min(sl, st[v] + chunk) : 0;
+    }
+    const size_t KVLD = (size_t)num_kv_heads * HEAD_DIM;
+    const int SLD = num_kv_heads;
+
+    extern __shared__ char i8smem[];
+    signed char* s_qi = reinterpret_cast<signed char*>(i8smem);       // [16][HD]
+    signed char* s_pi = s_qi + 16 * HEAD_DIM;                         // [16][HD]
+    float* s_s  = reinterpret_cast<float*>(s_pi + 16 * HEAD_DIM);     // [16][HD]
+    float* s_o  = s_s + 16 * HEAD_DIM;                                // [LR][HD]
+    float* s_qs = s_o + LR * HEAD_DIM;                                // [16]
+    float* s_ps = s_qs + 16;                                          // [16]
+    float* s_ks = s_ps + 16;                                          // [128]
+    float* s_vs = s_ks + 128;                                         // [128]
+    float* s_m  = s_vs + 128;                                         // [16]
+    float* s_l  = s_m + 16;                                           // [16]
+
+    constexpr int EPT = HEAD_DIM / 32;
+    #pragma unroll
+    for (int rr = 0; rr < 2; rr++) {
+        const int r = warp * 2 + rr;
+        const int v = r / GQA, h = r - v * GQA;
+        const bool live = r < LR && v < nrows;
+        const int sq = v == 0 ? seqA : seqB;
+        float qv[EPT], amax = 0.f;
+        #pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            qv[e] = live ? __bfloat162float(q[(size_t)(sq * num_q_heads + kvh * GQA + h) * HEAD_DIM + lane + e * 32]) : 0.f;
+            amax = fmaxf(amax, fabsf(qv[e]));
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+        const float d = amax / 127.0f;
+        if (lane == 0) s_qs[r] = d;
+        #pragma unroll
+        for (int e = 0; e < EPT; e++)
+            s_qi[r * HEAD_DIM + lane + e * 32] = (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
+    }
+    for (int i = tid; i < LR * HEAD_DIM; i += blockDim.x) s_o[i] = 0.f;
+    if (tid < 16) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
+    __syncthreads();
+
+    // One pass per distinct range start (almost always one).
+    const int npass = (nrows == 2 && st[1] != st[0]) ? 2 : 1;
+    for (int pass = 0; pass < npass; pass++) {
+        const int start = st[pass];
+        // Rows of this pass: same start. end = the longest of them.
+        bool act[2];
+        int end = 0;
+        #pragma unroll
+        for (int v = 0; v < 2; v++) {
+            act[v] = v < nrows && st[v] == start && (npass == 1 || v == pass);
+            if (act[v] && en[v] > start) end = max(end, en[v]);
+        }
+        const int first_blk = start / 16;
+        const int nblk = (end > start) ? ((end - 1) / 16 - first_blk + 1) : 0;
+        for (int g0 = 0; g0 < nblk; g0 += 8) {
+            const int gblk = min(8, nblk - g0);
+            const int gbase = (first_blk + g0) * 16;
+            for (int j = tid; j < gblk * 16; j += blockDim.x) {
+                const int lb = first_blk + g0 + j / 16, within = j & 15;
+                const int pb = block_table[seqA * max_blocks + lb];
+                const size_t si = (size_t)(pb * 16 + within) * SLD + kvh;
+                s_ks[j] = __half2float(k_scale[si]);
+                s_vs[j] = __half2float(v_scale[si]);
+            }
+            if (warp < gblk) {
+                const int pb = block_table[seqA * max_blocks + first_blk + g0 + warp];
+                const signed char* kb = k_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM;
+                fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
+                fragment<matrix_b, 16, 16, 16, signed char, col_major> bf;
+                fragment<accumulator, 16, 16, 16, int> cf;
+                fill_fragment(cf, 0);
+                #pragma unroll
+                for (int ks = 0; ks < KH; ks++) {
+                    load_matrix_sync(af, s_qi + ks * 16, HEAD_DIM);
+                    load_matrix_sync(bf, kb + ks * 16, KVLD);
+                    mma_sync(cf, af, bf, cf);
+                }
+                store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
+            }
+            __syncthreads();
+            const int* s_si = reinterpret_cast<const int*>(s_s);
+            #pragma unroll
+            for (int rr = 0; rr < 2; rr++) {
+                const int r = warp * 2 + rr;
+                const int v = r / GQA;
+                const bool on = r < LR && v < 2 && act[v < 2 ? v : 0];
+                const int rs = on ? st[v] : 0, re = on ? en[v] : 0;
+                float sc[4], mx = -1e30f;
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    const int t = lane + u * 32, gtok = gbase + t;
+                    sc[u] = (on && t < gblk * 16 && gtok >= rs && gtok < re)
+                            ? (float)s_si[r * 128 + t] * s_qs[r] * s_ks[t] * scale : -1e30f;
+                    mx = fmaxf(mx, sc[u]);
+                }
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+                const float m_old = s_m[r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
+                float sum = 0.f, pamax = 0.f;
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    const int t = lane + u * 32;
+                    float pv = 0.f;
+                    if (sc[u] > -1e29f) {
+                        const float p = __expf(sc[u] - m_new);
+                        sum += p; pv = p * s_vs[t]; pamax = fmaxf(pamax, fabsf(pv));
+                    }
+                    s_s[r * 128 + t] = pv;
+                }
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffff, sum, o); pamax = fmaxf(pamax, __shfl_xor_sync(0xffffffff, pamax, o)); }
+                const float pd = pamax / 127.0f;
+                if (on) {
+                    if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_ps[r] = pd; }
+                    for (int c = lane; c < HEAD_DIM; c += 32) s_o[r * HEAD_DIM + c] *= corr;
+                } else if (lane == 0) {
+                    s_ps[r] = 0.f;
+                }
+                for (int t = lane; t < gblk * 16; t += 32)
+                    s_pi[r * 128 + t] = (signed char)((!on || pamax == 0.f) ? 0 : (int)roundf(s_s[r * 128 + t] / pd));
+            }
+            __syncthreads();
+            for (int dh = 0; dh < HEAD_DIM; dh += 128) {
+                fragment<accumulator, 16, 16, 16, int> cf;
+                fill_fragment(cf, 0);
+                for (int ks = 0; ks < gblk; ks++) {
+                    const int pb = block_table[seqA * max_blocks + first_blk + g0 + ks];
+                    const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
+                    fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
+                    fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
+                    load_matrix_sync(af, s_pi + ks * 16, 128);
+                    load_matrix_sync(bf, vb, KVLD);
+                    mma_sync(cf, af, bf, cf);
+                }
+                store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
+                __syncthreads();
+                for (int i = tid; i < LR * 128; i += blockDim.x) {
+                    const int r = i >> 7, v = r / GQA;
+                    if (act[v]) s_o[r * HEAD_DIM + dh + (i & 127)] += (float)reinterpret_cast<int*>(s_s)[i] * s_ps[r];
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    for (int r = 0; r < nrows * GQA; r++) {
+        const int v = r / GQA, h = r - v * GQA;
+        const int sq = v == 0 ? seqA : seqB;
+        const int idx = (sq * num_q_heads + kvh * GQA + h) * n_splits + split;
+        if (tid == 0) { part_m[idx] = s_m[r]; part_l[idx] = s_l[r]; }
+        for (int c = tid; c < HEAD_DIM; c += blockDim.x)
+            part_acc[(size_t)idx * HEAD_DIM + c] = s_o[r * HEAD_DIM + c];
+    }
+}
+
+bool launch_flash_decode_split_pairs(
+    const void* q, const void* k_pool, const void* v_pool,
+    const int* block_table, const int* seq_lens, const int* pairs, int n_pairs, void* out,
+    float* part_m, float* part_l, float* part_acc,
+    int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
+    int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream,
+    int seqlen, const void* k_scale, const void* v_scale, int kv_format
+) {
+    // Exactly where launch_flash_decode_split takes fa_split_gqa_mma_i8_kernel<256, 6>, so a
+    // paired row computes what that kernel computes for it; anything else declines.
+    static int env = -1;
+    if (env < 0) { const char* e = getenv("SPARKINFER_FA_PAIRS"); env = (e && e[0] == '0') ? 0 : 1; }
+    static int famma256 = -1, famma6 = -1, fagqa6 = -1;
+    if (famma256 < 0) { const char* e = getenv("SPARKINFER_FAMMA"); famma256 = (e && e[0] == '0') ? 0 : 1; }
+    if (famma6 < 0) { const char* e = getenv("SPARKINFER_FAMMA6"); famma6 = (e && e[0] == '0') ? 0 : 1; }
+    if (fagqa6 < 0) { const char* e = getenv("SPARKINFER_FAGQA6"); fagqa6 = (e && e[0] == '0') ? 0 : 1; }
+    const int mma_chunk = (n_splits > 0) ? (seqlen + n_splits - 1) / n_splits : 0;
+    const bool mma_ok = famma256 && seqlen > 512 && block_size == 16 && mma_chunk >= 32;
+    if (!(env && head_dim == 256 && kv_format == 1 && fagqa6 && famma6 && mma_ok &&
+          num_kv_heads > 0 && num_q_heads == num_kv_heads * 6 && n_pairs > 0))
+        return false;
+    constexpr int GQA = 6;
+    const size_t smem = (size_t)2 * 16 * 256 * sizeof(signed char)
+                      + (size_t)(16 + 2 * GQA) * 256 * sizeof(float)
+                      + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
+    dim3 g(num_kv_heads * n_splits, n_pairs);
+    fa_split_gqa_mma_i8_pair_kernel<256, GQA><<<g, 256, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+        reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens, pairs,
+        part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
+        reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+    fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                     num_q_heads, n_splits, nullptr, num_seqs, stream);
+    return true;
+}
 #endif
 
 } // namespace kernels

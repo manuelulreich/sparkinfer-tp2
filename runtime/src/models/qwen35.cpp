@@ -959,6 +959,7 @@ struct Qwen35Model::Impl {
     const int** vr_ma_tptr = nullptr;      // device [2R]: full-table pointers, then ring-table
     const int** h_vr_ma_tptr = nullptr;    // pinned twin
     int *vr_ma_tab = nullptr, *vr_ma_tab_win = nullptr;   // [R][max_blocks]
+    int *vr_ma_pairs = nullptr, *h_vr_ma_pairs = nullptr;   // [2R]: row pairs of one session (B1)
     float *vr_ma_m = nullptr, *vr_ma_l = nullptr, *vr_ma_acc = nullptr;
     // (dual-GPU C2) Segmented multi-session verify: one GDN snapshot per segment (session),
     // grown on demand, agreed across the ranks, released when the group run ends.
@@ -4152,6 +4153,9 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                 cudaHostAllocDefault) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_tab, (size_t)R * mbs * sizeof(int)) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_tab_win, (size_t)R * mbs * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ma_pairs, (size_t)2 * R * sizeof(int)) == cudaSuccess &&
+                  cudaHostAlloc(&s.h_vr_ma_pairs, (size_t)2 * R * sizeof(int),
+                                cudaHostAllocDefault) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_m, fa * sizeof(float)) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_l, fa * sizeof(float)) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_acc, fa * HD * sizeof(float)) == cudaSuccess;
@@ -4159,7 +4163,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         s.vr_ma_state = ok ? 1 : -1;
     }
     if (ma && s.vr_ma_state != 1) ma = false;
-    int ma_maxlen = 0;
+    int ma_maxlen = 0, ma_pairs = 0;
     if (ma) {
         for (int r = 0; r < n; r++) {
             s.h_vr_ma_tptr[r] = s.kv->block_table(row_kv[r]);
@@ -4170,6 +4174,25 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                            cudaMemcpyHostToDevice, st), "tp rows attn tables");
         dflash_kernels::launch_gather_rows_i32(s.vr_ma_tptr, s.vr_ma_tab, mbs, n, st);
         dflash_kernels::launch_gather_rows_i32(s.vr_ma_tptr + R, s.vr_ma_tab_win, mbs, n, st);
+        // (plan 07, B1) Consecutive rows of one session in pairs, for the long-context attention
+        // that reads the KV once per pair (launch_flash_decode_split_pairs).
+        bool paired[kTpVerifyRows] = {};
+        for (int r = 0; r < n; r++) {
+            if (paired[r]) continue;
+            paired[r] = true;
+            int o = -1;
+            for (int r2 = r + 1; r2 < n; r2++)
+                if (!paired[r2] && row_kv[r2] == row_kv[r]) { o = r2; break; }
+            if (o >= 0) paired[o] = true;
+            s.h_vr_ma_pairs[2 * ma_pairs] = r;
+            s.h_vr_ma_pairs[2 * ma_pairs + 1] = o;
+            ma_pairs++;
+        }
+        if (ma_pairs < n)
+            cu(cudaMemcpyAsync(s.vr_ma_pairs, s.h_vr_ma_pairs, (size_t)2 * ma_pairs * sizeof(int),
+                               cudaMemcpyHostToDevice, st), "tp rows attn pairs");
+        else
+            ma_pairs = 0;
     }
 
     for (int L = 0; L < c.n_layers; L++) {
@@ -4254,11 +4277,17 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                                            (bf16*)vpool, tab, s.vr_pos, n, n_q, n_kv,
                                                            HD, c.rope_dim, c.rope_theta,
                                                            s.kv->block_size(), mbs, st);
-                kernels::launch_flash_decode_split(s.vr_q, kpool, vpool, tab, s.vr_seq, s.vr_attn,
-                                                   s.vr_ma_m, s.vr_ma_l, s.vr_ma_acc, n, n_q, n_kv,
-                                                   HD, s.kv->block_size(), mbs, s.n_splits,
-                                                   1.f / sqrtf((float)HD), st, nullptr, ma_maxlen,
-                                                   kscale, vscale, kvf, nullptr, 0);
+                if (!(ma_pairs > 0 && !w.swa &&
+                      kernels::launch_flash_decode_split_pairs(
+                          s.vr_q, kpool, vpool, tab, s.vr_seq, s.vr_ma_pairs, ma_pairs, s.vr_attn,
+                          s.vr_ma_m, s.vr_ma_l, s.vr_ma_acc, n, n_q, n_kv, HD, s.kv->block_size(),
+                          mbs, s.n_splits, 1.f / sqrtf((float)HD), st, ma_maxlen, kscale, vscale,
+                          kvf)))
+                    kernels::launch_flash_decode_split(s.vr_q, kpool, vpool, tab, s.vr_seq, s.vr_attn,
+                                                       s.vr_ma_m, s.vr_ma_l, s.vr_ma_acc, n, n_q, n_kv,
+                                                       HD, s.kv->block_size(), mbs, s.n_splits,
+                                                       1.f / sqrtf((float)HD), st, nullptr, ma_maxlen,
+                                                       kscale, vscale, kvf, nullptr, 0);
             } else {
             // Row by row, as the decode body appends: these kernels index the block table PER
             // TOKEN (block_table[tok * max_blocks + blk], the packed-sequence layout), so a
@@ -9013,7 +9042,10 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         // then gone and the draft windows, as after a truncated capture.
         bool first_ok = true;
         int ctx_rows = g.n, ctx_hidden_start = s.dflash_ctx_start;
-        if (h > 0) {
+        // A fresh prompt whose capture starts late (12288 and up) starts the same way, empty at
+        // capture_start: passing the whole prompt as the block's context would exceed the draft's
+        // max_seq from 16384 on, and the first draft would fail.
+        if (h > 0 || capture_start > 0) {
             const auto* snap = static_cast<const DFlashDraftModel::KvSnapshot*>(
                 job->start_state && capture_start == h ? job->start_state->draft.get() : nullptr);
             const int state_cap = (int)std::min<long>(need, draft.kv_slide_capacity());

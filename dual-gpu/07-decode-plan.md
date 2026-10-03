@@ -36,6 +36,8 @@ What this means:
 
 ## A. Tokens per step under sampling (largest gap, opencode's case)
 
+**A1 status: tried, no gain, reverted (2026-10-03).** Built as described (the draft's Markov chain drew each proposal with the verify's own top-k and Philox draw, keyed to the checking row's step; the noise was checked equal on both sides). Acceptance at temperature 1, top_k 20, top_p 0.95: story 1.72 -> 1.75, A* 2.92 -> 2.84 tokens a step, and the same within noise at draft temperature x0.25 / 0.5 / 2 / 4, at +0.7 ms a draft. The reason is the drafter: beyond its first choice its candidates do not match the target's (e.g. draft top 4: 557, 383, 11, 440; target: 557, 995, 66702, 5802), so a coupled draw lands on the target's draw no more often than the argmax does. HyperQwen's sampled acceptance comes from its drafter (DFlash2 with a trained candidate selector), not from the coupling alone.
+
 **A1. Draw the draft with the verify's own Gumbel noise.** Today the drafter proposes its argmax. A sampled target draw lands on that token only with probability about p(argmax): 2.0–2.3 tokens a step, and the gain guard often hands the request back to plain decode. HyperQwen draws each draft position as `argmax(log q + g)`, using the same seeded noise g the target sampler will use at that position (its `_selector_walk_kernel`, "sampling keys a draw by the position before the sampled token"). The target draws `argmax(log p + g)` with the same g, so the two agree whenever p and q put their noisy maxima on the same token. That is far more often than p(argmax) when q ≈ p.
   - Ours: the draft head computes logits over its vocab (ids < 65536, card 0). Apply the request's temperature, top_k and top_p to the draft logits. Add the decode sampler's Philox noise for (seed, token id, step = start + i + 1 − n), the same key the verify row uses. Take the argmax. DSpark's Markov head conditions position i on the token chosen at i − 1, which is now the noised choice.
   - Lossless without further work: P's accept rule (draft == drawn token) is unchanged, and only which proposal gets made changes.
@@ -51,6 +53,8 @@ What this means:
   - Size `cap` and the draft's ingest for 16 rows. `forward_blocks` batches only ingests of ≤ 8 rows, so a longer one goes through `forward_block`, or the limit is raised. Leave 16 rows of draft KV slack.
 
 ## B. Make deep blocks cheap (lifts C2/C4 and long context)
+
+**B1 status: done for int8 (2026-10-03).** `launch_flash_decode_split_pairs`: two rows of one session per CTA of the int8 6:1 tensor-core split (the second row's q-heads in the mma's unused M rows); rows whose split ranges start differently take two passes, the other row an exact no-op. Bit-identical (in-server check, 5000+ calls, one and two sessions). Smaller than estimated: verify at depth 6 behind 25.6k 30.3 -> 28.9 ms, 7 rows behind 14k 28.8 -> 27.6 ms; per verify row the attention is ~0.35 ms of the ~1.4 ms at 25.6k, so depth 2 stays the long-context default. Not done: the fp8/nvfp4 twin (`fa_split_gqa_mma_f8_kernel`), and the remaining per-row cost (all-reduce, lm_head, GDN: B2-B5). Found on the way: a fresh prompt of 16k+ never speculated (first draft over the draft's max_seq) -- fixed, 49.6 -> 75 tok/s at 25.6k.
 
 **B1. Fold verify attention across a session's rows, int8 KV included.**
   - Order the group verify session-major inside attention: gather a session's T rows next to each other, or index rows by (session, t).
