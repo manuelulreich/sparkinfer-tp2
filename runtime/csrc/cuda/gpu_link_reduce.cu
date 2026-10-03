@@ -15,6 +15,7 @@
 // Portable CUDA — same arch policy as the rest of csrc/cuda (sm_89 .. sm_120).
 
 #include <cuda_bf16.h>
+#include <cstdint>
 #include <cuda_fp16.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
@@ -64,11 +65,27 @@ __global__ void glink_reduce_f16(__half* __restrict__ dst, const __half* __restr
 // system-wide before the block barrier, so thread 0's flag store is ordered after every push.
 // The landing buffer is read with ld.global.cg (L2, bypassing L1): the peer wrote it over P2P,
 // which L1 does not observe.
+// The push and the reduce go 16 bytes a thread when the size and every pointer allow: element-
+// wide stores leave the peer link as warp-sized 64-byte writes, which PCIe carries at a fraction
+// of its rate (measured: the extra 130 KB of a 20-row verify cost 31 us, 4.2 GB/s on a Gen3 x8
+// link; vectorized, a C4 verify step is 2 ms shorter). Same values either way -- only the
+// transaction size changes. More blocks (one flag slot each) measured no further gain.
 template <typename T>
 __global__ void glink_flag_allreduce_kernel(const T* __restrict__ in, T* out, T* peer_land,
                                             const T* my_land, unsigned* peer_flag,
                                             const unsigned* my_flag, unsigned seq, int n) {
-  for (int i = threadIdx.x; i < n; i += blockDim.x) peer_land[i] = in[i];
+  constexpr int PER = 16 / (int)sizeof(T);
+  const bool vec = (n % PER) == 0 &&
+                   ((reinterpret_cast<uintptr_t>(in) | reinterpret_cast<uintptr_t>(out) |
+                     reinterpret_cast<uintptr_t>(peer_land) |
+                     reinterpret_cast<uintptr_t>(my_land)) & 15) == 0;
+  const int nv = n / PER;
+  if (vec) {
+    for (int i = threadIdx.x; i < nv; i += blockDim.x)
+      reinterpret_cast<uint4*>(peer_land)[i] = reinterpret_cast<const uint4*>(in)[i];
+  } else {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) peer_land[i] = in[i];
+  }
   __threadfence_system();
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -80,6 +97,23 @@ __global__ void glink_flag_allreduce_kernel(const T* __restrict__ in, T* out, T*
     __threadfence();
   }
   __syncthreads();
+  if (vec) {
+    for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+      const uint4 a = reinterpret_cast<const uint4*>(in)[i];
+      const uint4 b = __ldcg(reinterpret_cast<const uint4*>(my_land) + i);
+      uint4 r;
+      const T* ta = reinterpret_cast<const T*>(&a);
+      const T* tb = reinterpret_cast<const T*>(&b);
+      T* tr = reinterpret_cast<T*>(&r);
+      #pragma unroll
+      for (int e = 0; e < PER; e++) {
+        if constexpr (sizeof(T) == 4) tr[e] = ta[e] + tb[e];
+        else tr[e] = __float2bfloat16(__bfloat162float(ta[e]) + __bfloat162float(tb[e]));
+      }
+      reinterpret_cast<uint4*>(out)[i] = r;
+    }
+    return;
+  }
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     float x, y;
     if constexpr (sizeof(T) == 4) { x = in[i]; y = __ldcg(&my_land[i]); }

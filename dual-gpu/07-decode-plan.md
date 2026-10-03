@@ -71,6 +71,8 @@ What this means:
   - Expected: most of the 12% (C1) to 18% (C4) all-reduce time, and with it the main per-row cost.
   - First a microbenchmark: AR alone, AR + prefetch, then the following GEMM's time with and without the prefetched L2.
 
+**B3 status: done in part (2026-10-03).** The flag all-reduce's push and reduce now move 16 bytes a thread (one element before, so the link carried 64-byte writes): verify at C4 28.7 -> 26.6 ms, at C1 23.1 -> 22.8 ms, the split draft at C4 6.0 -> 5.4 ms. Splitting the op over up to 16 blocks with a flag slot each measured no further gain (C1 -0.15 ms, C4 flat), so it stays one block. Not tried: reduce-scatter + all-gather, fusing the residual + RMSNorm into the receive.
+
 **B3. Use the link better.** 130 KB of extra payload costs 31 µs (4.2 GB/s) on a Gen3 x8 link that sustains ~6.5.
   - Try more pushing blocks and 16-byte stores.
   - Try a split push: each card pushes half the rows and reduces locally, then pushes the result back (reduce-scatter + all-gather). This halves the bytes each card writes when both directions are used at once.

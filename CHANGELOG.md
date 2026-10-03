@@ -103,6 +103,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2: the flag all-reduce moves 16 bytes a thread** (push and reduce), where it moved one
+  element: element-wide stores left the PCIe link as 64-byte writes. Verify step at C4 (cohort,
+  256 tokens) 28.7 -> 26.6 ms, the split draft 6.0 -> 5.4 ms; greedy cohort C4 ~290 -> 336 tok/s.
+  Same values. (Splitting it over more blocks measured no further gain.)
 - **tp=2 DSpark: prompt lookup verifies up to 15 tokens a step while a copy runs** (was the
   draft block's 7; HyperQwen's `DFLASH_TOKENS=15`), past the draft's own block. A 150-line file
   rewritten with a rename, greedy: 267 -> 399 tok/s at 1.7k of context, 248 -> 354 tok/s behind a
