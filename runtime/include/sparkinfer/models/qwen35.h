@@ -814,6 +814,20 @@ public:
     const void* dflash_context_buffer() const;  // accumulated prefill/accept hiddens
     int dflash_hidden_row_stride() const;       // bf16 elems per row = n_capture * hidden
     int dflash_context_len() const;
+    // (dual-GPU) Split capture, for a draft whose fc is split by input columns
+    // (DFlashDraftModel::fc_split): rank r captures only columns [r * H/2, (r+1) * H/2) of each
+    // captured layer -- the residual stream is replicated on both cards, so neither needs the
+    // other's half -- into its own buffers, half as wide (dflash_hidden_row_stride() is then
+    // n_capture * H/2). Set before set_dflash_capture(true, ...); rank 0 only, applies to both.
+    // The capture buffers and rows a caller allocates and copies itself go through
+    // dflash_cap_alloc / dflash_cap_free / dflash_cap_copy, which do the same on rank 1 when the
+    // capture is split; dflash_cap_peer maps a rank-0 capture pointer to its rank-1 twin.
+    void set_dflash_capture_split(bool on);
+    bool dflash_capture_split() const;
+    void* dflash_cap_alloc(size_t bytes);
+    void dflash_cap_free(void* p);
+    void dflash_cap_copy(void* dst, const void* src, size_t bytes);
+    const void* dflash_cap_peer(const void* p) const;
 
     // Snapshot hybrid recurrent state for speculative rollback.
     void save_spec_snapshot();

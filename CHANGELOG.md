@@ -103,6 +103,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 DSpark: the draft's fc projector is split across the cards.** Each card now captures its
+  own half of every tapped layer's hidden state (the residual stream is the same on both) and
+  projects it through its half of fc's input columns; the all-reduce that used to carry card 0's
+  result to card 1 now sums the halves. Card 0 holds 164 MB less at idle and card 1 166 MB more
+  (gap 562 -> 232 MB), the prompt's transient capture rows are split the same way, and the draft
+  step is faster at C1 (2.59 -> 2.36 ms). Acceptance and output unchanged.
+  `SPARKINFER_DFLASH_FC_SPLIT=0` keeps fc on card 0.
 - **tp=2: concurrent sampled requests decode in one batched step.** The packed decode took only
   greedy requests, so sampled ones (opencode's default) decoded one forward each. The rows pass
   now draws each sampled row as decode does (exact top-64 per card, the same seeded Gumbel noise),

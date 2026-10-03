@@ -3,6 +3,7 @@
 // Loads official z-lab BF16 safetensors; reuses target embed + lm_head.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -80,6 +81,14 @@ public:
     // tensor-core GEMM instead of the Q4_K multirow GEMV, whose cost grows with the rows (0.6 ms
     // at 6 rows, 2.2 ms at 16). The target clears it before it frees the copy.
     void set_head_fp4(const void* w, const void* sf, float alpha);
+
+    // (dual-GPU) fc split by input columns: each rank holds the fc columns of its own half of
+    // every captured layer, and the target captures that half on each card
+    // (Qwen35Model::set_dflash_capture_split). True on a split draft unless
+    // SPARKINFER_DFLASH_FC_SPLIT=0. `map` turns a rank-0 capture pointer into rank 1's twin; the
+    // target sets it before the first forward.
+    bool fc_split() const;
+    void set_peer_hidden_map(std::function<const void*(const void*)> map);
 
     void set_shared_weights(const void* embed_bf16_or_null,
                             const void* lm_head,

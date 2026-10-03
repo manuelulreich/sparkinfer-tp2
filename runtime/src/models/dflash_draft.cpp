@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -335,7 +336,16 @@ struct DFlashDraftModel::Impl {
     cudaStream_t tp_stream = nullptr;
     bool tp_split = false;
     std::vector<LayerWeights> layers;
-    bf16* fc = nullptr;           // [H, n_cap * H] as [out, in] for gemv
+    bf16* fc = nullptr;           // [H, fc_k] as [out, in] for gemv
+    // (dual-GPU) fc split by input columns. The target captures, on each card, its own half of
+    // every tapped layer's hidden state (columns [r * H/2, (r+1) * H/2) of each layer, see
+    // Qwen35Model::set_dflash_capture_split), so a rank's capture rows are [rows, fc_k] and fc's
+    // matching columns live on that rank: the two partial projections sum to the whole one
+    // through the all-reduce that used to carry rank 0's result to rank 1. fc_k = n_cap * H
+    // unsplit. peer_hidden maps a rank-0 capture pointer to rank 1's twin (set by the target).
+    int fc_k = 0;
+    bool fc_split = false;
+    std::function<const void*(const void*)> peer_hidden;
     // YaRN rotary table (null unless the checkpoint configures rope_type "yarn").
     float* d_yarn_inv_freq = nullptr;   // [head_dim/2]
     float  yarn_att_scale = 1.0f;
@@ -1421,8 +1431,31 @@ bool DFlashDraftModel::load(const std::string& dir) {
     auto* hn = require("hidden_norm.weight");
     auto* nn = require("norm.weight");
     if (!fc || !hn || !nn) return false;
-    // Rank 1 of a split draft never projects the context (rank 0 sends it the result).
-    if (lead) {
+    // (dual-GPU) fc split by input columns (see Impl::fc_split): rank r keeps, of every captured
+    // layer's H columns, the half [r * H/2, (r+1) * H/2). SPARKINFER_DFLASH_FC_SPLIT=0 keeps the
+    // whole projector on rank 0, which then sends rank 1 the result.
+    static const bool kFcSplit = [] { const char* e = getenv("SPARKINFER_DFLASH_FC_SPLIT");
+                                      return !(e && e[0] == '0'); }();
+    s.fc_split = tp_n == 2 && kFcSplit && fc->dtype == "BF16" && fc->shape.size() == 2 &&
+                 (int)fc->shape[0] == s.cfg.hidden && (int)fc->shape[1] == n_cap * s.cfg.hidden &&
+                 (s.cfg.hidden / 2) % 256 == 0;
+    s.fc_k = s.fc_split ? n_cap * s.cfg.hidden / 2 : n_cap * s.cfg.hidden;
+    if (s.fc_split) {
+        const int Hh = s.cfg.hidden / 2, K = n_cap * s.cfg.hidden;
+        std::vector<bf16> host((size_t)s.cfg.hidden * s.fc_k);
+        const bf16* src = (const bf16*)fc->data;
+        for (int r = 0; r < s.cfg.hidden; r++)
+            for (int l = 0; l < n_cap; l++)
+                std::memcpy(host.data() + (size_t)r * s.fc_k + (size_t)l * Hh,
+                            src + (size_t)r * K + (size_t)l * s.cfg.hidden + (size_t)tp_r * Hh,
+                            (size_t)Hh * sizeof(bf16));
+        s.fc = s.alloc<bf16>(host.size());
+        cu(cudaMemcpy(s.fc, host.data(), host.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+           "upload fc half");
+        s.hidden_norm = s.upload(*hn);
+    } else if (lead) {
+        // Rank 1 of a split draft without the fc split never projects the context (rank 0 sends
+        // it the result).
         s.fc = s.upload(*fc);
         s.hidden_norm = s.upload(*hn);
     }
@@ -1430,9 +1463,8 @@ bool DFlashDraftModel::load(const std::string& dir) {
     // Quantize the projector alongside the layer weights (see Impl::q8_fc). The bf16 copy stays:
     // the FIRST block projects the whole prompt and routes to the tensor-core GEMM, which is
     // compute-bound and wants bf16.
-    if (q8_on() && lead)
-        s.pending_quant.push_back({s.fc, s.cfg.hidden,
-                                   (int)s.cfg.target_layer_ids.size() * s.cfg.hidden, &s.q8_fc});
+    if (q8_on() && s.fc)
+        s.pending_quant.push_back({s.fc, s.cfg.hidden, s.fc_k, &s.q8_fc});
 
     s.layers.resize(s.cfg.n_layers);
     for (int L = 0; L < s.cfg.n_layers; L++) {
@@ -1615,6 +1647,7 @@ bool DFlashDraftModel::load_gguf(const std::string& path) {
     };
 
     s.fc = dense("fc.weight");
+    s.fc_k = (int)s.cfg.target_layer_ids.size() * s.cfg.hidden;
     s.hidden_norm = dense("enc.output_norm.weight");
     s.final_norm = dense("output_norm.weight");
     if (!s.fc || !s.hidden_norm || !s.final_norm) return false;
@@ -1691,12 +1724,24 @@ bool DFlashDraftModel::quant_ok() const {
     return p_ && p_->quant_ready && !p_->quant_failed && (!p_->tp_peer || p_->tp_peer->quant_ok());
 }
 
+bool DFlashDraftModel::fc_split() const {
+    return p_ && p_->fc_split && p_->tp_peer && p_->tp_peer->p_->fc_split;
+}
+
+void DFlashDraftModel::set_peer_hidden_map(std::function<const void*(const void*)> map) {
+    p_->peer_hidden = std::move(map);
+}
+
 bool DFlashDraftModel::tp_attach(DFlashDraftModel* peer, int peer_device, cudaStream_t stream,
                                  cudaStream_t peer_stream) {
     Impl& s = *p_;
     if (!peer || !stream || !peer_stream || s.cfg.tp_rank != 0 || peer->p_->cfg.tp_rank != 1 ||
         s.cfg.tp_size != 2 || peer->p_->cfg.tp_size != 2)
         return false;
+    if (s.fc_split != peer->p_->fc_split) {
+        fprintf(stderr, "[dflash] split draft: the ranks disagree on the fc split\n");
+        return false;
+    }
     // The batched path's row scratch is taken now, on both cards: a rank that could not allocate
     // it lazily, mid-step, would leave the other one waiting in a link op.
     bool peer_multi = false;
@@ -1709,9 +1754,11 @@ bool DFlashDraftModel::tp_attach(DFlashDraftModel* peer, int peer_device, cudaSt
     peer->p_->tp_stream = peer_stream;
     peer->p_->tp_split = true;
     fprintf(stderr, "[dflash] split draft: rank 0 on device %d, rank 1 on device %d "
-                    "(%d of %d query heads, %d KV heads, FFN %d per card; batched path %s)\n",
+                    "(%d of %d query heads, %d KV heads, FFN %d per card; batched path %s; "
+                    "fc %s)\n",
             s.device, peer_device, s.cfg.n_q_heads, s.cfg.n_q_heads * 2, s.cfg.n_kv_heads,
-            s.cfg.intermediate, s.m_ready && peer_multi ? "on" : "off");
+            s.cfg.intermediate, s.m_ready && peer_multi ? "on" : "off",
+            s.fc_split ? "split by columns" : "on rank 0");
     return true;
 }
 
@@ -1735,10 +1782,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         if (!have || !peer_have) return false;
     }
     bool ok = false, peer_ok = false;
+    // fc split: rank 1 projects its own half of the capture (see Impl::fc_split).
+    const void* peer_th = s.fc_split && s.peer_hidden && target_hidden ? s.peer_hidden(target_hidden)
+                                                                        : nullptr;
     tp_run_with_peer(
         s.tp_peer_dev,
         [&] {
-            peer_ok = s.tp_peer->forward_block_body(nullptr, ctx_len, noise_ids, pos0, nullptr,
+            peer_ok = s.tp_peer->forward_block_body(peer_th, ctx_len, noise_ids, pos0, nullptr,
                                                     nullptr, proposals, nullptr,
                                                     target_hidden_start);
         },
@@ -2085,33 +2135,45 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
     // per-layer context K/V below -- through the Q4 copies. 0 restores bf16 for both.
     static const bool kCtxQ4 = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_Q4");
                                    return !(e && e[0] == '0'); }();
-    if (fc_rows > 0 && !lead) {
+    if (fc_rows > 0 && !lead && !s.fc_split) {
         if (fc_skip < target_hidden_start) return false;
         cu(cudaMemsetAsync(s.target_proj + (size_t)fc_skip * H, 0, (size_t)fc_rows * H * sizeof(bf16),
                            st), "split ctx zero");
         tp_allreduce_bf16_on(s.target_proj + (size_t)fc_skip * H, (size_t)fc_rows * H, st);
     } else if (fc_rows > 0) {
         if (fc_skip < target_hidden_start) return false;
+        const int fk = s.fc_k;
         const bf16* th = (const bf16*)target_hidden +
-                         (size_t)(fc_skip - target_hidden_start) * n_cap * H;
+                         (size_t)(fc_skip - target_hidden_start) * fk;
         bf16* tp = s.target_proj + (size_t)fc_skip * H;
         const bool fc_q4 = kCtxQ4 && s.q8_fc.q4 && fc_rows >= 1 && fc_rows <= 8;
-        if (ctx_gemm) {
-            kernels::launch_prefill_gemm(th, s.fc, tp, fc_rows, H, n_cap * H, st);
+        if (!target_hidden) {
+            // A split rank whose capture twin could not be found: its half contributes nothing
+            // (the draft proposes worse, nothing emitted changes), but it still joins the sum.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "[dflash] fc split: no capture rows on rank %d\n", c.tp_rank);
+            }
+            cu(cudaMemsetAsync(tp, 0, (size_t)fc_rows * H * sizeof(bf16), st), "fc half zero");
+        } else if (ctx_gemm) {
+            kernels::launch_prefill_gemm(th, s.fc, tp, fc_rows, H, fk, st);
         } else if (fc_q4 && dp4a_ok) {
             dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
-                q81n(th, n_cap * H, fc_rows), s.q8_fc.q4, nullptr, nullptr,
+                q81n(th, fk, fc_rows), s.q8_fc.q4, nullptr, nullptr,
                 s.q8_fc.dm, nullptr, nullptr,
-                tp, nullptr, nullptr, H, 0, 0, n_cap * H, st, fc_rows);
+                tp, nullptr, nullptr, H, 0, 0, fk, st, fc_rows);
         } else if (fc_q4) {
             dflash_kernels::launch_gemv_batched_q4_fused3(
                 th, s.q8_fc.q4, nullptr, nullptr, s.q8_fc.dm, nullptr, nullptr,
-                tp, nullptr, nullptr, H, 0, 0, n_cap * H, st, fc_rows);
+                tp, nullptr, nullptr, H, 0, 0, fk, st, fc_rows);
         } else if (fc_rows > 1) {
-            dflash_kernels::launch_gemv_rows_batched(th, s.fc, tp, fc_rows, H, n_cap * H, st);
+            dflash_kernels::launch_gemv_rows_batched(th, s.fc, tp, fc_rows, H, fk, st);
         } else {
-            kernels::launch_gemv(th, s.fc, tp, H, n_cap * H, st);
+            kernels::launch_gemv(th, s.fc, tp, H, fk, st);
         }
+        // fc split: the two ranks' column halves sum to the whole projection, on both cards.
+        if (s.fc_split) tp_allreduce_bf16_on(tp, (size_t)fc_rows * H, st);
         dflash_kernels::launch_rms(tp, s.hidden_norm, tp, fc_rows, H, c.rms_eps, st);
         // Ablation (SPARKINFER_DFLASH_ZERO_CTX=1): blank the projected target features after
         // computing them. The draft then attends over an all-zero context while everything else --
@@ -2121,7 +2183,7 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
         if (getenv("SPARKINFER_DFLASH_ZERO_CTX"))
             cu(cudaMemsetAsync(tp, 0, (size_t)fc_rows * H * sizeof(bf16), st), "zero ctx");
         // The projected context, to rank 1 (which adds zeros).
-        if (split) tp_allreduce_bf16_on(tp, (size_t)fc_rows * H, st);
+        if (split && !s.fc_split) tp_allreduce_bf16_on(tp, (size_t)fc_rows * H, st);
     }
 
     // x = noise embedding
@@ -2683,7 +2745,7 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
                 if (f) { fwrite(host.data(), 1, bytes, f); fclose(f); }
             };
             const size_t V_ = (size_t)V;
-            put("target_hidden", target_hidden, (size_t)ctx_len * n_cap * H * sizeof(bf16), true);
+            put("target_hidden", target_hidden, (size_t)ctx_len * s.fc_k * sizeof(bf16), true);
             put("target_proj",   s.target_proj, (size_t)ctx_len * H * sizeof(bf16), true);
             put("xn_last",       s.xn,          (size_t)BW * H * sizeof(bf16), true);
             // The block's token embeddings -- the draft borrows the TARGET's embed table, so this
@@ -2745,9 +2807,18 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
     const int mode = (s.multi_plan(n, seg, proposals, past, ctx_off, ctx_total) && s.m_ready &&
                       s.tp_peer->p_->m_ready) ? 1 : 0;
     bool ok = false, peer_ok = false;
+    // fc split: rank 1 projects its own half of each session's capture (see Impl::fc_split).
+    std::vector<DraftSeg> peer_seg;
+    if (s.fc_split) {
+        peer_seg.assign(seg, seg + n);
+        for (auto& q : peer_seg)
+            q.target_hidden = s.peer_hidden && q.target_hidden ? s.peer_hidden(q.target_hidden)
+                                                               : nullptr;
+    }
+    const DraftSeg* pseg = s.fc_split ? peer_seg.data() : seg;
     tp_run_with_peer(
         s.tp_peer_dev,
-        [&] { peer_ok = s.tp_peer->forward_blocks_body(n, seg, proposals, nullptr, mode); },
+        [&] { peer_ok = s.tp_peer->forward_blocks_body(n, pseg, proposals, nullptr, mode); },
         [&] { ok = forward_blocks_body(n, seg, proposals, stream, mode); });
     return ok && peer_ok;
 }
@@ -2865,20 +2936,38 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
     }
 
     // The sessions' new context rows, concatenated, through fc + hidden_norm.
-    if (lead) {
-        for (int j = 0; j < n; j++)
-            cu(cudaMemcpyAsync(s.m_th + (size_t)ctx_off[j] * n_cap * H, seg[j].target_hidden,
-                               (size_t)seg[j].ctx_len * n_cap * H * sizeof(bf16),
-                               cudaMemcpyDeviceToDevice, st), "multi ctx gather");
-        proj(q81(s.m_th, n_cap * H, ctx_total), s.q8_fc, nullptr, nullptr, s.m_tp, nullptr, nullptr,
-             H, 0, 0, n_cap * H, ctx_total);
-        dflash_kernels::launch_rms(s.m_tp, s.hidden_norm, s.m_tp, ctx_total, H, c.rms_eps, st);
+    // fc split (see Impl::fc_split): each rank projects its half of the capture columns and the
+    // sum below completes the projection on both cards; hidden_norm then runs on each.
+    if (lead || s.fc_split) {
+        const int fk = s.fc_k;
+        for (int j = 0; j < n; j++) {
+            bf16* dst = s.m_th + (size_t)ctx_off[j] * fk;
+            const size_t bytes = (size_t)seg[j].ctx_len * fk * sizeof(bf16);
+            if (seg[j].target_hidden)
+                cu(cudaMemcpyAsync(dst, seg[j].target_hidden, bytes, cudaMemcpyDeviceToDevice, st),
+                   "multi ctx gather");
+            else {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    fprintf(stderr, "[dflash] fc split: no capture rows on rank %d (batched)\n",
+                            c.tp_rank);
+                }
+                cu(cudaMemsetAsync(dst, 0, bytes, st), "multi ctx half zero");
+            }
+        }
+        proj(q81(s.m_th, fk, ctx_total), s.q8_fc, nullptr, nullptr, s.m_tp, nullptr, nullptr,
+             H, 0, 0, fk, ctx_total);
+        if (!s.fc_split)
+            dflash_kernels::launch_rms(s.m_tp, s.hidden_norm, s.m_tp, ctx_total, H, c.rms_eps, st);
     }
     if (split) {
         // Both ranks now hold rank 0's rows bit for bit (x + 0 is exact).
         tp_allreduce_bf16_on(s.m_noise, (size_t)rows * H, st);
         tp_allreduce_bf16_on(s.m_tp, (size_t)ctx_total * H, st);
     }
+    if (s.fc_split)
+        dflash_kernels::launch_rms(s.m_tp, s.hidden_norm, s.m_tp, ctx_total, H, c.rms_eps, st);
     cu(cudaMemcpyAsync(s.m_x, s.m_noise, (size_t)rows * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
        "multi noise->x");
 

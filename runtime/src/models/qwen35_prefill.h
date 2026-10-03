@@ -156,6 +156,11 @@ struct Qwen35PrefillCtx {
     // means the pass touches the arenas directly, exactly as before. Conv state is never split.
     GdnStateWindow       gdn_window   = {};
     float*               gdn_scratch  = nullptr;
+    // (dual-GPU) Split DSpark capture (Qwen35Model::set_dflash_capture_split): the prompt capture
+    // keeps columns [capture_off, capture_off + capture_h) of each captured layer's row, so
+    // capture_dst rows are n_capture * capture_h wide. 0 = the whole row.
+    int                  capture_off  = 0;
+    int                  capture_h    = 0;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

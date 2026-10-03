@@ -4277,11 +4277,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // capture_start -- so a windowed pass (pos0 > 0) lands at its own offset.
                 const int first = std::max(0, s.capture_start - pos0);
                 if (first >= N) continue;
+                // A split capture keeps this card's columns of each row only.
+                const int ch = s.capture_h > 0 ? s.capture_h : H;
                 char* dst = static_cast<char*>(s.capture_dst) +
                             ((size_t)(pos0 + first - s.capture_start) * s.n_capture + slot) *
-                                H * sizeof(bf16);
-                dflash_kernels::launch_capture_rows(
-                    x + (size_t)first * H, dst, N - first, H, s.n_capture * H, st);
+                                ch * sizeof(bf16);
+                if (ch == H)
+                    dflash_kernels::launch_capture_rows(
+                        x + (size_t)first * H, dst, N - first, H, s.n_capture * H, st);
+                else
+                    pf_cu(cudaMemcpy2DAsync(dst, (size_t)s.n_capture * ch * sizeof(bf16),
+                                         x + (size_t)first * H + s.capture_off,
+                                         (size_t)H * sizeof(bf16), (size_t)ch * sizeof(bf16),
+                                         N - first, cudaMemcpyDeviceToDevice, st),
+                       "prefill split capture");
             }
         }
 

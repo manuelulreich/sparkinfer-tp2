@@ -876,6 +876,18 @@ struct Qwen35Model::Impl {
     int dflash_ctx_start = 0;
     bf16* dflash_hidden = nullptr;    // [max_rows, n_cap * H]
     bf16* dflash_context = nullptr;   // [ctx_cap, n_cap * H]
+    // (dual-GPU) Split capture (set_dflash_capture_split): this card stores columns
+    // [dflash_cap_off, dflash_cap_off + cap_h()) of each captured layer, so both buffers above
+    // are n_cap * cap_h() wide. 0 / 0 = the whole row (tp=1, or an unsplit draft).
+    int dflash_cap_off = 0;
+    int dflash_cap_h = 0;
+    int cap_h() const { return dflash_cap_h > 0 ? dflash_cap_h : cfg.hidden; }
+    // Rank 0 only: its split-capture buffers and their rank-1 twins (same size, same layout).
+    struct CapAlias { const char* lead; size_t bytes; char* peer; };
+    std::vector<CapAlias> cap_alias;
+    mutable std::mutex cap_alias_mu;
+    // Rank 1 only, while the capture is split: the leader, whose dflash_cap_peer maps its pointers.
+    Qwen35Model* cap_lead = nullptr;
     float* spec_lin_snap = nullptr;
     bf16* spec_conv_snap = nullptr;
     // GDN v-head state window (dual-GPU state split, see GdnStateWindow): (0,0) = all heads =
@@ -1644,8 +1656,11 @@ void Qwen35Model::dflash_maybe_capture_layer(int layer) {
     // device, so this node is graph-capturable even though the row changes every verify token --
     // which retires the staging buffer and the extra out-of-graph flush memcpy that every DFlash
     // verify token paid on top of a plain decode forward.
-    dflash_kernels::launch_capture_row(s.x, s.dflash_hidden, s.d_cap_row, slot, H,
-                                       s.dflash_n_cap * H, s.dflash_max_rows, s.stream);
+    // (dual-GPU) A split capture stores this card's columns of the row only.
+    const int ch = s.cap_h();
+    (void)H;
+    dflash_kernels::launch_capture_row(s.x + s.dflash_cap_off, s.dflash_hidden, s.d_cap_row, slot,
+                                       ch, s.dflash_n_cap * ch, s.dflash_max_rows, s.stream);
 }
 
 // Depth-adaptive KV-split count for a given seqlen: 32 (short) -> 128 (mid) -> 256 (long), plus
@@ -4207,6 +4222,23 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
             ma_pairs = 0;
     }
 
+    // DSpark capture (end of each layer below): the leader's, or with a split capture
+    // (set_dflash_capture_split) each rank's own columns, rank 1 into the twin of the leader's
+    // destination the caller passed.
+    const bool cap_here = s.dflash_n_cap > 0 && (s.tp_rank == 0 || s.dflash_cap_h > 0);
+    const int ch = s.cap_h();
+    Qwen35Model* cap_lead = s.tp_rank != 0 ? s.cap_lead : nullptr;
+    auto cap_dst = [&](void* p) -> void* {
+        if (!p || s.tp_rank == 0) return p;
+        void* q = cap_lead ? const_cast<void*>(cap_lead->dflash_cap_peer(p)) : nullptr;
+        static bool warned = false;
+        if (!q && !warned) {
+            warned = true;
+            fprintf(stderr, "[tp] split capture: no rank-1 twin for a verify capture row\n");
+        }
+        return q;
+    };
+
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (is_linear_layer(c, L)) {
@@ -4380,23 +4412,28 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         tp_prefill_allreduce_bf16(s.vr_ar, (size_t)n * H);
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(s.vr_h, s.vr_ar, nextnorm, s.vr_x, s.vr_xn, n, H, c.rms_eps, st);
-        // DSpark capture of this layer's output rows (leader only; the draft lives on rank 0).
-        if (seg && seg_capture && s.tp_rank == 0 && s.dflash_n_cap > 0)
+        // DSpark capture of this layer's output rows: on the leader, or on both ranks with a split
+        // capture (each its own columns, into its own twin of the leader's destination).
+        if (cap_here && seg && seg_capture)
             for (int slot = 0; slot < s.dflash_n_cap; slot++)
                 if (s.dflash_layer_ids[slot] == L)
                     for (int j = 0; j < S; j++)
-                        if (seg_capture[j])
-                            cu(cudaMemcpy2DAsync(static_cast<bf16*>(seg_capture[j]) + (size_t)slot * H,
-                                                 (size_t)s.dflash_n_cap * H * sizeof(bf16),
-                                                 s.vr_x + (size_t)j * H, (size_t)S * H * sizeof(bf16),
-                                                 (size_t)H * sizeof(bf16), T,
+                        if (void* dst = cap_dst(seg_capture[j]))
+                            cu(cudaMemcpy2DAsync(static_cast<bf16*>(dst) + (size_t)slot * ch,
+                                                 (size_t)s.dflash_n_cap * ch * sizeof(bf16),
+                                                 s.vr_x + (size_t)j * H + s.dflash_cap_off,
+                                                 (size_t)S * H * sizeof(bf16),
+                                                 (size_t)ch * sizeof(bf16), T,
                                                  cudaMemcpyDeviceToDevice, st), "tp seg capture");
-        if (!multi && capture_dst && s.tp_rank == 0 && s.dflash_n_cap > 0)
-            for (int slot = 0; slot < s.dflash_n_cap; slot++)
-                if (s.dflash_layer_ids[slot] == L)
-                    dflash_kernels::launch_capture_rows(
-                        s.vr_x, static_cast<bf16*>(capture_dst) + (size_t)slot * H, n, H,
-                        s.dflash_n_cap * H, st);
+        if (cap_here && !multi && capture_dst)
+            if (void* dst = cap_dst(capture_dst))
+                for (int slot = 0; slot < s.dflash_n_cap; slot++)
+                    if (s.dflash_layer_ids[slot] == L)
+                        cu(cudaMemcpy2DAsync(static_cast<bf16*>(dst) + (size_t)slot * ch,
+                                             (size_t)s.dflash_n_cap * ch * sizeof(bf16),
+                                             s.vr_x + s.dflash_cap_off, (size_t)H * sizeof(bf16),
+                                             (size_t)ch * sizeof(bf16), n,
+                                             cudaMemcpyDeviceToDevice, st), "tp capture");
     }
 
     // Head: this rank's vocab half per row, then the decode epilogue's zero-padded [V] all-reduce
@@ -6299,6 +6336,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.d_mrope_pos };
     ctx.gdn_window = s.gdn_window;
     ctx.gdn_scratch = s.gdn_scratch;
+    ctx.capture_off = s.dflash_cap_off;
+    ctx.capture_h = s.dflash_cap_h;
     // The Bonsai decode shadow's VRAM is decode-only -- this pass reads the folded Q4_K weights
     // either way -- so on a scratch-alloc failure it is pure margin to give back and retry once.
     // #1154 was rejected for exactly the failure this skips: at a long --ctx the KV pool leaves
@@ -7266,6 +7305,17 @@ void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft =
 void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows,
                                     int context_start, int context_end) {
     Impl& s = *p_;
+    // (dual-GPU) Split capture: rank 1 sets up (or tears down) its own half-width buffers with
+    // rank 0's. A peer still capturing from an earlier split run is turned off here too.
+    if (s.tp_rank == 0 && s.tp_peers.size() == 2 && s.tp_peers[1] &&
+        (s.dflash_cap_h > 0 || s.tp_peers[1]->p_->dflash_capture)) {
+        Qwen35Model* peer = s.tp_peers[1];
+        const bool peer_on = on && s.dflash_cap_h > 0;
+        tp_run_with_peer(peer->tp_rank_view().device,
+                         [&] { peer->set_dflash_capture(peer_on, target_layer_ids, max_rows,
+                                                        context_start, context_end); },
+                         nullptr);
+    }
     s.dflash_capture = on;
     s.dflash_layer_ids = target_layer_ids;
     s.dflash_n_cap = (int)target_layer_ids.size();
@@ -7283,8 +7333,7 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
         if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
         return;
     }
-    const int H = s.cfg.hidden;
-    const size_t row_elems = (size_t)s.dflash_n_cap * H;
+    const size_t row_elems = (size_t)s.dflash_n_cap * s.cap_h();
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
     if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
     if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
@@ -7309,15 +7358,115 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
         fprintf(stderr, "[dflash] capture on n_cap=%d max_rows=%d\n", s.dflash_n_cap, s.dflash_max_rows);
 }
 
-void Qwen35Model::set_dflash_capture_row(int row) { p_->dflash_cap_row = row; }
+void Qwen35Model::set_dflash_capture_row(int row) {
+    p_->dflash_cap_row = row;
+    if (dflash_capture_split()) p_->tp_peers[1]->p_->dflash_cap_row = row;
+}
+
+void Qwen35Model::set_dflash_capture_split(bool on) {
+    Impl& s = *p_;
+    Qwen35Model* peer = (s.tp_rank == 0 && s.tp_peers.size() == 2) ? s.tp_peers[1] : nullptr;
+    const int ch = on && peer && s.cfg.hidden % 16 == 0 ? s.cfg.hidden / 2 : 0;
+    if (ch == s.dflash_cap_h) return;
+    // The capture nodes' column window is baked into a captured decode graph.
+    s.dflash_cap_off = 0;
+    s.dflash_cap_h = ch;
+    invalidate_decode_graph();
+    if (peer)
+        tp_run_with_peer(peer->tp_rank_view().device, [&] {
+            peer->p_->dflash_cap_off = ch;
+            peer->p_->dflash_cap_h = ch;
+            peer->p_->cap_lead = ch ? this : nullptr;
+            peer->invalidate_decode_graph();
+        }, nullptr);
+}
+
+bool Qwen35Model::dflash_capture_split() const {
+    const Impl& s = *p_;
+    return s.tp_rank == 0 && s.dflash_cap_h > 0 && s.tp_peers.size() == 2 && s.tp_peers[1];
+}
+
+void* Qwen35Model::dflash_cap_alloc(size_t bytes) {
+    Impl& s = *p_;
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    if (!dflash_capture_split()) return p;
+    Qwen35Model* peer = s.tp_peers[1];
+    void* q = nullptr;
+    tp_run_with_peer(peer->tp_rank_view().device, [&] {
+        if (cudaMalloc(&q, bytes) != cudaSuccess) { cudaGetLastError(); q = nullptr; }
+    }, nullptr);
+    if (!q) { cudaFree(p); return nullptr; }
+    std::lock_guard<std::mutex> lk(s.cap_alias_mu);
+    s.cap_alias.push_back({static_cast<const char*>(p), bytes, static_cast<char*>(q)});
+    return p;
+}
+
+void Qwen35Model::dflash_cap_free(void* p) {
+    Impl& s = *p_;
+    if (!p) return;
+    void* q = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(s.cap_alias_mu);
+        for (size_t i = 0; i < s.cap_alias.size(); i++)
+            if (s.cap_alias[i].lead == p) {
+                q = s.cap_alias[i].peer;
+                s.cap_alias.erase(s.cap_alias.begin() + i);
+                break;
+            }
+    }
+    if (q && s.tp_peers.size() == 2 && s.tp_peers[1])
+        tp_run_with_peer(s.tp_peers[1]->tp_rank_view().device, [&] { cudaFree(q); }, nullptr);
+    cudaFree(p);
+}
+
+const void* Qwen35Model::dflash_cap_peer(const void* p) const {
+    const Impl& s = *p_;
+    if (!p || !dflash_capture_split()) return nullptr;
+    const Impl& q = *s.tp_peers[1]->p_;
+    const char* c = static_cast<const char*>(p);
+    const size_t row = (size_t)s.dflash_n_cap * s.cap_h() * sizeof(bf16);
+    auto in = [&](const void* base, size_t bytes, const void* twin) -> const void* {
+        const char* b = static_cast<const char*>(base);
+        if (!base || !twin || c < b || c >= b + bytes) return nullptr;
+        return static_cast<const char*>(twin) + (c - b);
+    };
+    if (const void* r = in(s.dflash_hidden, (size_t)s.dflash_max_rows * row, q.dflash_hidden)) return r;
+    if (const void* r = in(s.dflash_context, (size_t)s.dflash_ctx_cap * row, q.dflash_context)) return r;
+    std::lock_guard<std::mutex> lk(s.cap_alias_mu);
+    for (const auto& a : s.cap_alias)
+        if (const void* r = in(a.lead, a.bytes, a.peer)) return r;
+    return nullptr;
+}
+
+void Qwen35Model::dflash_cap_copy(void* dst, const void* src, size_t bytes) {
+    Impl& s = *p_;
+    cu(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s.stream), "dflash cap copy");
+    if (!dflash_capture_split()) return;
+    void* pd = const_cast<void*>(dflash_cap_peer(dst));
+    const void* ps = dflash_cap_peer(src);
+    if (!pd || !ps) {
+        fprintf(stderr, "[dflash] split capture: no rank-1 twin for a copy\n");
+        return;
+    }
+    Qwen35Model* peer = s.tp_peers[1];
+    tp_run_with_peer(peer->tp_rank_view().device, [&] {
+        cu(cudaMemcpyAsync(pd, ps, bytes, cudaMemcpyDeviceToDevice, peer->p_->stream),
+           "dflash cap copy (rank 1)");
+    }, nullptr);
+}
 
 void Qwen35Model::dflash_stash_capture(int global_pos) {
     Impl& s = *p_;
+    if (dflash_capture_split()) {
+        Qwen35Model* peer = s.tp_peers[1];
+        tp_run_with_peer(peer->tp_rank_view().device,
+                         [&] { peer->dflash_stash_capture(global_pos); }, nullptr);
+    }
     if (!s.dflash_hidden || !s.dflash_context || s.dflash_n_cap <= 0) return;
     const int stored_pos = global_pos - s.dflash_ctx_start;
     if (stored_pos < 0 || stored_pos >= s.dflash_ctx_cap) return;
-    const int H = s.cfg.hidden;
-    const size_t row_elems = (size_t)s.dflash_n_cap * H;
+    const size_t row_elems = (size_t)s.dflash_n_cap * s.cap_h();
     const bf16* src = s.dflash_hidden + (size_t)s.dflash_cap_row * row_elems;
     bf16* dst = s.dflash_context + (size_t)stored_pos * row_elems;
     cu(cudaMemcpyAsync(dst, src, row_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
@@ -7325,10 +7474,17 @@ void Qwen35Model::dflash_stash_capture(int global_pos) {
     if (global_pos + 1 > s.dflash_ctx_len) s.dflash_ctx_len = global_pos + 1;
 }
 
-const void* Qwen35Model::dflash_hidden_buffer() const { return p_->dflash_hidden; }
-const void* Qwen35Model::dflash_context_buffer() const { return p_->dflash_context; }
+// With a split capture a buffer counts only when rank 1's twin exists too.
+const void* Qwen35Model::dflash_hidden_buffer() const {
+    if (dflash_capture_split() && !p_->tp_peers[1]->p_->dflash_hidden) return nullptr;
+    return p_->dflash_hidden;
+}
+const void* Qwen35Model::dflash_context_buffer() const {
+    if (dflash_capture_split() && !p_->tp_peers[1]->p_->dflash_context) return nullptr;
+    return p_->dflash_context;
+}
 int Qwen35Model::dflash_hidden_row_stride() const {
-    return p_->dflash_n_cap * p_->cfg.hidden;
+    return p_->dflash_n_cap * p_->cap_h();
 }
 int Qwen35Model::dflash_context_len() const { return p_->dflash_ctx_len; }
 
@@ -7400,9 +7556,12 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
 bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,
                                   int* out_argmax, const void* dflash_capture_dst) {
     if (tp_active()) {
-        // (dual-GPU WP-12) Both ranks run the row-batched tp verify; only the leader captures.
+        // (dual-GPU WP-12) Both ranks run the row-batched tp verify.
         std::vector<int> tp_peer_out(n > 0 ? n : 0);
-        TP_MIRROR(batched_forward(token_ids, n, start_pos, false, tp_peer_out.data(), nullptr));
+        // A split capture (set_dflash_capture_split) also captures on rank 1, into the twin of
+        // the leader's destination; unsplit, rank 1 skips it.
+        TP_MIRROR(batched_forward(token_ids, n, start_pos, false, tp_peer_out.data(),
+                                  dflash_capture_split() ? dflash_capture_dst : nullptr));
         return verify_rows_tp(token_ids, n, start_pos, const_cast<void*>(dflash_capture_dst),
                               out_argmax) > 0;
     }
@@ -7605,6 +7764,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // deferring them is the branch above: a generation that takes the autoregressive path returns
     // before this line and never materialises them at all.
     draft.ensure_quant();
+    // (dual-GPU) A draft whose fc is split by columns reads each card's own half of the capture
+    // (set_dflash_capture_split); rank 1 finds its rows through dflash_cap_peer.
+    set_dflash_capture_split(tp_draft_peer && draft.fc_split());
+    draft.set_peer_hidden_map([this](const void* p) { return dflash_cap_peer(p); });
     // B + 1 rows, not B: the verify submits vn = kProposalDepth + 1 rows and captures a target
     // hidden state for each, so a full-block plan captures row B. k_capture_row guards on
     // max_rows, so sizing this at B did not corrupt memory -- it silently DROPPED the last
@@ -8005,7 +8168,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // for B + 1 for the same reason. B rows here made that copy run past the end of th_scratch after
     // every full-block accept on the token-loop path ("dflash overlap stash: invalid argument"), and
     // the draft then read a stale context.
-    if (cudaMalloc(&th_scratch, (size_t)(B + 1) * row_stride * sizeof(bf16)) != cudaSuccess) {
+    th_scratch = static_cast<bf16*>(dflash_cap_alloc((size_t)(B + 1) * row_stride * sizeof(bf16)));
+    if (!th_scratch) {
         if (hooks) {
             // The prompt is prefilled and consistent: hand it back for ordinary decode.
             if (resume) { resume->engaged = true; resume->position = n; resume->next_token = next; }
@@ -8241,9 +8405,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // synchronize are pure overhead.
         const void* draft_hidden = target_hidden;
         if (!compact_verify && target_hidden == s.dflash_hidden) {
-            cu(cudaMemcpyAsync(th_scratch, target_hidden,
-                               (size_t)th_len * row_stride * sizeof(bf16),
-                               cudaMemcpyDeviceToDevice, s.stream), "dflash overlap stash");
+            dflash_cap_copy(th_scratch, target_hidden, (size_t)th_len * row_stride * sizeof(bf16));
             cu(cudaStreamSynchronize(s.stream), "dflash overlap stash sync");
             draft_hidden = th_scratch;
         }
@@ -8693,7 +8855,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         resume->emitted = (int)out.size();
     }
     if (!hooks) close_session(sid);   // an engine session stays with its job
-    if (th_scratch) cudaFree(th_scratch);
+    if (th_scratch) dflash_cap_free(th_scratch);
     // Verify graphs bake pointers into their request-sized arena. They are useful only for this
     // generation; retaining them steals enough VRAM from a following 32K prefill to change its
     // scratch path and, for the recurrent GDN stack, its result.
@@ -8707,13 +8869,15 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
 }
 
 // (dual-GPU C2) One segmented verify for a speculative group: both ranks run it (mirrored, as
-// batched_forward), only the leader captures. Returns n, or -1 when declined (nothing changed).
+// batched_forward). The leader captures; with a split capture rank 1 captures its own columns too,
+// into the twins of the leader's destinations. Returns n, or -1 when declined (nothing changed).
 int Qwen35Model::spec_group_verify(const int* ids, int n, const int* row_pos,
                                    const uint64_t* row_seq, int seg_n, void* const* seg_capture,
                                    int* out_argmax, int* seg_keep, const SpecSampleRow* row_sample) {
     if (!tp_active() || seg_n < 1 || n < 1) return -1;
     std::vector<int> peer_out(n), peer_keep(seg_n);
-    TP_MIRROR(spec_group_verify(ids, n, row_pos, row_seq, seg_n, nullptr, peer_out.data(),
+    void* const* peer_capture = dflash_capture_split() ? seg_capture : nullptr;
+    TP_MIRROR(spec_group_verify(ids, n, row_pos, row_seq, seg_n, peer_capture, peer_out.data(),
                                 peer_keep.data(), row_sample));
     return tp_rows_forward(ids, n, 0, row_pos, row_seq, nullptr, out_argmax, seg_n, seg_capture,
                            seg_keep, row_sample);
@@ -8872,7 +9036,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         int start = 0;           // committed position (prompt + emitted)
         int next = -1;           // verified, not yet emitted
         int state = -1;          // draft KV state
-        bf16* cap = nullptr;     // [BB + 1][n_cap * H] capture rows of the last verify
+        bf16* cap = nullptr;     // [BB + 1][row stride] capture rows of the last verify
         int th_len = 0;          // rows of `cap` the next draft ingests
         bool predrafted = false; // block[1..] already holds the join's first draft
         std::vector<int> block, out, draft_out;
@@ -8905,6 +9069,10 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                                   tp_draft_peer->tp_rank_view().device);
         draft.set_head_fp4(s.w.lm_head_fp4, s.w.lm_head_fp4_sf, s.w.lm_head_fp4_alpha);
         draft.ensure_quant();
+        // (dual-GPU) A draft whose fc is split by columns reads each card's own half of the
+        // capture (set_dflash_capture_split); rank 1 finds its rows through dflash_cap_peer.
+        set_dflash_capture_split(tp_draft_peer && draft.fc_split());
+        draft.set_peer_hidden_map([this](const void* p) { return dflash_cap_peer(p); });
         s.final_seqlen_hint = -1;
     }
 
@@ -8920,10 +9088,26 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     };
     auto drop = [&](G& g) {   // device_mu held
         if (g.state >= 0) draft.kv_state_free(g.state);
-        if (g.cap) cudaFree(g.cap);
+        if (g.cap) dflash_cap_free(g.cap);
         g.state = -1;
         g.cap = nullptr;
         g.done = true;
+    };
+    // The prompt's capture rows, on both cards with a split capture (device_mu held).
+    auto free_context = [&] {
+        if (dflash_capture_split()) {
+            Impl& q = *s.tp_peers[1]->p_;
+            tp_run_with_peer(s.tp_peers[1]->tp_rank_view().device, [&] {
+                if (q.dflash_context) cudaFree(q.dflash_context);
+                q.dflash_context = nullptr;
+                q.dflash_ctx_cap = 0;
+            }, nullptr);
+        }
+        if (s.dflash_context) {
+            cudaFree(s.dflash_context);
+            s.dflash_context = nullptr;
+            s.dflash_ctx_cap = 0;
+        }
     };
 
     // Prefill + capture + first draft of a joining job. false: it could not start (resume not
@@ -8965,12 +9149,13 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         set_dflash_capture(true, dc.target_layer_ids, B + 1, capture_start,
                            std::min(s.cfg.max_seq, g.n + 1));
         if (!dflash_context_buffer() || !dflash_hidden_buffer()) return false;
-        const size_t cap_bytes = (size_t)(BB + 1) * s.dflash_n_cap * H * sizeof(bf16);
-        if (cudaMalloc(&g.cap, cap_bytes) != cudaSuccess) { cudaGetLastError(); g.cap = nullptr; return false; }
+        const size_t cap_bytes = (size_t)(BB + 1) * dflash_hidden_row_stride() * sizeof(bf16);
+        g.cap = static_cast<bf16*>(dflash_cap_alloc(cap_bytes));
+        if (!g.cap) return false;
         // A state slides (DFlashDraftModel::kv_state_create), so it never needs more than the
         // sliding capacity, whatever the context: 123 MB a card instead of 20 KB a token.
         g.state = draft.kv_state_create((int)std::min<long>(need, draft.kv_slide_capacity()));
-        if (g.state < 0) { cudaFree(g.cap); return false; }
+        if (g.state < 0) { dflash_cap_free(g.cap); g.cap = nullptr; return false; }
         const int budget = session_token_budget(prompt.size(), job->max_new + B, s.cfg.max_seq);
         invalidate_decode_graph();
         bool kv_ok = s.kv->allocate(job->seq_id, budget);
@@ -9043,11 +9228,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             // prefix-cache hit, at the prefix, with its recurrent state put back below).
             fprintf(stderr, "[spec-group] join declined: the batched prefill does not fit beside "
                             "the draft (n=%d); prefilling it ordinarily\n", g.n);
-            if (s.dflash_context) {
-                cudaFree(s.dflash_context);
-                s.dflash_context = nullptr;
-                s.dflash_ctx_cap = 0;
-            }
+            free_context();
             drop(g);
             if (!undo_prefill()) { fill_resume(g, true, true); hooks.on_done(job); return true; }
             return false;
@@ -9106,11 +9287,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         // every later step drafts from the session's own `cap`. Give them back now rather than
         // when the group ends, for the prefills of whatever runs meanwhile. The draft has read
         // them: forward_block synchronises its stream (this model's) before it returns.
-        if (s.dflash_context) {
-            cudaFree(s.dflash_context);
-            s.dflash_context = nullptr;
-            s.dflash_ctx_cap = 0;
-        }
+        free_context();
         // The draft's context at the last checkpoint goes with that prefix-cache entry (plan 06,
         // W4), in pinned host memory: SPARKINFER_DSPARK_SNAPSHOT positions (default 12288, the
         // span the draft attends unwindowed; 0 = off), ~10 KB a position per card. A prefix of

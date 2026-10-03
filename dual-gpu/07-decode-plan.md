@@ -144,6 +144,8 @@ Card 0 carries 560–640 MiB more. The KV pool is sized by the tighter card, so 
    - Each card projects its half. The existing zero-padded all-reduce of `target_proj` becomes a real sum, with the same bytes on the link.
    - The capture rows split the same way, halving card 0's transient.
    - Gap after this step: ~560 → ~250 MB.
+
+   **Step 1 status: done (2026-10-03).** Each card captures its own columns into its own half-width buffers; rank 1 finds its twins through a pointer map the leader keeps (`dflash_cap_peer`). Measured idle at `--ctx 32768`: card 0 12,669 → 12,505 MiB, card 1 12,107 → 12,273 MiB (gap 562 → 232). Greedy deterministic: same outputs, same acceptance (2.85 tokens a step), draft 2.42 → 2.23 ms. `SPARKINFER_DFLASH_FC_SPLIT=0` reverts.
 2. **Drop fc's bf16 copy** by running the first block's projection as an NVFP4 tensor-core GEMM (as the verify and now the draft head do). That frees the 131 MB per card left by step 1. The draft's context projection changes numerically, but it only affects proposals, not output.
 3. **Markov w1 to int8 with a per-row scale** (−63 MB on card 0). It is an embedding lookup of the previous token, read once per proposal row.
 4. **Stream the capture into the draft (plan 06, W2)**, so a join holds a window of rows instead of up to 4096 (−170 MB transient).
