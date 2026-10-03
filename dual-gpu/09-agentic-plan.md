@@ -199,6 +199,38 @@ It differs from DSpark in:
   - ~8 rows at ~29 ms verify (M2 scaling) plus ~2–3 ms draft is ~31 ms a step.
   - At 3.4–3.7 tokens/step that is ~110–120 tok/s at 60k, on par with HyperQwen.
 
+**Status of B (2026-10-03): B1-B3 done, B4 measured. A sub-agent ported it in a worktree; it
+was merged and tested here.**
+- `DFlashDraftModel` serves both drafters. `cfg.dflash2` comes from `config.json`.
+- The bf16 checkpoint is quantized to NVFP4 once, on the CPU, into
+  `sparkinfer-nvfp4.safetensors` (1.55 GB, ~30 s; `SPARKINFER_DFLASH2_NVFP4_CACHE`).
+- Split at tp=2: 16/32 query heads, 4 KV heads, FFN 8704 per card.
+- Selector: each card takes the top-16 of its vocab half, the halves merge on the host, then
+  rank 0 runs the greedy walk.
+- Depth 7 at every context (`spec_depth`).
+- Memory at `--ctx 131072`: card 0 at 13.26 GB idle (DSpark: 12.97).
+- Lossless: tp2 gates pass 7/7. Gate counting 303 tok/s, list prose 111.7 (DSpark 275 / 83.5).
+- M2 replay (60.7k context, the opencode step with tools, constrained):
+
+  | | greedy | sampled |
+  |---|---:|---:|
+  | DSpark | 76.8 tok/s, 2.08/step | 50.8 tok/s, 1.53/step (group stopped) |
+  | DFlash2 | **100.0 tok/s, 3.56/step**, 30.3 ms verify + 4.3 ms draft | **76.6 tok/s, 2.73/step** |
+  | HyperQwen | 102.2 tok/s, 3.42/step | 113.9 tok/s, 3.74/step |
+
+**B5 (next): the sampled gap is the acceptance rule.**
+- vLLM accepts with rejection sampling (Σ min(p, q) per token). We accept while the draft
+  equals the verify row's own draw, which keeps output identical to ordinary sampled decode.
+- With a greedy walk, that accepts a token with probability p(argmax).
+- Couple the walk to the verify's noise instead:
+  - in each step, the selector picks argmax(score / T + g), where g is the same Philox Gumbel
+    noise the verify draws with for that position and candidate (seed, token id, step);
+  - restrict it to the request's top_k / top_p the same way.
+- When the selector's distribution is close to the target's, the two argmaxes coincide far
+  more often than p(argmax). Output stays exactly ordinary sampled decode.
+- DSpark's attempt (plan 07 A1) failed because its candidates do not match the target.
+  DFlash2's selector scores are trained as a distribution over the top-16.
+
 ### C. Prefill memory: reserve it, then size the KV pool
 
 - **C1. Reserve the prefill arena at startup.**

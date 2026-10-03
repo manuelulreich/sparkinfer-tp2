@@ -1394,8 +1394,9 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     impl_->draft = std::move(draft);
     impl_->draft_peer = std::move(draft_peer);
     impl_->batch_engine->enable_speculative(true);
-    fprintf(stderr, "[sparkinfer-server] speculative decoding: DSpark draft %s (block %d, draft context %d)\n",
-            dir.c_str(), impl_->draft->config().block_size, impl_->draft->config().max_seq);
+    fprintf(stderr, "[sparkinfer-server] speculative decoding: %s draft %s (block %d, draft context %d)\n",
+            impl_->draft->config().dflash2 ? "DFlash2" : "DSpark", dir.c_str(),
+            impl_->draft->config().block_size, impl_->draft->config().max_seq);
     return true;
 }
 

@@ -57,6 +57,29 @@ struct DFlashDraftConfig {
     int   yarn_orig_max_pos = 0;      // "original_max_position_embeddings" (8192)
     float yarn_beta_fast = 32.f;
     float yarn_beta_slow = 1.f;
+
+    // DFlash2 (config.json "architectures": ["DFlash2DraftModel"]). Each layer wraps its attention
+    // and its MLP in a grouped convolution along the block (conv_taps taps over the previous
+    // positions of the same block, one coefficient per conv_group channels and row, from a
+    // per-row kernel_projection), and the proposals come from a candidate selector instead of the
+    // head's argmax: the head's top selector_top_k per row, then a walk over the rows that scores
+    // each candidate given the previous pick (rank selector_rank codebooks). Block rows 1..depth
+    // back proposals 1..depth (no row shift), so a block backs block_size - 1 proposals.
+    bool dflash2 = false;
+    int conv_taps = 2;
+    int conv_group = 16;
+    int selector_rank = 256;
+    int selector_top_k = 16;
+    float output_multiplier = 1.f;   // dflash_config "output_multiplier"
+    float logit_softcap = 0.f;       // dflash_config "final_logit_softcapping" (<= 0: none)
+    float embed_scale = 1.f;         // dflash_config "input_embedding_scale"
+    int is_causal = -1;              // top-level "is_causal" (-1: absent); DFlash2 layers follow it
+    // Proposal depth the checkpoint asks for at every context (0: the caller's own ladder).
+    // DFlash2 drafts its whole trained block (block_size - 1), as HyperQwen runs it.
+    int spec_depth = 0;
+
+    // Most proposals one block can back.
+    int max_proposals() const { return dflash2 ? block_size - 1 : block_size; }
 };
 
 class DFlashDraftModel {
@@ -81,6 +104,20 @@ public:
     // tensor-core GEMM instead of the Q4_K multirow GEMV, whose cost grows with the rows (0.6 ms
     // at 6 rows, 2.2 ms at 16). The target clears it before it frees the copy.
     void set_head_fp4(const void* w, const void* sf, float alpha);
+
+    // (dual-GPU) DFlash2 scores its candidates over the whole vocabulary: each card takes its
+    // top-k of its own vocab half and the two are merged (tp_exchange_topk). The second card's
+    // half of the target head, read at every block (the target may release its FP4 copy between
+    // blocks): `rows` vocab rows, the last ones of the vocabulary. Ignored by other drafts and
+    // without an attached peer.
+    struct HeadRef {
+        const void* lm_head = nullptr;
+        int lm_head_type = 0;
+        const void* fp4_w = nullptr;
+        const void* fp4_sf = nullptr;
+        float fp4_alpha = 1.f;
+    };
+    void set_peer_head(std::function<HeadRef()> src, int rows);
 
     // (dual-GPU) fc split by input columns: each rank holds the fc columns of its own half of
     // every captured layer, and the target captures that half on each card
@@ -119,7 +156,8 @@ public:
     // below them are gone). So a state of kv_slide_capacity() positions serves any context.
     int kv_state_create(int capacity);
     // Positions a sliding state needs to behave exactly as an unbounded one for every context the
-    // draft attends unwindowed (SPARKINFER_DSPARK_KV_CAP, default 12288 + 2 x block).
+    // draft attends unwindowed (SPARKINFER_DSPARK_KV_CAP, default 12288 + 2 x block; DFlash2,
+    // windowed everywhere: kv_slide_keep() + 4 x block).
     int kv_slide_capacity() const;
     // Positions kept when a state slides (SPARKINFER_DSPARK_KV_KEEP, default 4096).
     int kv_slide_keep() const;

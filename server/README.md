@@ -54,7 +54,10 @@ docker run --gpus all -p 8080:8080 -v qwen38:/models \
   ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest serve-dspark
 ```
 
-For a source build, pass the downloaded drafter directory explicitly:
+At `--tp 2` the drafter can also be DFlash2 (`incoai/Qwen3.8-27B-DFlash2`, the bf16 original; the
+server detects it from `config.json`): it proposes 7 tokens a step at every context length and
+holds up far better at long context (60k-token agent turn: 3.6 tokens a step greedy against
+DSpark's 2.1). For a source build, pass the downloaded drafter directory explicitly:
 
 ```bash
 ./build/server/sparkinfer_server \
@@ -588,6 +591,7 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_TP_FRONT_PIPE` | `1` | At `--tp 2`, a GDN layer's row-wise front (residual add, norm, qkv/z/alpha/beta projections) runs chunk by chunk behind the previous FFN's down all-reduces (bit-identical). `0` = after the whole block. |
 | `SPARKINFER_DFLASH_FC_SPLIT` | `1` | At `--tp 2`, the DSpark draft's fc projector is split by input columns: each card captures its own half of the tapped hidden states and projects it, and the halves are summed. `0` = fc and the whole capture on card 0. |
 | `SPARKINFER_PACKED_SAMPLING` | `1` | At `--tp 2`, concurrent sampled requests (`top_k` 1–64, no penalties or `logit_bias`) decode in one batched step like greedy ones; each row draws its token exactly as single-request decode would. `0` = each sampled request decodes on its own. |
+| `SPARKINFER_DFLASH2_NVFP4_CACHE` | `1` | `--draft-model` pointing at a bf16 DFlash2 checkpoint (`incoai/Qwen3.8-27B-DFlash2`): its projections are quantized to NVFP4 once, into `sparkinfer-nvfp4.safetensors` beside the checkpoint (or `$XDG_CACHE_HOME/sparkinfer/` when that directory is read-only), and later starts load that file (~30 s the first time, 1.55 GB). Keyed by the checkpoint's size and mtime. `rebuild` rebuilds it; `0` quantizes on the GPU at every start instead. |
 | `SPARKINFER_DSPARK_SNAPSHOT` | `12288` | Drafter context kept with a speculated request's last prefix-cache checkpoint (pinned host memory, ~10 KB a position per card), so the next turn of the conversation speculates with it. `0` = off: the next turn then starts the drafter at the cached prefix's end. |
 | `SPARKINFER_MAX_QUEUE_DEPTH` | `0` (unlimited) | Admission-time cap on the total active continuous-batch set (running and waiting between scheduler steps). Beyond it, new requests are rejected as `429` before KV allocation. Requests waiting for KV capacity count toward it. Production services that promise bounded admission should set this explicitly; `0` does not satisfy such a promise. |
 | `SPARKINFER_SAMPLING_DEFAULTS` | `generation_config` | What a request that omits `temperature`, `top_k` or `top_p` gets. `generation_config` uses the checkpoint's `generation_config.json` (Qwen3.8: temperature 1.0, top_k 20, top_p 0.95), as vLLM does; greedy decoding makes a thinking model loop on long agent tasks. `greedy` restores greedy decoding for those requests. A checkpoint without the file, and `SPARKINFER_DETERMINISTIC=1`, stay greedy. An explicit value, including `temperature: 0`, always wins. DSpark speeds up greedy requests, and at `--tp 2` also sampled ones with `top_k` 1–64 (see `SPARKINFER_SPEC_SAMPLING`). |

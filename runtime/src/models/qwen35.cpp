@@ -9051,10 +9051,11 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     // cost more than they land. Measured here on an opencode-like replay (multiturn_bench.py),
     // depth 6 at 14k-55k: 28 -> 40 ms a step for 1.8-2.8 tokens. SPARKINFER_SPEC_GROUP_LONG_DEPTH
     // (default 2; 0 keeps depth_for's).
-    static const int kLongDepth = [] {
+    // A draft that asks for one depth at every context (DFlash2: its whole block) gets it here
+    // unless these two say otherwise; its long depth is then off.
+    static const int kLongDepthEnv = [] {
         const char* e = getenv("SPARKINFER_SPEC_GROUP_LONG_DEPTH");
-        const int v = e ? atoi(e) : 2;
-        return v < 0 ? 0 : v;
+        return e ? std::max(0, atoi(e)) : -1;
     }();
     // Speculation must beat ordinary decode, which costs about the same per step for one to four
     // greedy sessions (packed). Over the group's last kGainWindow steps, gain = (tokens committed
@@ -9147,6 +9148,16 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             draft.set_embed_split(s.cfg.vocab / 2, tp_draft_peer->embed_weights(),
                                   tp_draft_peer->tp_rank_view().device);
         draft.set_head_fp4(s.w.lm_head_fp4, s.w.lm_head_fp4_sf, s.w.lm_head_fp4_alpha);
+        if (tp_draft_peer)   // DFlash2 scores the second card's vocab half there
+            draft.set_peer_head([pm = tp_draft_peer] {
+                DFlashDraftModel::HeadRef h;
+                h.lm_head = pm->lm_head_weights();
+                h.lm_head_type = pm->lm_head_quant_type();
+                h.fp4_w = pm->p_->w.lm_head_fp4;
+                h.fp4_sf = pm->p_->w.lm_head_fp4_sf;
+                h.fp4_alpha = pm->p_->w.lm_head_fp4_alpha;
+                return h;
+            }, s.cfg.vocab - s.cfg.vocab / 2);
         draft.ensure_quant();
         // (dual-GPU) A draft whose fc is split by columns reads each card's own half of the
         // capture (set_dflash_capture_split); rank 1 finds its rows through dflash_cap_peer.
@@ -9401,10 +9412,11 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         return true;
     };
 
+    const int kLongDepth = kLongDepthEnv >= 0 ? kLongDepthEnv : (dc.spec_depth > 0 ? 0 : 2);
     auto depth_for = [&](int S, int ctx = 0) {
-        int want = kDepthEnv > 0 ? kDepthEnv : (S <= 1 ? 6 : 4);
+        int want = kDepthEnv > 0 ? kDepthEnv : dc.spec_depth > 0 ? dc.spec_depth : (S <= 1 ? 6 : 4);
         if (kDepthEnv <= 0 && kLongDepth > 0 && ctx >= 12288) want = std::min(want, kLongDepth);
-        return std::max(0, std::min(want, std::min(B, R / std::max(S, 1) - 1)));
+        return std::max(0, std::min(want, std::min(dc.max_proposals(), R / std::max(S, 1) - 1)));
     };
     for (SpecGroupJob* j : jobs) {
         if (!join(j, depth_for((int)jobs.size()))) {

@@ -7,6 +7,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2: DFlash2 drafter** (`--draft-model` on `incoai/Qwen3.8-27B-DFlash2`, detected from
+  `config.json`; DSpark keeps working unchanged). The same block-drafter family as DSpark plus
+  a grouped 2-tap convolution around each attention and MLP, a native 2048-token sliding window
+  and a candidate selector (top-16 of the shared head per position, rank-256 pairwise scores,
+  greedy path walk); depth 7 at every context. Its projections are quantized to NVFP4 once and
+  cached beside the checkpoint (`SPARKINFER_DFLASH2_NVFP4_CACHE`). Lossless (tp2 gates 7/7).
+  DSpark -> DFlash2: gate counting 275 -> 303 tok/s, list prose 83.5 -> 111.7; a 60k-context
+  opencode turn greedy 76.8 -> 100.0 tok/s (3.56 tokens a step; HyperQwen's vLLM DFlash2 102),
+  sampled 50.8 -> 76.6 (2.73 a step; HyperQwen 114 with rejection sampling).
+
 - **tp=2: DSpark speculates on tool-calling requests.** A request with tools is decoded under
   the tool grammar, and constrained requests never speculated -- so an agent (opencode sends
   its tools with every request) got no speculation at all, reasoning and answers included.

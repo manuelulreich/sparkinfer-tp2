@@ -59,6 +59,30 @@ void launch_rows_sample_candidates(const float* cand_v, const int* cand_i, int n
 // bits[r][i / 32] (V / 32 words a row, bit i % 32) is clear. V must be a multiple of 32.
 void launch_rows_mask_bits(float* x, int n_rows, int V, const uint32_t* bits, cudaStream_t stream);
 
+// DFlash2's grouped convolution along the block, one side of it (DFlashGroupedConv in the vLLM
+// reference). x, out: [rows, H] bf16, rows made of consecutive blocks of `block` rows; coef:
+// [rows, 2, taps, H / group] bf16 (the kernel_projection of the row); base: [2, taps, H] bf16.
+//   out[i][c] = sum_t (base[side][t][c] + coef[i][side][t][c / group]) * x[i - t][c]
+// over the taps t with i - t in the same block (tap 0 is the row itself). Rounded to bf16 after
+// every operation, as the reference computes it in bf16. out must not alias x.
+void launch_dflash2_conv(const void* x, const void* coef, const void* base, void* out, int rows,
+                         int block, int H, int group, int taps, int side, cudaStream_t stream);
+
+// DFlash2's candidate selector and greedy path walk, for one block of `steps` proposals. Step l
+// has k candidates cand_i[l * cand_stride + j] (global ids, best first) with head logits
+// cand_v[...]; hp[l * hp_stride + r] is the selector's hidden projection of the row backing it.
+//   score(l, j) = u(cand_v) + bf16(sum_r bf16(pred[prev][r] * hp[l][r]) * succ[cand_i][r])
+// with u = bf16(v) * multiplier, then softcap * tanh(u / softcap) when softcap > 0, and prev the
+// token picked at step l - 1 (*anchor, a device int, for step 0). Each step takes its best score
+// (ties to the lower j); out[l] = its id. k <= 32. Candidates outside [0, vocab) score -inf.
+void launch_dflash2_select(const int* cand_i, const float* cand_v, int cand_stride,
+                           const void* hp, int hp_stride, const int* anchor, const void* pred,
+                           const void* succ, int vocab, int rank, int k, int steps,
+                           float multiplier, float softcap, int* out, cudaStream_t stream);
+
+// x[i] *= s over n bf16 values.
+void launch_scale_bf16(void* x, long n, float s, cudaStream_t stream);
+
 // In-place RoPE on [seq, n_heads, d] bf16. positions[i] = pos0 + i.
 void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0,
                      float theta, cudaStream_t stream);
