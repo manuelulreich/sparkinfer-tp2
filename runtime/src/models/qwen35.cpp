@@ -5471,7 +5471,13 @@ void tp_prefill_allreduce_bf16(void* in_out, size_t elems) {
 // next collective fails. Agreeing first keeps them on one path. Not tp: returns v unchanged.
 static std::atomic<int> g_tp_agree_in[2];
 static std::atomic<int> g_tp_agree_out{0};
-static int tp_prefill_agree(int v, int (*op)(int, int)) {
+// Each rank's call site (file, line). Agreements pair by arrival order only, so a rank that
+// skipped one pairs every later agreement -- and link op -- with the wrong partner; seen once as
+// a prefill FFN chunk "agreed" to 1 and a GpuLink op on a null buffer. The leader names both
+// sites when they differ.
+static const char* g_tp_agree_file[2] = {nullptr, nullptr};
+static std::atomic<int> g_tp_agree_line[2];
+static int tp_prefill_agree(int v, int (*op)(int, int), int line, const char* file) {
     if (!g_tp_prefill_link || g_tp_prefill_dev[0] < 0 || g_tp_prefill_dev[1] < 0) return v;
     int dev = -1;
     if (cudaGetDevice(&dev) != cudaSuccess ||
@@ -5479,22 +5485,31 @@ static int tp_prefill_agree(int v, int (*op)(int, int)) {
         return v;
     const int r = (dev == g_tp_prefill_dev[0]) ? 0 : 1;
     g_tp_agree_in[r].store(v, std::memory_order_release);
+    g_tp_agree_file[r] = file;
+    g_tp_agree_line[r].store(line, std::memory_order_release);
     if (r != 0) {
         tp_peer_rendezvous("prefill agree");
         return g_tp_agree_out.load(std::memory_order_acquire);
     }
     int out = v;
     tp_leader_rendezvous("prefill agree", [&] {
+        const int peer_line = g_tp_agree_line[1].load(std::memory_order_acquire);
+        const char* peer_file = g_tp_agree_file[1];
+        if (peer_line != line || !peer_file || strcmp(peer_file, file) != 0) {
+            fprintf(stderr, "[tp] agreement out of step: rank 0 at %s:%d, rank 1 at %s:%d\n",
+                    file, line, peer_file ? peer_file : "?", peer_line);
+            note_tp_fatal("tp agreement out of step");
+        }
         out = op(v, g_tp_agree_in[1].load(std::memory_order_acquire));
         g_tp_agree_out.store(out, std::memory_order_release);
     });
     return out;
 }
-int tp_prefill_agree_min(int v) {
-    return tp_prefill_agree(v, [](int a, int b) { return std::min(a, b); });
+int tp_prefill_agree_min(int v, int line, const char* file) {
+    return tp_prefill_agree(v, [](int a, int b) { return std::min(a, b); }, line, file);
 }
-int tp_prefill_agree_and(int v) {
-    return tp_prefill_agree(v, [](int a, int b) { return a & b; });
+int tp_prefill_agree_and(int v, int line, const char* file) {
+    return tp_prefill_agree(v, [](int a, int b) { return a & b; }, line, file);
 }
 
 // (dual-GPU) Row-wise argmax over the vocab-split head without moving the logits: each rank brings
@@ -6368,12 +6383,18 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     // the operand is the one with MORE headroom at the moment of the decision -- the KV cache and
     // the arena are both taken afterwards. The prompt length is the signal that actually
     // separates them.
+    //
+    // Not at tp=2: there each card holds half the head (0.41 GB), the prefill falls back to smaller
+    // windows rather than to the token loop, and without the operand every verify and draft reads
+    // the q4k head instead (measured with DFlash2 at 20k: 31.3 -> 28.7 ms a step kept, the 20k
+    // prefill unchanged at 5.9 s). An explicit SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS still applies.
+    static const char* kHeadFp4YieldEnv = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
     static const int kHeadFp4YieldTokens = [] {
-        const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
-        const int v = e ? atoi(e) : 1024;
+        const int v = kHeadFp4YieldEnv ? atoi(kHeadFp4YieldEnv) : 1024;
         return v < 1 ? 1 : v;
     }();
-    if (n >= kHeadFp4YieldTokens && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+    const bool head_yield = kHeadFp4YieldEnv || !s.tp_link;
+    if (head_yield && n >= kHeadFp4YieldTokens && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
         fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for a %d-token batched "
                         "prefill (the scratch arena needs the VRAM more)\n", n);
         release_lm_head_fp4();
@@ -9129,7 +9150,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     std::vector<G> gs;
     bool group_ok = true;
     long steps = 0, seg_steps = 0;
-    double accept_sum = 0, t_draft = 0, t_verify = 0;
+    double accept_sum = 0, t_draft = 0, t_verify = 0, t_mask = 0, t_step_all = 0;
     auto ms_since = [](std::chrono::steady_clock::time_point t0) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
@@ -9550,6 +9571,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             keep.assign(S, 1); caps.assign(S, nullptr);
             row_mask.assign(n, nullptr);
             bool masks_ok = true, any_mask = false;
+            const auto _tm = std::chrono::steady_clock::now();
             for (int j = 0; j < S && masks_ok; j++) {
                 G& g = *act[j];
                 if (!g.job->constraint) continue;
@@ -9558,6 +9580,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                 for (int t = 0; t < T && masks_ok; t++)
                     row_mask[t * S + j] = g.masks.data() + (size_t)t * mask_words;
             }
+            if (kTiming) t_mask += ms_since(_tm);
             if (!masks_ok) { fprintf(stderr, "[spec-group] constraint refused a verified token\n"); break; }
             for (int j = 0; j < S; j++) {
                 caps[j] = act[j]->cap;
@@ -9644,6 +9667,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                 hooks.on_done(g.job);
             }
         }
+        if (kTiming) t_step_all += ms_since(t_step);
         if (kMinGain > 0) {
             // Ordinary decode packs the sessions into one step, sampled ones included (their
             // top_k is 1..64 here); SPARKINFER_PACKED_SAMPLING=0 runs each sampled one alone.
@@ -9699,8 +9723,9 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     spec_group_release();
     if (kTiming && steps > 0)
         fprintf(stderr, "[spec-group] steps=%ld sessions/step=%.2f mean_accept=%.3f | draft %.2f "
-                        "ms/step | verify %.2f ms/step\n", steps, (double)seg_steps / steps,
-                accept_sum / seg_steps, t_draft / steps, t_verify / steps);
+                        "ms/step | verify %.2f ms/step | masks %.2f | step %.2f\n", steps,
+                (double)seg_steps / steps, accept_sum / seg_steps, t_draft / steps,
+                t_verify / steps, t_mask / steps, t_step_all / steps);
     if (kTiming && kNgram && steps > 0)
         fprintf(stderr, "[spec-group] lookup: %ld of %ld session-steps matched; %ld deep steps "
                         "committed %.2f tokens each\n", ng_steps, seg_steps,

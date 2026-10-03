@@ -1,6 +1,9 @@
 #include "chat_tokenizer.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -283,6 +286,58 @@ bool test_gpt2_bytelevel_decode_printable_ascii_roundtrip() {
     return true;
 }
 
+// decode_delta decodes a window of the last tokens. Streamed through it, a text must come back
+// delta for delta as the whole-output decode gives it, and concatenated exactly as decode() of
+// all its tokens (no U+FFFD for characters split over tokens) (needs a tokenizer.json:
+// SPARKINFER_TEST_TOKENIZER=<path>; skipped without one).
+bool test_decode_delta_window_matches_full() {
+    const char* path = std::getenv("SPARKINFER_TEST_TOKENIZER");
+    if (!path) { std::printf("decode_delta window: skipped (no SPARKINFER_TEST_TOKENIZER)\n"); return true; }
+    sparkinfer_server::ChatTokenizer tok;
+    std::string err;
+    CHECK(tok.load(path, err));
+    const std::string texts[] = {
+        "Plain ASCII, with  double  spaces,\ttabs and\nnewlines.\n\n```cpp\nint main() { return 0; }\n```",
+        "Gr\xc3\xbc\xc3\x9f Gott \xe2\x80\x94 \xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x8c\xe4\xb8\x96\xe7\x95\x8c\xef\xbc\x81 "
+        "\xf0\x9f\x98\x80\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd \xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa7 "
+        "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87 "
+        "\xeb\x8c\x80\xed\x95\x9c\xeb\xaf\xbc\xea\xb5\xad \xe2\x88\x91\xe2\x88\xab\xe2\x88\x9a",
+        "<think>\nreasoning\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/a/b\n</parameter>\n</function>\n</tool_call>",
+    };
+    for (const std::string& base : texts) {
+        std::string text;
+        for (int r = 0; r < 6; r++) text += base;   // longer than the window many times over
+        const std::vector<int> ids = tok.encode_raw(text);
+        CHECK(ids.size() > 64);
+        std::vector<int> acc, all;
+        std::string streamed;
+        for (int id : ids) {
+            const std::string got = tok.decode_delta(acc, id);
+            // The whole-output form decode_delta replaced (with the same hold-back of an
+            // incomplete trailing character).
+            all.push_back(id);
+            auto strip = [](std::string t) {
+                while (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) t.resize(t.size() - 3);
+                return t;
+            };
+            const std::string full = strip(tok.decode(all));
+            std::string want = full;
+            if (all.size() > 1) {
+                const std::string prev = strip(tok.decode(std::vector<int>(all.begin(), all.end() - 1)));
+                size_t i = 0;
+                const size_t n = std::min(full.size(), prev.size());
+                while (i < n && full[i] == prev[i]) ++i;
+                while (i > 0 && i < full.size() && (static_cast<unsigned char>(full[i]) & 0xC0) == 0x80) --i;
+                want = full.substr(i);
+            }
+            CHECK(got == want);
+            streamed += got;
+        }
+        CHECK(streamed == tok.decode(ids));
+    }
+    return true;
+}
+
 int main() {
     if (!test_thinking_prompt_and_nonstream_parser()) return 1;
     if (!test_thinking_stream_boundaries()) return 1;
@@ -302,6 +357,7 @@ int main() {
     if (!test_gpt2_bytelevel_decode_invalid_utf8_shows_replacement()) return 1;
     if (!test_gpt2_bytelevel_decode_empty_piece()) return 1;
     if (!test_gpt2_bytelevel_decode_printable_ascii_roundtrip()) return 1;
+    if (!test_decode_delta_window_matches_full()) return 1;
     std::printf("chat_tokenizer_test: OK\n");
     return 0;
 }

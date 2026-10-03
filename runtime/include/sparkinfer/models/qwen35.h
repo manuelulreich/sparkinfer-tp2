@@ -955,10 +955,11 @@ bool tp_prefill_ar_side_prepare();
 void tp_prefill_allreduce_wait(int ticket);
 void tp_prefill_allreduce_join();
 // (dual-GPU) Both ranks of a mirrored pass pass their own value at the same point; both get the
-// minimum (tp=1: v). For rank-local, memory-driven choices that must not diverge.
-int tp_prefill_agree_min(int v);
+// minimum (tp=1: v). For rank-local, memory-driven choices that must not diverge. line/file
+// default to the call site; the leader checks both ranks are at the same one.
+int tp_prefill_agree_min(int v, int line = __builtin_LINE(), const char* file = __builtin_FILE());
 // Bitwise-AND twin: each bit is an arm a rank can run; both get the set BOTH can run (tp=1: v).
-int tp_prefill_agree_and(int v);
+int tp_prefill_agree_and(int v, int line = __builtin_LINE(), const char* file = __builtin_FILE());
 // Row-wise argmax over the vocab-split head: each rank passes its half's best value and local
 // index per row (n <= 64); both get the global vocab index (ties to rank 0, the lower half).
 void tp_exchange_argmax(const float* val, const int* idx, int n, int rows_per_rank, int* out);

@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cooperative_groups.h>
 #include <curand_kernel.h>
 #include <climits>
 #include <cmath>
@@ -2618,6 +2619,251 @@ __global__ void __launch_bounds__(kTkThreads) k_rows_topk(const float* __restric
     }
 }
 
+// k_rows_topk_c: one cluster of kTcBlocks blocks per row (sm_90+; launched with the cluster
+// attribute, see launch_rows_topk). 158 -> 12.5 us for 8 rows of 124160 (the tp head half). Each block finds the exact top
+// k of its slice of the row -- a lower bound tau from its threads' best four (radix select), then
+// one pass collecting everything above / at tau, then a small sort -- and block 0 merges the
+// slices' lists through distributed shared memory. Same result as k_rows_topk: the k best by
+// value, ties to the lower index.
+constexpr int kTcBlocks = 8;
+constexpr int kTcThreads = 512;
+constexpr int kTcSlots = kTcThreads * kTkLocal;   // 2048
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+__device__ void tc_sort(float* v, int* ix, int P) {
+    for (int size = 2; size <= P; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = threadIdx.x; i < P; i += kTcThreads) {
+                const int j = i ^ stride;
+                if (j <= i) continue;
+                const bool best_first = (i & size) == 0;
+                const bool swap = best_first ? tk_better(v[j], ix[j], v[i], ix[i])
+                                             : tk_better(v[i], ix[i], v[j], ix[j]);
+                if (swap) {
+                    const float tv = v[i]; v[i] = v[j]; v[j] = tv;
+                    const int ti = ix[i]; ix[i] = ix[j]; ix[j] = ti;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+__device__ __forceinline__ unsigned tk_key(float f) {
+    const unsigned u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float tk_unkey(unsigned k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+#endif
+__global__ void __launch_bounds__(kTcThreads)
+k_rows_topk_c(const float* __restrict__ x, int V, int k, float* __restrict__ out_v,
+              int* __restrict__ out_i) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    __shared__ float sv[kTcSlots];
+    __shared__ int si[kTcSlots];
+    __shared__ unsigned s_hist[256];
+    __shared__ unsigned s_prefix, s_need;
+    __shared__ int s_cnt, s_tie;
+    const int part = (int)cluster.block_rank();
+    const int row = blockIdx.x / kTcBlocks;
+    const int seg = (V + kTcBlocks - 1) / kTcBlocks;
+    const int v0 = part * seg, v1 = min(V, v0 + seg);
+    const float* L = x + (size_t)row * V;
+    float lv[kTkLocal];
+    int li[kTkLocal];
+#pragma unroll
+    for (int j = 0; j < kTkLocal; j++) { lv[j] = -INFINITY; li[j] = INT_MAX; }
+    // Static indices only (a dynamically indexed lv/li would live in local memory), and four
+    // loads in flight a thread.
+    auto keep = [&](float a, int v) {
+        if (a != a) a = -INFINITY;
+        if (!tk_better(a, v, lv[kTkLocal - 1], li[kTkLocal - 1])) return;
+        lv[kTkLocal - 1] = a;
+        li[kTkLocal - 1] = v;
+#pragma unroll
+        for (int j = kTkLocal - 1; j > 0; j--) {
+            if (tk_better(lv[j], li[j], lv[j - 1], li[j - 1])) {
+                const float tv = lv[j]; lv[j] = lv[j - 1]; lv[j - 1] = tv;
+                const int ti = li[j]; li[j] = li[j - 1]; li[j - 1] = ti;
+            }
+        }
+    };
+    int v = v0 + threadIdx.x;
+    for (; v + 3 * kTcThreads < v1; v += 4 * kTcThreads) {
+        const float a0 = L[v], a1 = L[v + kTcThreads], a2 = L[v + 2 * kTcThreads],
+                    a3 = L[v + 3 * kTcThreads];
+        keep(a0, v);
+        keep(a1, v + kTcThreads);
+        keep(a2, v + 2 * kTcThreads);
+        keep(a3, v + 3 * kTcThreads);
+    }
+    for (; v < v1; v += kTcThreads) keep(L[v], v);
+    // tau = the k-th largest of the kept values (a lower bound on the slice's k-th): radix
+    // select, 8 bits a round; warp 0 finds each round's bin with a scan over the 256 bins.
+    unsigned key[kTkLocal];
+#pragma unroll
+    for (int j = 0; j < kTkLocal; j++) key[j] = tk_key(lv[j]);
+    if (threadIdx.x == 0) { s_prefix = 0u; s_need = (unsigned)k; s_cnt = 0; s_tie = 0; }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (threadIdx.x < 256) s_hist[threadIdx.x] = 0u;
+        __syncthreads();
+        const unsigned pre = s_prefix;
+        const unsigned hmask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+#pragma unroll
+        for (int j = 0; j < kTkLocal; j++)
+            if ((key[j] & hmask) == pre) atomicAdd(&s_hist[(key[j] >> shift) & 255u], 1u);
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            // Lane l owns bins 8*(31-l)+7 down to 8*(31-l); the inclusive scan over lanes counts
+            // everything at or above a lane's bins.
+            const int l = threadIdx.x;
+            unsigned c[8], tot = 0;
+#pragma unroll
+            for (int j = 0; j < 8; j++) { c[j] = s_hist[8 * (31 - l) + 7 - j]; tot += c[j]; }
+            unsigned incl = tot;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned t = __shfl_up_sync(0xffffffffu, incl, o);
+                if (l >= o) incl += t;
+            }
+            const unsigned above = incl - tot, need = s_need;
+            if (above < need && incl >= need) {
+                unsigned acc = above;
+                int j = 0;
+                for (; j < 7; j++) { if (acc + c[j] >= need) break; acc += c[j]; }
+                s_prefix = pre | ((unsigned)(8 * (31 - l) + 7 - j) << shift);
+                s_need = need - acc;
+            }
+        }
+        __syncthreads();
+    }
+    const float tau = tk_unkey(s_prefix);
+    // Above tau: at most k - 1 kept values plus the slice values of threads that kept all four
+    // above tau (at most k / 4 threads, ceil(seg / kTcThreads) each) -- within the first half,
+    // which launch_rows_topk checks before it picks this kernel. Ties at tau (a masked
+    // row's ~all values at -1e9) fill the second half; no value above tau is lost to them.
+    constexpr int kHalf = kTcSlots / 2;
+    auto collect = [&](float a, int v) {
+        if (a != a) a = -INFINITY;
+        if (a > tau) {
+            const int slot = atomicAdd(&s_cnt, 1);
+            if (slot < kHalf) { sv[slot] = a; si[slot] = v; }
+        } else if (a == tau && tau != -INFINITY) {
+            const int slot = atomicAdd(&s_tie, 1);
+            if (slot < kHalf) { sv[kHalf + slot] = a; si[kHalf + slot] = v; }
+        }
+    };
+    v = v0 + threadIdx.x;
+    for (; v + 3 * kTcThreads < v1; v += 4 * kTcThreads) {
+        const float a0 = L[v], a1 = L[v + kTcThreads], a2 = L[v + 2 * kTcThreads],
+                    a3 = L[v + 3 * kTcThreads];
+        collect(a0, v);
+        collect(a1, v + kTcThreads);
+        collect(a2, v + 2 * kTcThreads);
+        collect(a3, v + 3 * kTcThreads);
+    }
+    for (; v < v1; v += kTcThreads) collect(L[v], v);
+    __syncthreads();
+    const int na = min(s_cnt, kHalf), nt = min(s_tie, kHalf);
+    {
+        float tv[kHalf / kTcThreads];
+        int ti[kHalf / kTcThreads];
+#pragma unroll
+        for (int j = 0; j < kHalf / kTcThreads; j++) {
+            const int i = threadIdx.x + j * kTcThreads;
+            if (i < nt) { tv[j] = sv[kHalf + i]; ti[j] = si[kHalf + i]; }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < kHalf / kTcThreads; j++) {
+            const int i = threadIdx.x + j * kTcThreads;
+            if (i < nt) { sv[na + i] = tv[j]; si[na + i] = ti[j]; }
+        }
+    }
+    const int n = na + nt;
+    __syncthreads();
+    if (n <= kTcThreads) {
+        // Few candidates: each one's place is the number of better ones (indices are distinct,
+        // so the order is total); the slice's k best land in sv[0..k).
+        float a = -INFINITY;
+        int ai = INT_MAX, rank = INT_MAX;
+        if (threadIdx.x < n) {
+            a = sv[threadIdx.x];
+            ai = si[threadIdx.x];
+            rank = 0;
+            for (int i = 0; i < n; i++) rank += tk_better(sv[i], si[i], a, ai);
+        }
+        __syncthreads();
+        if (threadIdx.x < kRowsTopkMax) { sv[threadIdx.x] = -INFINITY; si[threadIdx.x] = INT_MAX; }
+        __syncthreads();
+        if (rank < kRowsTopkMax) { sv[rank] = a; si[rank] = ai; }
+        __syncthreads();
+    } else {
+        int P = 64;
+        while (P < n) P <<= 1;
+        for (int i = n + threadIdx.x; i < P; i += kTcThreads) { sv[i] = -INFINITY; si[i] = INT_MAX; }
+        __syncthreads();
+    tc_sort(sv, si, P);
+    }
+    // The slice's k best are sv[0..k). Block 0 gathers all slices' lists and sorts them.
+    cluster.sync();
+    float mv[kTcBlocks * kRowsTopkMax / kTcThreads];
+    int mi[kTcBlocks * kRowsTopkMax / kTcThreads];
+    if (part == 0) {
+#pragma unroll
+        for (int j = 0; j < kTcBlocks * kRowsTopkMax / kTcThreads; j++) {
+            const int i = threadIdx.x + j * kTcThreads;
+            const int b = i / kRowsTopkMax, r = i % kRowsTopkMax;
+            const float* rv = cluster.map_shared_rank(sv, b);
+            const int* ri = cluster.map_shared_rank(si, b);
+            mv[j] = r < k ? rv[r] : -INFINITY;
+            mi[j] = r < k ? ri[r] : INT_MAX;
+        }
+    }
+    cluster.sync();   // the other blocks' shared memory stays alive until block 0 has read it
+    if (part != 0) return;
+    // Each list is sorted, so a candidate's place in the row is its place in its own list plus
+    // the number of better entries in each other list (a binary search apiece).
+#pragma unroll
+    for (int j = 0; j < kTcBlocks * kRowsTopkMax / kTcThreads; j++) {
+        const int i = threadIdx.x + j * kTcThreads;
+        sv[i] = mv[j];
+        si[i] = mi[j];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < kTcBlocks * kRowsTopkMax / kTcThreads; j++) {
+        const int i = threadIdx.x + j * kTcThreads;
+        const int b = i / kRowsTopkMax, r = i % kRowsTopkMax;
+        if (r >= k) continue;
+        const float a = sv[i];
+        const int ai = si[i];
+        int rank = r;
+        for (int o = 0; o < kTcBlocks; o++) {
+            if (o == b) continue;
+            const float* ov = sv + o * kRowsTopkMax;
+            const int* oi = si + o * kRowsTopkMax;
+            int lo = 0, hi = k;   // first entry of list o not better than (a, ai)
+            while (lo < hi) {
+                const int mid = (lo + hi) >> 1;
+                if (tk_better(ov[mid], oi[mid], a, ai)) lo = mid + 1; else hi = mid;
+            }
+            rank += lo;
+        }
+        if (rank < k) {
+            out_v[(size_t)row * kRowsTopkMax + rank] = a;
+            out_i[(size_t)row * kRowsTopkMax + rank] = ai;
+        }
+    }
+    for (int j = k + threadIdx.x; j < kRowsTopkMax; j += kTcThreads) {
+        out_v[(size_t)row * kRowsTopkMax + j] = -INFINITY;
+        out_i[(size_t)row * kRowsTopkMax + j] = INT_MAX;
+    }
+#endif
+}
+
 // One thread per row: m candidates are few, and the top_p prefix sum is taken in order.
 __global__ void k_rows_sample_candidates(const float* __restrict__ cv, const int* __restrict__ ci,
                                          int n_rows, int m, const float* __restrict__ temp,
@@ -2662,6 +2908,31 @@ void launch_rows_topk(const float* x, int n_rows, int V, int k, float* out_v, in
     if (n_rows <= 0 || V <= 0) return;
     k = k < 1 ? 1 : (k > kRowsTopkMax ? kRowsTopkMax : k);
     if (k > V) k = V;
+    static const bool cluster_ok = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 9;
+    }();
+    // The cluster form spreads a row over kTcBlocks SMs; one block a row reads half a megabyte
+    // through a single SM. Its slices must each hold k values and fit the first half of the slots.
+    const int seg = (V + kTcBlocks - 1) / kTcBlocks;
+    if (cluster_ok && seg >= k &&
+        (k / 4) * ((seg + kTcThreads - 1) / kTcThreads) + k <= kTcSlots / 2) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(n_rows * kTcBlocks);
+        cfg.blockDim = dim3(kTcThreads);
+        cfg.stream = stream;
+        cudaLaunchAttribute at[1];
+        at[0].id = cudaLaunchAttributeClusterDimension;
+        at[0].val.clusterDim.x = kTcBlocks;
+        at[0].val.clusterDim.y = 1;
+        at[0].val.clusterDim.z = 1;
+        cfg.attrs = at;
+        cfg.numAttrs = 1;
+        if (cudaLaunchKernelEx(&cfg, k_rows_topk_c, x, V, k, out_v, out_i) == cudaSuccess) return;
+        cudaGetLastError();
+    }
     k_rows_topk<<<n_rows, kTkThreads, 0, stream>>>(x, V, k, out_v, out_i);
 }
 

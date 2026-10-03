@@ -773,9 +773,27 @@ std::string ChatTokenizer::decode(const std::vector<int>& ids) const {
 std::string ChatTokenizer::decode_delta(std::vector<int>& acc, int new_id) const {
     std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     acc.push_back(new_id);
-    const std::string full = decode(acc);
+    // Only the tail is decoded: the new token's text depends on the few tokens before it (a
+    // character split over several byte tokens), never on the whole output. Decoding all of acc
+    // twice a token made streaming quadratic -- ~0.2 ms a token by 2k tokens of output, on the
+    // engine thread between decode steps. Both decodes start at the same token, so whatever the
+    // window's first bytes decode to is a common prefix and drops out of the delta below.
+    // Muse Glimmer's decode() maps its marker tokens one by one, which a window leaves alone too.
+    constexpr size_t kWindow = 16;
+    const size_t w0 = acc.size() > kWindow ? acc.size() - kWindow : 0;
+    const std::vector<int> win(acc.begin() + w0, acc.end());
+    // A character split over byte tokens decodes to U+FFFD until its last byte arrives. Emitting
+    // that made the stream carry a stray U+FFFD before every such character (emoji, most CJK):
+    // both texts are compared without their trailing U+FFFDs, so the incomplete character goes
+    // out once it is complete, and everything before it goes out as usual.
+    static const std::string kReplacement = "\xEF\xBF\xBD";
+    auto strip_incomplete = [&](std::string t) {
+        while (t.size() >= 3 && t.compare(t.size() - 3, 3, kReplacement) == 0) t.resize(t.size() - 3);
+        return t;
+    };
+    const std::string full = strip_incomplete(decode(win));
     if (acc.size() == 1) return full;
-    const std::string prev = decode(std::vector<int>(acc.begin(), acc.end() - 1));
+    const std::string prev = strip_incomplete(decode(std::vector<int>(win.begin(), win.end() - 1)));
     // HF-style Decode is not always prefix-stable: incomplete UTF-8 / BPE merges can
     // rewrite the tail (often via U+FFFD). Returning `full` on mismatch re-sends the
     // entire so-far string into the SSE stream. Emit only the bytes after the longest

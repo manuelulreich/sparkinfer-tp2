@@ -35,6 +35,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **Streaming was quadratic in the output length, and split characters streamed a U+FFFD.**
+  Every streamed token decoded the whole output twice (`ChatTokenizer::decode_delta`) on the
+  engine thread, between decode steps: ~0.7 ms a step by 1.5k tokens of output and growing
+  (a 10k-token thinking turn paid several ms a step). It now decodes the last 16 tokens, which
+  yields the same deltas. A character split over byte tokens (emoji, most CJK) decoded to U+FFFD
+  until its last byte arrived, and that U+FFFD was streamed before the character; it is now held
+  back until the character is complete, so the stream concatenates to exactly the output text.
+- **tp=2 rank agreements name their call site.** Agreements between the cards pair by arrival
+  order, so a rank that skips one pairs every later agreement and link op with the wrong
+  partner (seen once: a prefill FFN chunk "agreed" to 1, then a GpuLink op on a null buffer).
+  The leader now checks both ranks are at the same call site and reports both if not.
+
 - **Sampled verify rows could drop their best candidates** (`k_rows_topk`). The kernel keeps
   every value at or above a lower bound of the k-th best in 4096 slots; when most of a row ties
   at that bound (a constrained row: ~124k logits at the same -1e9) the real candidates raced
@@ -183,6 +195,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   one card and two. Truncation is now ignored for packing at temperature 0.
 
 ### Performance
+
+- **tp=2 decode with DFlash2: 100 -> 114-117 tok/s at 20k context (sampled, tools on).**
+  - The verify and draft heads stay NVFP4: the 0.41 GB-a-card NVFP4 head copy was released on
+    the first prefill of 1024+ tokens (a 32-GB single-card trade), after which every verify and
+    every draft ran the q4k head (2.1 + 1.6 ms a step). At tp=2 it is now kept (prefill falls back
+    to smaller windows instead; the 20k prefill is unchanged at 5.9 s).
+    `SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS` set explicitly still releases it.
+  - The rows top-k (sampled verify rows, DFlash2 candidates) runs one 8-block cluster a row
+    instead of one block, with a radix-selected bound and rank-counting merges: 158 -> 12.5 us
+    for 8 rows of 124k, same result.
+  - The streaming fix above (~1 ms a step at 1.5k tokens of output).
+  - Step at 20k: draft 4.6 -> 3.3 ms, verify 26.7 -> 25.1 ms, host overhead ~1 ms -> 0.2 ms.
+    `SPARKINFER_DSPARK_TIMING` now also reports the constraint masks and the whole step.
 
 - **DSpark draft runs its NVFP4 weights as stored.** The checkpoint's NVFP4 projections
   (o/gate/up/down) were dequantized to bf16 at load and requantized to an asymmetric int4, and fc

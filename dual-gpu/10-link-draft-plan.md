@@ -1,6 +1,6 @@
 # 10. nvfp4 + DFlash2: the decode step, the link, the drafter
 
-Written 2026-10-03. Plan only; nothing here is implemented yet.
+Written 2026-10-03. Status blocks below record what is done.
 
 Configuration: `startup.sh` (nvfp4 KV, DFlash2, `--ctx 131072`, int8 prefill wire), one opencode
 session. Every lossless item keeps the speculative output equal to ordinary decode (checked as in
@@ -47,6 +47,25 @@ One nsys run of the 60k replay (`cap_si/req_007`, 256 tokens, sampled) and one a
 - draft: kernels vs host gaps around its 2 host syncs (`d2_head` candidate merge, proposals).
 
 Every estimate below is rescaled after P0, and items that turn out to be small are dropped.
+
+**P0 status: done (2026-10-03).** nsys, 20k context, sampled, 8 rows; per card per step:
+
+| | ms | |
+|---|---:|---|
+| weight GEMMs (CUTLASS NVFP4) | 15.6 | at the bandwidth floor |
+| all-reduce (141 calls, 19.6 us avg) | 2.8 | of which ~1/3 in the draft |
+| nvfp4 split attention | 2.3 | |
+| verify head `si_mmvq_q4k_rows_exact` | 2.1 | the NVFP4 head had been released |
+| draft head `si_mmvq_q4k_multirow` | 1.6 | same |
+| draft linears (dp4a GEMVs) | 1.6 | ~65 % of bandwidth |
+| GDN steps + conv | 1.5 | |
+| `k_rows_topk` (2 calls) | 0.34 | one block a row |
+| draft attention (5 calls) | 0.31 | |
+| host gaps | ~2.5 | streaming (`decode_delta`), syncs |
+
+Found and fixed first (not in the plan above): the NVFP4 head release, the top-k kernel, and
+quadratic streaming. Step at 20k 31.3 -> 28.7 ms, 100 -> 114-117 tok/s. The grammar masks cost
+0.17 ms a step; the host merge of the draft candidates 8 us (R1 is worth little).
 
 ## D. Decode all-reduce (lossless first)
 
