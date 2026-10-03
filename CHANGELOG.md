@@ -7,6 +7,26 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2: DSpark speculates on tool-calling requests.** A request with tools is decoded under
+  the tool grammar, and constrained requests never speculated -- so an agent (opencode sends
+  its tools with every request) got no speculation at all, reasoning and answers included.
+  The speculative group now takes them: before each verify the constraint walks the drafted
+  path (xgrammar rollback) and gives every row the mask for the tokens before it, applied to
+  that row's logits as the engine's constraint bias, so each row draws exactly the token
+  ordinary constrained decode would (int8 KV, deterministic mode: byte-identical to
+  `SPARKINFER_SPEC_GROUP_MAX=0` for greedy and sampled tool turns). An opencode turn
+  ("Explain this repo", nvfp4 KV, `--ctx 131072`): 82 -> 65.5 s; its tool steps decode at
+  74-100 tok/s instead of ~50. Streamed and non-streamed chat usage now also report
+  `completion_tokens_details.reasoning_tokens`, and streamed usage `speculative_tokens`.
+
+### Fixed
+
+- **Sampled verify rows could drop their best candidates** (`k_rows_topk`). The kernel keeps
+  every value at or above a lower bound of the k-th best in 4096 slots; when most of a row ties
+  at that bound (a constrained row: ~124k logits at the same -1e9) the real candidates raced
+  the ties for the slots and could lose -- a sampled tool turn then never drew `<|im_end|>` or
+  `</tool_call>` and ran to max_tokens. Values above the bound are now collected first.
+
 - **nvfp4 KV decode at memory bandwidth.** A new decode attention kernel for nvfp4
   (`fa_split_gqa_mma_nvfp4_kernel`): e2m1 widened straight to f16 (magnitude bits into the f16
   exponent field, one HMUL2 by the block scale -- exact) instead of e2m1 -> e4m3 -> f16, the

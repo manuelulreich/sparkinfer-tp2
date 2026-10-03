@@ -589,10 +589,25 @@ bool write_stream_finish(GuardedSink& gs, const std::string& cid, long long crea
 // aggregate "usage" object) -- no choice_index needed. For n>1 this is emitted ONCE, after every
 // branch has joined, with prompt_tokens reported once (not xn) and completion_tokens summed
 // across choices -- see the n-fanout aggregation code below.
+// Generated tokens before the first </think>: the reasoning, as OpenAI's
+// completion_tokens_details.reasoning_tokens counts it. 0 with thinking off.
+int count_reasoning_tokens(const std::vector<int>& ids, bool thinking) {
+    if (!thinking) return 0;
+    static const int close = [] {
+        const std::vector<int> v = g_tokenizer.encode_raw("</think>");
+        return v.size() == 1 ? v[0] : -1;
+    }();
+    if (close < 0) return 0;
+    return (int)(std::find(ids.begin(), ids.end(), close) - ids.begin());
+}
+
+// reasoning_tokens >= 0 adds completion_tokens_details; speculative_tokens >= 0 adds the
+// (non-OpenAI) count of completion tokens DSpark produced.
 bool write_stream_usage(GuardedSink& gs, const std::string& cid, long long created,
                         int prompt_tokens, int completion_tokens, double ttft_ms,
                         double generation_ms, double decode_tps,
-                        const char* object = "chat.completion.chunk", int cached_tokens = -1) {
+                        const char* object = "chat.completion.chunk", int cached_tokens = -1,
+                        int reasoning_tokens = -1, int speculative_tokens = -1) {
     auto chunk = stream_chunk_base(cid, created, object);
     chunk["choices"] = nlohmann::json::array();
     nlohmann::json usage = {{"prompt_tokens", prompt_tokens},
@@ -603,6 +618,8 @@ bool write_stream_usage(GuardedSink& gs, const std::string& cid, long long creat
     if (decode_tps >= 0.0) usage["decode_tps"] = decode_tps;
     // OpenAI's own field for prompt-cache hits; -1 (text completions) leaves it out.
     if (cached_tokens >= 0) usage["prompt_tokens_details"] = {{"cached_tokens", cached_tokens}};
+    if (reasoning_tokens >= 0) usage["completion_tokens_details"] = {{"reasoning_tokens", reasoning_tokens}};
+    if (speculative_tokens >= 0) usage["speculative_tokens"] = speculative_tokens;
     chunk["usage"] = std::move(usage);
     return write_sse_json(gs, chunk);
 }
@@ -1915,6 +1932,7 @@ int main(int argc, char** argv) {
                                  std::string fail_message;
                                  long long prompt_tokens = 0, completion_tokens = 0;
                                  int cached_tokens = 0;   // prompt tokens served from the prefix cache
+                                 int reasoning_tokens = 0, speculative_tokens = 0;
                                  double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                                  // Only populated on the json_mode_active/tool_protocol sub-paths
                                  // -- used to replay an already-buffered result to a deduped index
@@ -2169,6 +2187,8 @@ int main(int argc, char** argv) {
                                      {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
                                  out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
+                                 out->reasoning_tokens = count_reasoning_tokens(stream_ids, enable_thinking);
+                                 out->speculative_tokens = outcome.speculative_tokens;
                                  if (outcome.cancelled && !stopped_by_sequence) {
                                      out->fail = BranchOutcome::Fail::cancelled;
                                      return;
@@ -2407,6 +2427,11 @@ int main(int argc, char** argv) {
                                  return true;
                              }
 
+                             int agg_reasoning = 0, agg_speculative = 0;
+                             for (const auto& r : results) {
+                                 agg_reasoning += r.reasoning_tokens;
+                                 agg_speculative += r.speculative_tokens;
+                             }
                              g_requests_ok++;
                              double ttft_min = -1.0, gen_max = -1.0;
                              for (const auto& r : results) {
@@ -2425,7 +2450,8 @@ int main(int argc, char** argv) {
                                  // sums real per-branch prefill cost; see plan for why.
                                  write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
                                                     (int)agg_completion, ttft_min, gen_max, decode_tps_agg,
-                                                    "chat.completion.chunk", (int)results[0].cached_tokens);
+                                                    "chat.completion.chunk", (int)results[0].cached_tokens,
+                                                    agg_reasoning, agg_speculative);
                              heartbeat.stop();
                              write_stream_done(gs);
                              sink.done();
@@ -2456,7 +2482,7 @@ int main(int argc, char** argv) {
                      nlohmann::json logprobs_json = nullptr;
                      long long prompt_tokens = 0, completion_tokens = 0;
                                  int cached_tokens = 0;   // prompt tokens served from the prefix cache
-                     int speculative_tokens = 0;
+                     int speculative_tokens = 0, reasoning_tokens = 0;
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
@@ -2646,6 +2672,7 @@ int main(int argc, char** argv) {
                          out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                          out.speculative_tokens = outcome.speculative_tokens;
                          out.completion_tokens = (long long)outcome.tokens.size();
+                         out.reasoning_tokens = count_reasoning_tokens(outcome.tokens, enable_thinking);
                          if (stopped_by_sequence) {
                              size_t pos;
                              if (find_stop_match(text, controls.stop, pos)) text.resize(pos);
@@ -2844,8 +2871,13 @@ int main(int argc, char** argv) {
                  usage["prompt_tokens_details"] = {{"cached_tokens", (int)results[0].cached_tokens}};
                  // Not an OpenAI field: completion tokens DSpark produced (the rest decoded ordinarily).
                  int spec_agg = 0;
-                 for (const auto& r : results) spec_agg += r.speculative_tokens;
+                 int reasoning_agg = 0;
+                 for (const auto& r : results) {
+                     spec_agg += r.speculative_tokens;
+                     reasoning_agg += r.reasoning_tokens;
+                 }
                  usage["speculative_tokens"] = spec_agg;
+                 usage["completion_tokens_details"] = {{"reasoning_tokens", reasoning_agg}};
 
                  nlohmann::json choices = nlohmann::json::array();
                  for (int i = 0; i < controls.n; i++) {

@@ -129,6 +129,32 @@ bool walk(GrammarEngine& engine, const std::string& tag, const Vocab& vocab, std
             ++g_failures;
             return false;
         }
+        // Speculative decoding walks a drafted path ahead and rolls it back: afterwards the mask
+        // must be exactly the one before.
+        if (rng() % 3 == 0) {
+            const std::vector<uint32_t> before = bits;
+            std::vector<uint32_t> ahead(bits.size());
+            int walked = 0;
+            for (int k = 0, depth = 1 + rng() % 7; k < depth; ++k) {
+                constraint->fill_next_mask(ahead.data(), vocab_size);
+                std::vector<int> ok;
+                for (int id = 0; id < vocab_size; ++id)
+                    if (((ahead[id / 32] >> (id % 32)) & 1) && id != vocab.stop) ok.push_back(id);
+                if (ok.empty() || !constraint->accept(ok[rng() % ok.size()])) break;
+                ++walked;
+            }
+            if (!constraint->can_rollback() || !constraint->rollback(walked)) {
+                std::fprintf(stderr, "rollback(%d) failed\n", walked);
+                ++g_failures;
+                return false;
+            }
+            constraint->fill_next_mask(ahead.data(), vocab_size);
+            if (ahead != before) {
+                std::fprintf(stderr, "mask after rollback(%d) differs from the mask before\n", walked);
+                ++g_failures;
+                return false;
+            }
+        }
         const bool can_stop = (bits[vocab.stop / 32] >> (vocab.stop % 32)) & 1;
         int pick;
         if (can_stop && (rng() % 4 == 0 || step > 600)) pick = vocab.stop;

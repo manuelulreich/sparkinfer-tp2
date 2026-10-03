@@ -9,6 +9,7 @@
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/models/qwen_config.h"
 #include "sparkinfer/moe/engine.h"
+#include "sparkinfer/token_constraint.h"
 
 namespace sparkinfer {
 
@@ -438,6 +439,11 @@ public:
         int top_k = 0;
         float top_p = 1.f;
         unsigned long long seed = 0;
+        // A constrained request (tool calls): each verify row draws under the constraint's mask
+        // for the drafted path up to it, as ordinary constrained decode would. The engine keeps
+        // the constraint at the emitted tokens (on_tokens); the group only walks ahead and rolls
+        // back. Null: unconstrained.
+        TokenConstraint* constraint = nullptr;
     };
     struct SpecGroupHooks {
         // Between steps, no lock held: append jobs to join; false stops the group.
@@ -461,9 +467,13 @@ public:
         float top_p = 1.f;
         unsigned long long seed = 0, step = 0;
     };
+    // row_mask (optional, per row): the allowed-token bitmask over the whole vocabulary (bit id % 32
+    // of word id / 32), or null for an unconstrained row. A masked-out token's logit gets the
+    // engine's constraint bias (-1e9) before the row draws.
     int spec_group_verify(const int* ids, int n, const int* row_pos, const uint64_t* row_seq,
                           int seg_n, void* const* seg_capture, int* out_argmax, int* seg_keep,
-                          const SpecSampleRow* row_sample = nullptr);
+                          const SpecSampleRow* row_sample = nullptr,
+                          const uint32_t* const* row_mask = nullptr);
     void spec_group_release();
 
     std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
@@ -910,7 +920,8 @@ private:
     int tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
                         const uint64_t* row_seq, void* capture_dst, int* out_argmax,
                         int seg_n = 0, void* const* seg_capture = nullptr, int* seg_keep = nullptr,
-                        const SpecSampleRow* row_sample = nullptr);
+                        const SpecSampleRow* row_sample = nullptr,
+                        const uint32_t* const* row_mask = nullptr);
     bool tp_verify_alloc();
     void reserve_tp_verify_local(bool* ok);
     // (dual-GPU) Rank-1 mirroring: the peer model to replay a state-changing public call on, or

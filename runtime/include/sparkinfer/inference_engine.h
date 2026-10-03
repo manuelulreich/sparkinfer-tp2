@@ -251,6 +251,8 @@ public:
     // model (Qwen35Model::set_dflash_draft). A greedy request with no constraint, penalties,
     // logit_bias, logprobs, images or prefix-cache hit decodes speculatively while it is the only
     // request; the moment another is submitted it continues as ordinary decode and joins the batch.
+    // At tp=2 the group path (run_speculative_group) also takes sampled requests, prefix-cache hits
+    // and constrained ones (tool calls; each verify row draws under the constraint's mask).
     // The tokens are the same either way -- speculation only changes how many target passes produce
     // them.
     void enable_speculative(bool on);

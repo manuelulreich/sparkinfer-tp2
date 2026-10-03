@@ -20,6 +20,12 @@ public:
     // mean the mask was not applied: the engine then fails the request rather than return output
     // that breaks the constraint.
     virtual bool accept(int token_id) = 0;
+
+    // Speculative decoding walks a drafted path through accept() to get each verify row's mask,
+    // then undoes it: rollback(n) forgets the last n accepted tokens. A constraint that cannot
+    // (can_rollback() false) keeps its requests off the speculative path.
+    virtual bool can_rollback() const { return false; }
+    virtual bool rollback(int n) { (void)n; return false; }
 };
 
 }  // namespace sparkinfer

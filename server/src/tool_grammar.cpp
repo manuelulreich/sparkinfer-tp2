@@ -108,7 +108,19 @@ public:
         if (token_id < 0 || token_id >= utf8_->vocab_size) return false;
         const uint8_t next = utf8_->next[(size_t)state_ * utf8_->vocab_size + token_id];
         if (next == kInvalid || !matcher_.AcceptToken(token_id)) return false;
+        history_.push_back(state_);
         state_ = next;
+        return true;
+    }
+
+    bool can_rollback() const override { return true; }
+
+    bool rollback(int n) override {
+        if (n < 0 || n > (int)history_.size()) return false;
+        if (n == 0) return true;
+        matcher_.Rollback(n);
+        state_ = history_[history_.size() - n];
+        history_.resize(history_.size() - n);
         return true;
     }
 
@@ -117,6 +129,7 @@ private:
     std::shared_ptr<const Utf8Tables> utf8_;
     std::vector<int32_t> scratch_;
     uint8_t state_ = kClean;
+    std::vector<uint8_t> history_;   // the UTF-8 state before each accepted token, for rollback()
 };
 
 // Replace every json_schema node with the narrowed EBNF of its schema.

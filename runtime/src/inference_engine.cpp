@@ -332,7 +332,8 @@ ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() cons
 
 bool ContinuousBatchEngine::spec_eligible(const Request& r) {
     // Speculation is lossless only for greedy argmax, and the verify path has none of the sampler
-    // extras. A constraint must stay on the per-token path where its mask is applied. Images need
+    // extras. A constraint (tool calls) speculates in the group path only, whose verify rows draw
+    // under its mask (SpecGroupJob::constraint), and only if it can roll a drafted path back. Images need
     // the vision splice ordinary prefill does. A prefix-cache hit (prefill_start > 0) speculates
     // in the group path only, which prefills the rest and starts the draft from the entry's
     // snapshot (dflash_generate cannot start past 0).
@@ -345,7 +346,7 @@ bool ContinuousBatchEngine::spec_eligible(const Request& r) {
     }();
     const bool sampling_ok = r.temperature <= 0.f ||
                              (kSpecSampling && r.top_k >= 1 && r.top_k <= 64);
-    return !r.constraint && sampling_ok && r.presence_penalty == 0.f &&
+    return (!r.constraint || r.constraint->can_rollback()) && sampling_ok && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
            r.forced_tokens.empty() && r.vision_pos.empty() && !r.use_prefix_session;
 }
@@ -360,6 +361,14 @@ bool ContinuousBatchEngine::spec_emit(Job& job, const int* tokens, int n) {
             job.t_first = t_emit;
             job.saw_first_tok = true;
             job.ttft_ms = std::chrono::duration<double, std::milli>(job.t_first - job.t_submit).count();
+        }
+        // The constraint follows the emitted tokens, as step_job advances it (an end token closes
+        // the output there and is not offered to it).
+        const Qwen35Config& cfg = model_->config();
+        const bool eos = tokens[i] == cfg.eos_id || (cfg.eos_id2 >= 0 && tokens[i] == cfg.eos_id2);
+        if (job.req.constraint && !eos && !job.req.constraint->accept(tokens[i])) {
+            job.error = "constrained decoding: emitted a token the constraint does not allow";
+            return false;
         }
         job.output.push_back(tokens[i]);
         job.decode_emitted++;
@@ -447,6 +456,7 @@ void ContinuousBatchEngine::run_speculative_group(const std::vector<Job*>& first
         m->gj.top_k = job->req.top_k;
         m->gj.top_p = job->req.top_p;
         m->gj.seed = job->req.seed;
+        m->gj.constraint = job->req.constraint.get();
         if (job->req.prefill_start > 0) {
             m->gj.start = job->req.prefill_start;
             m->gj.start_state = &job->hit_state;
@@ -795,7 +805,8 @@ void ContinuousBatchEngine::worker_loop() {
                     if (live == 1 && !(spec_group_single() && model_->spec_group_supported()) &&
                         !only->spec_tried && only->phase == SeqPhase::PREFILL &&
                         only->prefill_pos == 0 && only->req.prefill_start == 0 &&
-                        only->req.temperature <= 0.f && spec_eligible(only->req)) {
+                        only->req.temperature <= 0.f && !only->req.constraint &&
+                        spec_eligible(only->req)) {
                         spec_job = only;
                         // Raised under mu_, which submit_locked also holds: a request submitted from
                         // here on sees it and interrupts; one submitted before made live == 2.

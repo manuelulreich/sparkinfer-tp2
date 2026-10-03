@@ -1,6 +1,7 @@
 #pragma once
 // Internal CUDA helpers for DFlash draft attention / RoPE / SwiGLU.
 
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace sparkinfer {
@@ -54,6 +55,9 @@ void launch_rows_sample_candidates(const float* cand_v, const int* cand_i, int n
                                    const float* temp, const int* top_k, const float* top_p,
                                    const unsigned long long* seed, const unsigned long long* step,
                                    int* out, cudaStream_t stream);
+// Constrained rows: x[r][i] += -1e9 (the engine's constraint bias) for every i whose bit in
+// bits[r][i / 32] (V / 32 words a row, bit i % 32) is clear. V must be a multiple of 32.
+void launch_rows_mask_bits(float* x, int n_rows, int V, const uint32_t* bits, cudaStream_t stream);
 
 // In-place RoPE on [seq, n_heads, d] bf16. positions[i] = pos0 + i.
 void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0,

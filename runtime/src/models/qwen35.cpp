@@ -952,6 +952,11 @@ struct Qwen35Model::Impl {
     int *vr_tk_i = nullptr, *vr_mg_i = nullptr, *vr_smp_topk = nullptr, *vr_smp_out = nullptr;
     unsigned long long *vr_smp_seed = nullptr, *vr_smp_step = nullptr;
     char* h_vr_smp = nullptr;
+    // Constrained verify rows: this rank's half of each row's allowed-token bitmask, [R][Vr / 32]
+    // on the device and pinned staging for it; allocated on the first constrained verify.
+    uint32_t* vr_mask = nullptr;
+    uint32_t* h_vr_mask = nullptr;
+    int vr_mask_state = 0;          // 0 = untried, 1 = ready, -1 = declined (agreed across ranks)
     float* vr_snap_lin = nullptr;
     bf16* vr_snap_conv = nullptr;
     // (dual-GPU C1b) FP4 tensor-core staging for the multi-session rows path: one activation
@@ -3795,7 +3800,7 @@ int Qwen35Model::verify_rows_tp(const int* ids, int n, int start_pos, void* capt
 int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int* row_pos,
                                  const uint64_t* row_seq, void* capture_dst, int* out_argmax,
                                  int seg_n, void* const* seg_capture, int* seg_keep,
-                                 const SpecSampleRow* row_sample) {
+                                 const SpecSampleRow* row_sample, const uint32_t* const* row_mask) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     const bool multi = row_seq != nullptr;
     // (dual-GPU C2) Segmented: seg_n sessions each verify T = n / seg_n consecutive positions,
@@ -3884,6 +3889,22 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                     return -1;
             }
         if (any && !s.h_vr_smp) return -1;
+    }
+    // Constrained rows need their mask staging (both ranks agree, as for the FP4 rows below) and a
+    // vocab half that splits into whole mask words.
+    bool masked = false;
+    if (row_mask)
+        for (int r = 0; r < n; r++) masked |= row_mask[r] != nullptr;
+    if (masked) {
+        if (Vr % 32) return -1;
+        if (s.vr_mask_state == 0) {
+            const size_t bytes = (size_t)R * (Vr / 32) * sizeof(uint32_t);
+            bool ok = cudaMalloc(&s.vr_mask, bytes) == cudaSuccess &&
+                      cudaMallocHost(&s.h_vr_mask, bytes) == cudaSuccess;
+            ok = tp_prefill_agree_min(ok ? 1 : 0) != 0;
+            s.vr_mask_state = ok ? 1 : -1;
+        }
+        if (s.vr_mask_state < 0) return -1;
     }
 
     // (dual-GPU C1b) Multi-session rows on the FP4 tensor cores. The dp4a rows kernels re-read
@@ -4470,6 +4491,20 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                 kernels::launch_gemv_f32(x, s.w.lm_head, y, Vr, H, st);
             }
         }
+    }
+    // Constrained rows: this rank's half of each row's mask, applied as the engine's constraint
+    // bias, so every draw below (argmax, sampled top-k) is the one ordinary constrained decode makes.
+    if (masked) {
+        const int Wr = Vr / 32;
+        const size_t w0 = (size_t)s.tp_rank * Wr;
+        for (int r = 0; r < n; r++) {
+            uint32_t* dst = s.h_vr_mask + (size_t)r * Wr;
+            if (row_mask[r]) std::memcpy(dst, row_mask[r] + w0, (size_t)Wr * sizeof(uint32_t));
+            else std::memset(dst, 0xff, (size_t)Wr * sizeof(uint32_t));
+        }
+        cu(cudaMemcpyAsync(s.vr_mask, s.h_vr_mask, (size_t)n * Wr * sizeof(uint32_t),
+                           cudaMemcpyHostToDevice, st), "tp verify row masks");
+        dflash_kernels::launch_rows_mask_bits(s.vr_lh, n, Vr, s.vr_mask, st);
     }
     // Argmax per rank over its own vocab half, then exchange (value, index) per row on the host.
     // This used to zero-pad an [n][V] f32 row block, place the half, all-reduce all of it across
@@ -8915,14 +8950,15 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
 // into the twins of the leader's destinations. Returns n, or -1 when declined (nothing changed).
 int Qwen35Model::spec_group_verify(const int* ids, int n, const int* row_pos,
                                    const uint64_t* row_seq, int seg_n, void* const* seg_capture,
-                                   int* out_argmax, int* seg_keep, const SpecSampleRow* row_sample) {
+                                   int* out_argmax, int* seg_keep, const SpecSampleRow* row_sample,
+                                   const uint32_t* const* row_mask) {
     if (!tp_active() || seg_n < 1 || n < 1) return -1;
     std::vector<int> peer_out(n), peer_keep(seg_n);
     void* const* peer_capture = dflash_capture_split() ? seg_capture : nullptr;
     TP_MIRROR(spec_group_verify(ids, n, row_pos, row_seq, seg_n, peer_capture, peer_out.data(),
-                                peer_keep.data(), row_sample));
+                                peer_keep.data(), row_sample, row_mask));
     return tp_rows_forward(ids, n, 0, row_pos, row_seq, nullptr, out_argmax, seg_n, seg_capture,
-                           seg_keep, row_sample);
+                           seg_keep, row_sample, row_mask);
 }
 
 // Frees the per-segment GDN snapshots of the segmented verify (both ranks).
@@ -9086,6 +9122,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         std::vector<int> lk;     // this step's lookup continuation (BB tokens)
         int lk_len = 0;          // its match length (0: none)
         bool lk_run = false;     // the last step accepted every row and the lookup agreed
+        std::vector<uint32_t> masks;   // constrained: each verify row's allowed tokens, [T][words]
         bool done = false;
     };
     std::vector<G> gs;
@@ -9382,6 +9419,33 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     std::vector<uint64_t> seq;
     std::vector<SpecSampleRow> smp;
     std::vector<void*> caps;
+    std::vector<const uint32_t*> row_mask;
+    const int mask_words = (s.cfg.vocab + 31) / 32;
+    // A constrained session's verify masks: row t draws the token after block[0..t], so walk the
+    // constraint (which stands at the emitted tokens) through block[0] and the drafted tokens,
+    // taking the mask before each, then roll the walk back. A drafted token the constraint refuses
+    // ends the walk: the row before it cannot draw it, so no later row is kept and their masks
+    // are never used. So does a drafted end token: nothing after it is kept, and a constraint that
+    // accepted it has terminated (it has no next mask). False: block[0] itself is refused (it was
+    // drawn under the mask, so this means the engine's constraint and the group disagree).
+    auto build_masks = [&](G& g, int T) -> bool {
+        TokenConstraint* c = g.job->constraint;
+        g.masks.assign((size_t)T * mask_words, 0xffffffffu);
+        if (!c->accept(g.block[0])) return false;
+        int walked = 1;
+        for (int t = 0; t < T; t++) {
+            uint32_t* m = g.masks.data() + (size_t)t * mask_words;
+            c->fill_next_mask(m, s.cfg.vocab);
+            if (s.cfg.vocab % 32) m[mask_words - 1] &= (1u << (s.cfg.vocab % 32)) - 1;
+            if (t + 1 == T) break;
+            const int nt = g.block[t + 1];
+            if (nt == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && nt == s.cfg.eos_id2)) break;
+            if (!c->accept(nt)) break;
+            walked++;
+        }
+        c->rollback(walked);
+        return true;
+    };
     while (group_ok) {
         // Active sessions of this step.
         std::vector<G*> act;
@@ -9455,6 +9519,17 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             const int n = S * T;
             ids.assign(n, 0); pos.assign(n, 0); seq.assign(n, 0); argmax.assign(n, 0);
             keep.assign(S, 1); caps.assign(S, nullptr);
+            row_mask.assign(n, nullptr);
+            bool masks_ok = true, any_mask = false;
+            for (int j = 0; j < S && masks_ok; j++) {
+                G& g = *act[j];
+                if (!g.job->constraint) continue;
+                masks_ok = build_masks(g, T);
+                any_mask = true;
+                for (int t = 0; t < T && masks_ok; t++)
+                    row_mask[t * S + j] = g.masks.data() + (size_t)t * mask_words;
+            }
+            if (!masks_ok) { fprintf(stderr, "[spec-group] constraint refused a verified token\n"); break; }
             for (int j = 0; j < S; j++) {
                 caps[j] = act[j]->cap;
                 for (int t = 0; t < T; t++) {
@@ -9482,7 +9557,8 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             auto _tv = std::chrono::steady_clock::now();
             const int r = spec_group_verify(ids.data(), n, pos.data(), seq.data(), S, caps.data(),
                                             argmax.data(), keep.data(),
-                                            smp.empty() ? nullptr : smp.data());
+                                            smp.empty() ? nullptr : smp.data(),
+                                            any_mask ? row_mask.data() : nullptr);
             if (kTiming) t_verify += ms_since(_tv);
             if (r != n) { fprintf(stderr, "[spec-group] verify declined (S=%d T=%d)\n", S, T); break; }
         }

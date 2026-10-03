@@ -75,11 +75,13 @@ greedy, plain-text requests while they are the sole active request. Vision, samp
 logprobs, forced-token paths, prefix resumes, and requests that overlap another request stay on or
 hand off to lossless autoregressive decoding. At `--tp 2` several requests speculate together,
 including ones that start from a prefix-cache hit (the next turn of a conversation) and sampled
-ones (`top_k` 1–64; the output is what ordinary sampled decode would emit), and a group that stops
-paying off hands its requests back to ordinary decode. `/metrics` exposes
-`sparkinfer_speculative_runs_total`, `sparkinfer_speculative_tokens_total`, and
-`sparkinfer_speculative_handoffs_total` so this is observable in production; a non-streamed chat
-completion also reports the tokens DSpark produced for it as `usage.speculative_tokens`.
+ones (`top_k` 1–64; the output is what ordinary sampled decode would emit), as well as requests
+with tools or a JSON schema (each verify row draws under the grammar's mask, so the output is what
+ordinary constrained decode would emit), and a group that stops paying off hands its requests back
+to ordinary decode. `/metrics` exposes `sparkinfer_speculative_runs_total`,
+`sparkinfer_speculative_tokens_total`, and `sparkinfer_speculative_handoffs_total` so this is
+observable in production; chat completion usage also reports the tokens DSpark produced for the
+request as `usage.speculative_tokens`.
 
 ### Serve on two cards (`--tp 2`)
 

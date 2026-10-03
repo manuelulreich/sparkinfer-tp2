@@ -100,6 +100,47 @@ lands.
   - The tool-call gates (`invalid_tool_output` stays 0).
   - The M1 replay shows `speculative_tokens` > 0 on every step.
 
+**Status of A (2026-10-03): A1 and A3 done and verified on the GPUs; A2 not needed so far.**
+- Exactness: int8 KV, `SPARKINFER_DETERMINISTIC=1`, `--ctx 32768`. Two captured tool turns,
+  each greedy and with two sampled seeds, are byte-identical with and without speculation,
+  and every token was speculated. tp2 gates all pass (lossless 7/7, DSpark 275 / 83.5 tok/s).
+  With nvfp4 KV the outputs differ: that is plan 08's open nvfp4/fp8 losslessness issue.
+- The first GPU run found a bug in the sampled verify's top-k (`k_rows_topk`). Masked rows tie
+  ~124k values at -1e9, and the real candidates lost slots to them. The model then could not
+  draw `<|im_end|>` or `</tool_call>`, and tool turns ran to max_tokens. Fixed.
+- `build_masks` stops at a drafted end token: xgrammar aborts on a mask request after the
+  stop token.
+- opencode "Explain this repo", default `startup.sh` (`--ctx 131072`), 7 requests, all
+  speculated:
+  - 65.5 s, against 82 s without speculation;
+  - tool steps at 7-24k context: 74-100 tok/s instead of ~50;
+  - final answer at 26.5k context: 57 tok/s, 2,530 tokens, with DSpark at 1.74 tokens a step.
+    The gain guard ended speculation after 1,105 tokens. That is B's job.
+- `TokenConstraint::can_rollback/rollback`; GrammarConstraint keeps its UTF-8 state history and
+  calls `GrammarMatcher::Rollback`. tool_grammar_test now rolls back random drafted walks and
+  checks that the mask is unchanged.
+- `SpecGroupJob::constraint`. The group loop's `build_masks` walks block[0] and the drafted
+  tokens, takes each row's mask, then rolls back.
+- `spec_group_verify` / `tp_rows_forward` take `row_mask`. Each rank adds -1e9 to its own vocab
+  half of the masked rows (`launch_rows_mask_bits`, the engine's `kMasked`) before argmax or
+  top-k. So greedy and sampled rows draw exactly what `apply_constraint_mask` + decode would.
+- Engine:
+  - `spec_eligible` admits constraints that can roll back;
+  - `run_speculative` (the lone, non-group path) still refuses them;
+  - `spec_emit` advances the constraint with each emitted token, as `step_job` does, but not for
+    the end token.
+- Usage: `completion_tokens_details.reasoning_tokens` (tokens before the first `</think>`) in
+  streamed and non-streamed chat, and `speculative_tokens` in streamed chat.
+- A2 is deliberately not done yet. The drafter proposes the model's own tool-call tokens, which
+  the mask rarely changes, so first measure acceptance inside `<tool_call>` before adding a
+  depth-0 rule.
+- GPU checks, in order:
+  1. M1 replay: every step reports `speculative_tokens` > 0 and `invalid_tool_output` stays 0.
+  2. Deterministic greedy at ctx 32768, with a tool call: output identical to
+     `SPARKINFER_SPEC_GROUP_MAX=0`.
+  3. Cost of `build_masks` per step: `SPARKINFER_DSPARK_TIMING` draft/verify ms against the
+     M2 numbers.
+
 ### B. Port DFlash2 (the drafter gap at long context)
 
 The user deferred this earlier. M2 now makes it the main lever: 3.4–3.7 tokens/step against our

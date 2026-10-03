@@ -2587,16 +2587,30 @@ __global__ void __launch_bounds__(kTkThreads) k_rows_topk(const float* __restric
     const float tau = s_tau;
     for (int i = threadIdx.x; i < kTkSlots; i += kTkThreads) { sv[i] = -INFINITY; si[i] = INT_MAX; }
     __syncthreads();
+    // Everything above tau first: a masked row (constrained verify) holds ~all its values at the
+    // same -1e9, so the ties at tau can outnumber the slots, and collected together with them the
+    // row's real candidates could lose the race for a slot. Ties fill what is left.
     for (int v = threadIdx.x; v < V; v += kTkThreads) {
         float a = L[v];
         if (a != a) a = -INFINITY;
-        // tau == -inf: the row has fewer than k finite values; keep only those.
-        if (a > tau || (a == tau && tau != -INFINITY)) {
+        if (a > tau) {
             const int slot = atomicAdd(&s_cnt, 1);
             if (slot < kTkSlots) { sv[slot] = a; si[slot] = v; }
         }
     }
     __syncthreads();
+    // tau == -inf: the row has fewer than k finite values; keep only those.
+    if (tau != -INFINITY && s_cnt < kTkSlots) {
+        for (int v = threadIdx.x; v < V; v += kTkThreads) {
+            float a = L[v];
+            if (a != a) a = -INFINITY;
+            if (a == tau) {
+                const int slot = atomicAdd(&s_cnt, 1);
+                if (slot < kTkSlots) { sv[slot] = a; si[slot] = v; }
+            }
+        }
+        __syncthreads();
+    }
     tk_sort(sv, si);
     for (int j = threadIdx.x; j < kRowsTopkMax; j += kTkThreads) {
         out_v[(size_t)blockIdx.x * kRowsTopkMax + j] = j < k ? sv[j] : -INFINITY;
@@ -2649,6 +2663,19 @@ void launch_rows_topk(const float* x, int n_rows, int V, int k, float* out_v, in
     k = k < 1 ? 1 : (k > kRowsTopkMax ? kRowsTopkMax : k);
     if (k > V) k = V;
     k_rows_topk<<<n_rows, kTkThreads, 0, stream>>>(x, V, k, out_v, out_i);
+}
+
+static __global__ void k_rows_mask_bits(float* x, int V, const uint32_t* bits) {
+    const int r = blockIdx.y;
+    const uint32_t* b = bits + (size_t)r * (V / 32);
+    float* row = x + (size_t)r * V;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < V; i += gridDim.x * blockDim.x)
+        if (!((b[i >> 5] >> (i & 31)) & 1u)) row[i] += -1.0e9f;
+}
+
+void launch_rows_mask_bits(float* x, int n_rows, int V, const uint32_t* bits, cudaStream_t stream) {
+    if (n_rows <= 0 || V <= 0 || V % 32) return;
+    k_rows_mask_bits<<<dim3(64, n_rows), 256, 0, stream>>>(x, V, bits);
 }
 
 void launch_rows_sample_candidates(const float* cand_v, const int* cand_i, int n_rows, int m,
