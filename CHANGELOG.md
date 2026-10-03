@@ -103,6 +103,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **DSpark draft runs its NVFP4 weights as stored.** The checkpoint's NVFP4 projections
+  (o/gate/up/down) were dequantized to bf16 at load and requantized to an asymmetric int4, and fc
+  plus the k/v projections also kept a bf16 copy. Every draft projection is now one NVFP4 payload:
+  the stored tensors byte for byte, the bf16 ones (q/k/v, fc) quantized once at load. A new dp4a
+  GEMV reads them against the same int8 (Q8_1) activations as before (exact integer dots per
+  16-weight group, up to three matrices and 16 activation rows per weight read); a prompt's
+  context goes through the bf16 tensor-core GEMM on weights dequantized in slices. Activations are
+  never 4-bit. tp=2: 238 MB less on each card (idle 12,505 / 12,273 -> 12,267 / 12,035 MiB), draft
+  step C1 2.23 -> 2.19 ms, C4 (deterministic, equal acceptance) 6.71 -> 6.57 ms; same acceptance
+  and output. Sampled cohort C2 / C4: 174 / 265 tok/s. `SPARKINFER_DFLASH_NVFP4=0` restores the
+  int4 copies.
 - **tp=2 DSpark: the draft's fc projector is split across the cards.** Each card now captures its
   own half of every tapped layer's hidden state (the residual stream is the same on both) and
   projects it through its half of fc's input columns; the all-reduce that used to carry card 0's

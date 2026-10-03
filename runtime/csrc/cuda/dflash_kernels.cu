@@ -2,6 +2,7 @@
 #include "sparkinfer/models/dflash_kernels.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <curand_kernel.h>
 #include <climits>
 #include <cmath>
@@ -1419,6 +1420,153 @@ void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
 // 16-row instantiation (2 weight rows per warp group, so the accumulators stay in registers), the
 // weights streamed once per chunk instead of once per session. A row count of 8 or less takes the
 // exact-width launcher above unchanged.
+namespace {
+// ---- NVFP4 payload weights x Q8_1 activations (the draft's NVFP4 projections) ----
+//
+// An e2m1 weight doubled is an exact small integer {0, +-1, +-2, +-3, +-4, +-6, +-8, +-12}, so a
+// 16-weight group's dot with int8 activations is one exact dp4a sum, scaled by the group's ue4m3
+// scale / 2 / global and by the activation block's d. The structure is k_gemv_batched_fused3_q4_dp4a's
+// (ROWS weight rows a warp, KSPLIT warps along K, BATCH activation rows per weight read).
+__device__ __forceinline__ float nv81_ue4m3(unsigned b) {
+    const unsigned e = (b >> 3) & 15u, m = b & 7u;
+    if (e == 0) return (float)m * (1.f / 512.f);
+    return __int_as_float((int)(((e + 120u) << 23) | (m << 20)));
+}
+// The four e2m1 codes in the low 16 bits of sel (nibble i = element i, which is exactly how a
+// packed word stores elements 0..3, and its high half 4..7) -> four signed doubled e2m1 bytes in
+// element order. byte_perm is the table: the 3-bit magnitude picks from {0,1,2,3,4,6,8,12} or its
+// negation, and the sign bit picks between the two.
+__device__ __forceinline__ unsigned nv81_lut4(unsigned sel) {
+    const unsigned pos = __byte_perm(0x03020100u, 0x0C080604u, sel & 0x7777u);
+    const unsigned neg = __byte_perm(0xFDFEFF00u, 0xF4F8FAFCu, sel & 0x7777u);
+    return __byte_perm(pos, neg, 0x3210u | ((sel & 0x8888u) >> 1));
+}
+template <int BATCH, int ROWS, int KSPLIT>
+__global__ void k_gemv_nvfp4_q81(const si_q81_blk* __restrict__ xq,
+                                 const unsigned char* __restrict__ W0,
+                                 const unsigned char* __restrict__ W1,
+                                 const unsigned char* __restrict__ W2,
+                                 bf16* __restrict__ y0, bf16* __restrict__ y1, bf16* __restrict__ y2,
+                                 int N0, int N1, int N2, int K, int nb) {
+    __shared__ float red[KSPLIT][ROWS][BATCH];
+    const int total = N0 + N1 + N2;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int KB = K / 32;
+    for (int global_n = blockIdx.x * ROWS; global_n < total; global_n += gridDim.x * ROWS) {
+        const unsigned char* W; bf16* y; int N, n0;
+        if (global_n < N0)           { W = W0; y = y0; N = N0; n0 = global_n; }
+        else if (global_n < N0 + N1) { W = W1; y = y1; N = N1; n0 = global_n - N0; }
+        else                         { W = W2; y = y2; N = N2; n0 = global_n - N0 - N1; }
+        const int nr = (N - n0 < ROWS) ? (N - n0) : ROWS;
+        const float inv_g = 1.f / *reinterpret_cast<const float*>(W);
+        const unsigned char* S = W + 256;
+        const unsigned char* P = S + (size_t)N * (K / 16);
+        float acc[ROWS][BATCH];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) acc[r][b] = 0.f;
+        for (int kb = warp * 32 + lane; kb < KB; kb += KSPLIT * 32) {
+            unsigned wq[ROWS][8];
+            float s0[ROWS], s1[ROWS];
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int rr = (r < nr) ? r : 0;
+                const uint4 pk = __ldcs(reinterpret_cast<const uint4*>(
+                    P + (size_t)(rr + n0) * (K / 2) + (size_t)kb * 16));
+                const unsigned short sc = __ldcs(reinterpret_cast<const unsigned short*>(
+                    S + (size_t)(rr + n0) * (K / 16) + (size_t)kb * 2));
+                s0[r] = nv81_ue4m3(sc & 0xFFu) * inv_g * 0.5f;
+                s1[r] = nv81_ue4m3(sc >> 8) * inv_g * 0.5f;
+                const unsigned pv[4] = { pk.x, pk.y, pk.z, pk.w };
+#pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    wq[r][2 * u]     = nv81_lut4(pv[u]);
+                    wq[r][2 * u + 1] = nv81_lut4(pv[u] >> 16);
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+                if (b >= nb) break;
+                const si_q81_blk* xb = xq + (size_t)b * KB + kb;
+                const float da = __low2float(xb->ds);
+                // Four-byte loads: qs sits at byte 36*b + 4 (see the Q4 kernel).
+                const unsigned* ap = reinterpret_cast<const unsigned*>(xb->qs);
+                unsigned av[8];
+#pragma unroll
+                for (int u = 0; u < 8; u++) av[u] = ap[u];
+#pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    int d0 = 0, d1 = 0;
+#pragma unroll
+                    for (int u = 0; u < 4; u++) d0 = __dp4a((int)wq[r][u], (int)av[u], d0);
+#pragma unroll
+                    for (int u = 4; u < 8; u++) d1 = __dp4a((int)wq[r][u], (int)av[u], d1);
+                    acc[r][b] += da * ((float)d0 * s0[r] + (float)d1 * s1[r]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+#pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    acc[r][b] += __shfl_down_sync(0xffffffffu, acc[r][b], off);
+            }
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < ROWS; r++)
+#pragma unroll
+                for (int b = 0; b < BATCH; b++) red[warp][r][b] = acc[r][b];
+        }
+        __syncthreads();
+        if (warp == 0 && lane < ROWS * BATCH) {
+            const int r = lane / BATCH, b = lane % BATCH;
+            if (r < nr && b < nb) {
+                float o = 0.f;
+#pragma unroll
+                for (int w = 0; w < KSPLIT; w++) o += red[w][r][b];
+                y[(size_t)b * N + n0 + r] = f2b(o);
+            }
+        }
+        __syncthreads();
+    }
+}
+} // namespace
+
+bool launch_gemv_nvfp4_q81(const void* xq81, const void* W0, const void* W1, const void* W2,
+                           void* y0, void* y1, void* y2, int N0, int N1, int N2, int K, int rows,
+                           cudaStream_t stream) {
+    const int total = N0 + N1 + N2;
+    if (total <= 0 || rows <= 0 || (K & 31) || !xq81 || !W0) return false;
+    if ((N1 && !W1) || (N2 && !W2)) return false;
+    // 2 weight rows a warp, 2 warps along K: measured best of (2,2), (2,4), (1,4), (1,2) at C4.
+    // ROWS * BATCH must stay <= 32 (the final reduction is one warp's lanes).
+    constexpr int ROWS = 2, KS = 2;
+    const auto* xp = reinterpret_cast<const si_q81_blk*>(xq81);
+    const size_t xrow = (size_t)(K / 32);
+    const auto* w0 = (const unsigned char*)W0;
+    const auto* w1 = (const unsigned char*)W1;
+    const auto* w2 = (const unsigned char*)W2;
+    for (int r0 = 0; r0 < rows; r0 += 16) {
+        const int nb = rows - r0 < 16 ? rows - r0 : 16;
+        auto off = [&](void* y, int N) -> bf16* { return y ? (bf16*)y + (size_t)r0 * N : nullptr; };
+#define SI_NV81(BATCH_) k_gemv_nvfp4_q81<BATCH_, ROWS, KS><<<dim3((total + ROWS - 1) / ROWS), \
+                                                              dim3(KS * 32), 0, stream>>>( \
+            xp + (size_t)r0 * xrow, w0, w1, w2, off(y0, N0), off(y1, N1), off(y2, N2), N0, N1, N2, \
+            K, nb)
+        if (nb <= 1)      SI_NV81(1);
+        else if (nb <= 2) SI_NV81(2);
+        else if (nb <= 4) SI_NV81(4);
+        else if (nb <= 8) SI_NV81(8);
+        else              SI_NV81(16);
+#undef SI_NV81
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 void launch_gemv_batched_q4_dp4a_fused3_rows(const void* xq81,
                                              const void* Q0, const void* Q1, const void* Q2,
                                              const void* D0, const void* D1, const void* D2,
@@ -1527,6 +1675,68 @@ void launch_capture_row(const void* x, void* hidden, const int* cap_row, int slo
     const int n4 = H / 8;
     k_capture_row<<<(n4 + 255) / 256, 256, 0, stream>>>(
         (const bf16*)x, (bf16*)hidden, cap_row, slot, H, row_elems, max_rows);
+}
+
+namespace {
+// amax over the tensor into hdr[1] (as float bits: non-negative floats order like their bits).
+__global__ void k_nvfp4_amax(const bf16* __restrict__ w, long n, unsigned* __restrict__ amax_bits) {
+    float m = 0.f;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x)
+        m = fmaxf(m, fabsf(__bfloat162float(w[i])));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) atomicMax(amax_bits, __float_as_uint(m));
+}
+// Round |v| to the nearest e2m1 magnitude {0, .5, 1, 1.5, 2, 3, 4, 6}; returns its index 0..7.
+__device__ __forceinline__ unsigned nvfp4_e2m1_idx(float a) {
+    if (a < 0.25f) return 0;
+    if (a < 0.75f) return 1;
+    if (a < 1.25f) return 2;
+    if (a < 1.75f) return 3;
+    if (a < 2.5f)  return 4;
+    if (a < 3.5f)  return 5;
+    if (a < 5.f)   return 6;
+    return 7;
+}
+// One thread per 16-weight group.
+__global__ void k_nvfp4_quant(const bf16* __restrict__ w, unsigned char* __restrict__ payload,
+                              long groups, int gpr) {
+    const long g = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    float* hdr = reinterpret_cast<float*>(payload);
+    const float amax_t = hdr[1];
+    const float glob = amax_t > 0.f ? 448.f * 6.f / amax_t : 1.f;
+    if (g == 0) hdr[0] = glob;
+    if (g >= groups) return;
+    const bf16* src = w + g * 16;
+    float v[16], am = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; i++) { v[i] = __bfloat162float(src[i]); am = fmaxf(am, fabsf(v[i])); }
+    const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(am / 6.f * glob, __NV_SATFINITE, __NV_E4M3);
+    const float sq = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
+    unsigned char* scales = payload + 256;
+    const long N_K16 = groups;   // scales occupy one byte per group
+    unsigned char* packed = scales + N_K16 + g * 8;
+    scales[g] = (unsigned char)sb;
+    const float inv = sq > 0.f ? glob / sq : 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; i += 2) {
+        const float a = v[i] * inv, b = v[i + 1] * inv;
+        const unsigned lo = nvfp4_e2m1_idx(fabsf(a)) | (a < 0.f ? 8u : 0u);
+        const unsigned hi = nvfp4_e2m1_idx(fabsf(b)) | (b < 0.f ? 8u : 0u);
+        packed[i >> 1] = (unsigned char)(lo | (hi << 4));
+    }
+    (void)gpr;
+}
+} // namespace
+
+void launch_quantize_w_nvfp4(const void* w, void* payload, int N, int K, cudaStream_t stream) {
+    if (N <= 0 || K <= 0 || (K & 15)) return;
+    cudaMemsetAsync(payload, 0, 256, stream);
+    const long n = (long)N * K;
+    k_nvfp4_amax<<<256, 256, 0, stream>>>((const bf16*)w, n,
+                                          reinterpret_cast<unsigned*>(payload) + 1);
+    const long groups = n / 16;
+    k_nvfp4_quant<<<(unsigned)((groups + 255) / 256), 256, 0, stream>>>(
+        (const bf16*)w, (unsigned char*)payload, groups, K / 16);
 }
 
 void launch_quantize_w_q8(const void* w, void* q, float* sc, int N, int K, cudaStream_t stream) {

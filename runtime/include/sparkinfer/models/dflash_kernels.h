@@ -104,6 +104,21 @@ void launch_capture_row(const void* x, void* hidden, const int* cap_row, int slo
 // bf16 -> asymmetric int4 (packed nibbles + fp16 scale/min per 32). Run once at load.
 void launch_quantize_w_q4(const void* w, void* q, void* dm, int N, int K, cudaStream_t stream);
 
+// bf16 [N, K] -> an SI_QTYPE_NVFP4 payload (kernels/qtype.h: 256 B header holding the f32 global
+// scale, then ue4m3 group scales [N, K/16], then packed e2m1 [N, K/2], low nibble = even column),
+// round to nearest. global = 448 * 6 / amax(w), so the largest group scale is e4m3's maximum, and
+// each weight dequantizes as e2m1 * scale / global -- the decode launch_gemv_nvfp4* apply.
+// `payload` must hold 256 + N*K/16 + N*K/2 bytes. K % 16 == 0. Run once at load.
+void launch_quantize_w_nvfp4(const void* w, void* payload, int N, int K, cudaStream_t stream);
+
+// y_i[rows, N_i] = x[rows, K] @ W_i^T for up to three SI_QTYPE_NVFP4 payloads sharing one Q8_1
+// activation (launch_quantize_q8_1_rows layout, K/32 blocks a row): exact integer dots per
+// 16-weight group (doubled e2m1 x int8), so the weights are used exactly as stored. Pass N1/N2 = 0
+// for fewer. Rows are taken 16 at a time per weight read. K % 32 == 0. False: nothing launched.
+bool launch_gemv_nvfp4_q81(const void* xq81, const void* W0, const void* W1, const void* W2,
+                           void* y0, void* y1, void* y2, int N0, int N1, int N2, int K, int rows,
+                           cudaStream_t stream);
+
 // int4-weight form of launch_gemv_batched16_fused3 (~5 bits/weight vs Q8_0's 9).
 // dp4a twin of the Q4 fused3 below; `xq81` is Q8_1(x), 36 B per 32 values per batch row.
 void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,

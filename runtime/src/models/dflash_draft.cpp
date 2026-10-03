@@ -9,6 +9,7 @@
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/prefill_nvfp4.h"
+#include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/gguf.h"
 // Header-only Muse Glimmer DFlash draft config derivation (mirrors examples/qwen3_gguf_config.h's
 // museglimmer_config_from_gguf for the target model). Lives in examples/ by this codebase's
@@ -305,6 +306,9 @@ struct LayerWeights {
     bf16 *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
     // Q8_0 mirrors of the four batched projections (Q/K/V, O, gate/up, down).
     Q8W q8_wq, q8_wk, q8_wv, q8_wo, q8_gate, q8_up, q8_down;
+    // NVFP4 payloads (SI_QTYPE_NVFP4, see Impl::nv_on) of the same projections, or null.
+    void *nv_wq = nullptr, *nv_wk = nullptr, *nv_wv = nullptr, *nv_wo = nullptr,
+         *nv_gate = nullptr, *nv_up = nullptr, *nv_down = nullptr;
     bf16 *q_norm = nullptr, *k_norm = nullptr;
     bf16 *input_norm = nullptr, *post_norm = nullptr;
     bf16 *gate = nullptr, *up = nullptr, *down = nullptr;
@@ -321,6 +325,13 @@ inline int draft_w_bits() {
     return v;
 }
 inline bool q8_on() { return draft_w_bits() != 0; }
+
+// NVFP4 draft projections (SPARKINFER_DFLASH_NVFP4, default on): see Impl::nv_on.
+inline bool draft_nvfp4() {
+    static const bool v = [] { const char* e = getenv("SPARKINFER_DFLASH_NVFP4");
+                               return !(e && e[0] == '0'); }();
+    return v;
+}
 
 } // namespace
 
@@ -346,6 +357,19 @@ struct DFlashDraftModel::Impl {
     int fc_k = 0;
     bool fc_split = false;
     std::function<const void*(const void*)> peer_hidden;
+
+    // NVFP4 projections (SPARKINFER_DFLASH_NVFP4, default on for a safetensors draft). Every
+    // backbone projection and fc is one SI_QTYPE_NVFP4 payload (kernels/qtype.h): the checkpoint's
+    // own NVFP4 tensors (o/gate/up/down on DSpark) as they are stored, its bf16 ones (q/k/v, fc)
+    // quantized once at load. No bf16 or Q4 copy is kept. Up to kNvGemvRows rows run the dp4a
+    // GEMV against the same Q8_1 activations the Q4 path used (exact integer dots per 16-weight
+    // group, the weights as stored); wider calls (a prompt's context) dequantize the weight to
+    // bf16 in slices for the tensor-core GEMM. Activations are never cut to 4 bits.
+    bool nv_on = false;
+    void* nv_fc = nullptr;
+    char* nv_q81 = nullptr;   // Q8_1 staging for up to kNvGemvRows rows of nv_kmax
+    int nv_kmax = 0;
+    static constexpr int kNvGemvRows = 64;
     // YaRN rotary table (null unless the checkpoint configures rope_type "yarn").
     float* d_yarn_inv_freq = nullptr;   // [head_dim/2]
     float  yarn_att_scale = 1.0f;
@@ -628,13 +652,16 @@ struct DFlashDraftModel::Impl {
         const int rows = n * BW;
         const bool fast_w = (BW == 16 || BW == 8 || BW == 7 || BW == 6 || BW == 5 || BW == 4 || BW == 2);
         bool ok = multi_env && n >= 2 && rows <= R && n * depth <= R && fast_w && kDp4a == 15 &&
-                  kRowShift == 1 && xq81 && q8_fc.q4 && head_q8 && lm_head_type == 12 &&
+                  kRowShift == 1 && xq81 && (nv_on ? nv_fc != nullptr : q8_fc.q4 != nullptr) &&
+                  head_q8 && lm_head_type == 12 &&
                   kFullWindowEnv < 0 && 3 * c.sliding_window <= 0 && !lm_head_i4 &&
                   !lm_head_i8 && markov_w1 && markov_w2_q;
         for (int L = 0; ok && L < c.n_layers; L++) {
             const auto& w = layers[L];
-            ok = w.q8_wq.q4 && w.q8_wk.q4 && w.q8_wv.q4 && w.q8_wo.q4 && w.q8_gate.q4 &&
-                 w.q8_up.q4 && w.q8_down.q4;
+            ok = nv_on ? (w.nv_wq && w.nv_wk && w.nv_wv && w.nv_wo && w.nv_gate && w.nv_up &&
+                          w.nv_down)
+                       : (w.q8_wq.q4 && w.q8_wk.q4 && w.q8_wv.q4 && w.q8_wo.q4 && w.q8_gate.q4 &&
+                          w.q8_up.q4 && w.q8_down.q4);
         }
         ctx_total = 0;
         for (int j = 0; ok && j < n; j++) {
@@ -821,6 +848,11 @@ struct DFlashDraftModel::Impl {
             const size_t blocks = (size_t)(B + 1) * ((kmax + 31) / 32);
             xq81 = alloc<char>(blocks * 36);
         }
+        if (nv_on) {
+            nv_kmax = std::max(std::max(cfg.intermediate, cfg.hidden),
+                               std::max(fc_k, cfg.n_q_heads * cfg.head_dim));
+            nv_q81 = alloc<char>((size_t)kNvGemvRows * (nv_kmax / 32) * 36);
+        }
         if (confidence_w) {
             d_confidence = alloc<float>(B + 1);
             cu(cudaHostAlloc(&h_confidence, (B + 1) * sizeof(float), cudaHostAllocDefault),
@@ -873,6 +905,108 @@ struct DFlashDraftModel::Impl {
         if (kv_cur == -1) kv_cap = cfg.max_seq;
         else kv_default.cap = cfg.max_seq;
         return true;
+    }
+
+    // ---- NVFP4 projections (see nv_on) ----
+
+    // A checkpoint NVFP4 tensor (ModelOpt: packed e2m1 [rows, cols/2], e4m3 group scales
+    // [rows, cols/16], weight_scale_2) as an SI_QTYPE_NVFP4 payload of this rank's slice (by_rows:
+    // rows [part * rows/parts, ...), else those columns). The header holds 1 / weight_scale_2,
+    // the payload's divisor. The bytes are copied as stored: nothing is re-rounded.
+    void* upload_nvfp4_payload(const TensorView& w, const TensorView& sc, float ws2, bool by_rows,
+                               int part, int parts, int* n_out, int* k_out) {
+        const int rows = (int)w.shape[0], cols = (int)w.shape[1] * 2;
+        if ((by_rows ? rows : cols) % parts != 0 || (!by_rows && (cols / parts) % 16 != 0))
+            return nullptr;
+        const int r0 = by_rows ? part * (rows / parts) : 0, nr = by_rows ? rows / parts : rows;
+        const int c0 = by_rows ? 0 : part * (cols / parts), nc = by_rows ? cols : cols / parts;
+        const size_t sbytes = (size_t)nr * (nc / 16), pbytes = (size_t)nr * (nc / 2);
+        std::vector<unsigned char> host(256 + sbytes + pbytes, 0);
+        const float g = ws2 > 0.f ? 1.f / ws2 : 1.f;
+        std::memcpy(host.data(), &g, sizeof(float));
+        const unsigned char* pw = (const unsigned char*)w.data;
+        const unsigned char* ps = (const unsigned char*)sc.data;
+        for (int r = 0; r < nr; r++) {
+            std::memcpy(host.data() + 256 + (size_t)r * (nc / 16),
+                        ps + (size_t)(r0 + r) * (cols / 16) + c0 / 16, nc / 16);
+            std::memcpy(host.data() + 256 + sbytes + (size_t)r * (nc / 2),
+                        pw + (size_t)(r0 + r) * (cols / 2) + c0 / 2, nc / 2);
+        }
+        unsigned char* d = alloc<unsigned char>(host.size());
+        cu(cudaMemcpy(d, host.data(), host.size(), cudaMemcpyHostToDevice), "upload nvfp4 payload");
+        if (n_out) *n_out = nr;
+        if (k_out) *k_out = nc;
+        return d;
+    }
+
+    // A device bf16 [N, K] weight as an NVFP4 payload (round to nearest); the bf16 is released.
+    void* quant_nvfp4_payload(bf16* w, int N, int K) {
+        if (!w || K % 16) return nullptr;
+        unsigned char* d = alloc<unsigned char>(256 + (size_t)N * K / 16 + (size_t)N * K / 2);
+        dflash_kernels::launch_quantize_w_nvfp4(w, d, N, K, stream);
+        cu(cudaStreamSynchronize(stream), "nvfp4 quantize");
+        release(w);
+        return d;
+    }
+
+    // y_i = x @ W_i^T for up to three NVFP4 payloads on one bf16 activation x [rows, K]: rows up
+    // to kNvGemvRows through the dp4a GEMV (x quantized to Q8_1 here, unless `xq81` already holds
+    // it), wider through nv_gemm.
+    void nv_proj(const bf16* x, const void* xq81, int rows, int K, const void* W0, bf16* y0, int N0,
+                 const void* W1, bf16* y1, int N1, const void* W2, bf16* y2, int N2,
+                 cudaStream_t st) {
+        if (rows <= 0) return;
+        if (rows > kNvGemvRows) {
+            nv_gemm(x, W0, y0, rows, N0, K, st);
+            if (W1) nv_gemm(x, W1, y1, rows, N1, K, st);
+            if (W2) nv_gemm(x, W2, y2, rows, N2, K, st);
+            return;
+        }
+        if (!xq81) {
+            kernels::launch_quantize_q8_1_rows(x, nv_q81, K, rows, K, st);
+            xq81 = nv_q81;
+        }
+        dflash_kernels::launch_gemv_nvfp4_q81(xq81, W0, W1, W2, y0, y1, y2, N0, W1 ? N1 : 0,
+                                              W2 ? N2 : 0, K, rows, st);
+    }
+
+    // The wide case: the weight dequantized to bf16 in slices of output rows (at most 32 MB each)
+    // for the tensor-core GEMM, whose input stays bf16. Runs at a join, so its two scratch
+    // buffers are taken and given back here.
+    void nv_gemm(const bf16* x, const void* W, bf16* y, int rows, int N, int K, cudaStream_t st) {
+        const char* base = static_cast<const char*>(W);
+        const size_t sbytes = (size_t)N * K / 16;
+        int ns = N;
+        while ((size_t)ns * K * sizeof(bf16) > (32u << 20) && ns % 128 == 0 && ns > 128) ns /= 2;
+        bf16* wb = nullptr;
+        bf16* yt = nullptr;
+        if (cudaMalloc(&wb, (size_t)ns * K * sizeof(bf16)) != cudaSuccess ||
+            (ns < N && cudaMalloc(&yt, (size_t)rows * ns * sizeof(bf16)) != cudaSuccess)) {
+            cudaGetLastError();
+            if (wb) cudaFree(wb);
+            // Not enough room for the slices: the GEMV path, slower but allocation-free.
+            for (int r0 = 0; r0 < rows; r0 += kNvGemvRows)
+                nv_proj(x + (size_t)r0 * K, nullptr, std::min(kNvGemvRows, rows - r0), K, W,
+                        y + (size_t)r0 * N, N, nullptr, nullptr, 0, nullptr, nullptr, 0, st);
+            return;
+        }
+        for (int n0 = 0; n0 < N; n0 += ns) {
+            const int nn = std::min(ns, N - n0);
+            kernels::launch_ct_dequant_nvfp4_dev(base + 256 + sbytes + (size_t)n0 * (K / 2),
+                                                 base + 256 + (size_t)n0 * (K / 16),
+                                                 static_cast<const float*>(W), wb, nn, K, st);
+            if (nn == N) {
+                kernels::launch_prefill_gemm(x, wb, y, rows, N, K, st);
+            } else {
+                kernels::launch_prefill_gemm(x, wb, yt, rows, nn, K, st);
+                cu(cudaMemcpy2DAsync(y + n0, (size_t)N * sizeof(bf16), yt, (size_t)nn * sizeof(bf16),
+                                     (size_t)nn * sizeof(bf16), rows, cudaMemcpyDeviceToDevice, st),
+                   "nvfp4 gemm slice");
+            }
+        }
+        cu(cudaStreamSynchronize(st), "nvfp4 gemm");
+        cudaFree(wb);
+        if (yt) cudaFree(yt);
     }
 
     // NVFP4 -> BF16 at load, decoded on the host.
@@ -1460,6 +1594,13 @@ bool DFlashDraftModel::load(const std::string& dir) {
         s.hidden_norm = s.upload(*hn);
     }
     s.final_norm = s.upload(*nn);
+    // NVFP4 projections (Impl::nv_on): fc becomes one payload and its bf16 copy goes.
+    s.nv_on = draft_nvfp4();
+    if (s.nv_on && s.fc) {
+        s.nv_fc = s.quant_nvfp4_payload(s.fc, s.cfg.hidden, s.fc_k);
+        s.fc = nullptr;
+        if (!s.nv_fc) return false;
+    }
     // Quantize the projector alongside the layer weights (see Impl::q8_fc). The bf16 copy stays:
     // the FIRST block projects the whole prompt and routes to the tensor-core GEMM, which is
     // compute-bound and wants bf16.
@@ -1483,6 +1624,42 @@ bool DFlashDraftModel::load(const std::string& dir) {
         auto* d = require(pfx + "mlp.down_proj.weight");
         if (!qn || !kn || !in || !pn)
             return false;
+        if (s.nv_on) {
+            // One NVFP4 payload per projection, this rank's slice (see Impl::nv_on).
+            auto load_nv = [&](const std::string& name, int split, int N, int K) -> void* {
+                TensorView* t = require(name);
+                if (!t) return nullptr;
+                const bool part = tp_n > 1 && split != 0;
+                if (t->dtype == "U8") {
+                    TensorView* sc = optional(name + "_scale");
+                    TensorView* g2 = optional(name + "_scale_2");
+                    if (!sc) return nullptr;
+                    const float gs = g2 && g2->nbytes >= sizeof(float) ? *(const float*)g2->data : 1.f;
+                    int n = 0, k = 0;
+                    void* d = s.upload_nvfp4_payload(*t, *sc, gs, split == 1, part ? tp_r : 0,
+                                                     part ? tp_n : 1, &n, &k);
+                    return d && n == N && k == K ? d : nullptr;
+                }
+                bf16* b = load_weight(name, split);
+                return s.quant_nvfp4_payload(b, N, K);
+            };
+            const int qd = s.cfg.n_q_heads * s.cfg.head_dim, kvd = s.cfg.n_kv_heads * s.cfg.head_dim;
+            lw.nv_wq = load_nv(pfx + "self_attn.q_proj.weight", 1, qd, H);
+            lw.nv_wk = load_nv(pfx + "self_attn.k_proj.weight", 1, kvd, H);
+            lw.nv_wv = load_nv(pfx + "self_attn.v_proj.weight", 1, kvd, H);
+            lw.nv_wo = load_nv(pfx + "self_attn.o_proj.weight", 2, H, qd);
+            lw.nv_gate = load_nv(pfx + "mlp.gate_proj.weight", 1, I, H);
+            lw.nv_up = load_nv(pfx + "mlp.up_proj.weight", 1, I, H);
+            lw.nv_down = load_nv(pfx + "mlp.down_proj.weight", 2, H, I);
+            lw.q_norm = s.upload(*qn); lw.k_norm = s.upload(*kn);
+            lw.input_norm = s.upload(*in); lw.post_norm = s.upload(*pn);
+            if (!lw.nv_wq || !lw.nv_wk || !lw.nv_wv || !lw.nv_wo || !lw.nv_gate || !lw.nv_up ||
+                !lw.nv_down) {
+                fprintf(stderr, "[dflash] layer %d: NVFP4 projections failed to load\n", L);
+                return false;
+            }
+            continue;
+        }
         lw.wq = load_weight(pfx + "self_attn.q_proj.weight", 1);
         lw.wk = load_weight(pfx + "self_attn.k_proj.weight", 1);
         lw.wv = load_weight(pfx + "self_attn.v_proj.weight", 1);
@@ -1770,7 +1947,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     s.ensure_quant();
     // Every decline that depends on rank-0-only state happens here, before the peer starts: inside
     // the bodies the two ranks may only return early together, before their first link op.
-    if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
+    if ((!s.fc && !s.nv_fc) || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
     if (!s.tp_peer)
         return forward_block_body(target_hidden, ctx_len, noise_ids, pos0, out_argmax, stream,
                                   proposals, out_confidence, target_hidden_start);
@@ -1859,6 +2036,8 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
     // is emitted, and LOSSLESS stays 1.
     static const int kDp4a = []{ const char* e = getenv("SPARKINFER_DFLASH_DP4A");
                                  return e ? atoi(e) : 15; }();
+    // NVFP4 projections (Impl::nv_on) replace every Q4/bf16 projection below.
+    const bool nv = s.nv_on;
     const bool dp4a_ok = s.xq81 != nullptr;
     const bool dp4a_qkv  = dp4a_ok && (kDp4a & 1);
     const bool dp4a_o    = dp4a_ok && (kDp4a & 2);
@@ -2156,6 +2335,9 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
                 fprintf(stderr, "[dflash] fc split: no capture rows on rank %d\n", c.tp_rank);
             }
             cu(cudaMemsetAsync(tp, 0, (size_t)fc_rows * H * sizeof(bf16), st), "fc half zero");
+        } else if (s.nv_fc) {
+            s.nv_proj(th, nullptr, fc_rows, fk, s.nv_fc, tp, H, nullptr, nullptr, 0, nullptr,
+                      nullptr, 0, st);
         } else if (ctx_gemm) {
             kernels::launch_prefill_gemm(th, s.fc, tp, fc_rows, H, fk, st);
         } else if (fc_q4 && dp4a_ok) {
@@ -2216,7 +2398,11 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
             dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
 
         // Q from noise, K/V from cat(target, noise)
-        if (fast16) {
+        if (nv) {
+            s.nv_proj(s.xn, xn_ready ? s.xq81 : q81(s.xn, H), BW, H, w.nv_wq, s.q, qdim,
+                      w.nv_wk, kdst + (size_t)ctx_len * kvdim, kvdim,
+                      w.nv_wv, vdst + (size_t)ctx_len * kvdim, kvdim, st);
+        } else if (fast16) {
             if (w.q8_wq.q4 && dp4a_qkv)
                 dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
                     xn_ready ? s.xq81 : q81(s.xn, H), w.q8_wq.q4, w.q8_wk.q4, w.q8_wv.q4,
@@ -2292,7 +2478,10 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
         // the most expensive of all, two separate bf16 GEMVs each streaming the whole 10.5 MB
         // matrix to produce one row. Cover 1..8, not just the multi-row tiers.
         const bool ctx_q4 = kCtxQ4 && w.q8_wk.q4 && w.q8_wv.q4 && ctx_rows >= 1 && ctx_rows <= 8;
-        if (ctx_rows > 0 && ctx_gemm) {
+        if (ctx_rows > 0 && nv) {
+            s.nv_proj(ctx_src, nullptr, ctx_rows, H, w.nv_wk, kdst_ctx, kvdim, w.nv_wv, vdst_ctx,
+                      kvdim, nullptr, nullptr, 0, st);
+        } else if (ctx_rows > 0 && ctx_gemm) {
             kernels::launch_prefill_gemm(ctx_src, w.wk, kdst_ctx, ctx_rows, kvdim, H, st);
             kernels::launch_prefill_gemm(ctx_src, w.wv, vdst_ctx, ctx_rows, kvdim, H, st);
         } else if (ctx_q4 && dp4a_ok) {
@@ -2314,7 +2503,7 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
             kernels::launch_gemv(ctx_src, w.wk, kdst_ctx, kvdim, H, st);
             kernels::launch_gemv(ctx_src, w.wv, vdst_ctx, kvdim, H, st);
         }
-        if (!fast16) {
+        if (!fast16 && !nv) {
             for (int t = 0; t < BW; t++) {
                 kernels::launch_gemv(s.xn + (size_t)t * H, w.wk,
                                      kdst + (size_t)(ctx_len + t) * kvdim, kvdim, H, st);
@@ -2390,7 +2579,10 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
                                         q_pos0, /*k_pos0_cache=*/s.kv_base, window, causal, scale,
                                         st, s.fa_m, s.fa_l, s.fa_acc);
 
-        if (fast16) {
+        if (nv) {
+            s.nv_proj(s.attn, q81(s.attn, qdim), BW, qdim, w.nv_wo, s.ao, H, nullptr, nullptr, 0,
+                      nullptr, nullptr, 0, st);
+        } else if (fast16) {
             if (w.q8_wo.q4 && dp4a_o)
                 dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
                     q81(s.attn, qdim), w.q8_wo.q4, nullptr, nullptr,
@@ -2415,7 +2607,10 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
         dflash_kernels::launch_add_rms(s.x, s.ao, s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st,
                                        dp4a_gu ? s.xq81 : nullptr);
         hn_ready = dp4a_gu;
-        if (fast16) {
+        if (nv) {
+            s.nv_proj(s.hn, hn_ready ? s.xq81 : q81(s.hn, H), BW, H, w.nv_gate, s.gate, I,
+                      w.nv_up, s.up, I, nullptr, nullptr, 0, st);
+        } else if (fast16) {
             if (w.q8_gate.q4 && dp4a_gu)
                 dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
                     hn_ready ? s.xq81 : q81(s.hn, H), w.q8_gate.q4, w.q8_up.q4, nullptr,
@@ -2439,7 +2634,10 @@ bool DFlashDraftModel::forward_block_body(const void* target_hidden, int ctx_len
             }
         }
         dflash_kernels::launch_swiglu(s.gate, s.up, s.gate, BW * I, st);
-        if (fast16) {
+        if (nv) {
+            s.nv_proj(s.gate, q81(s.gate, I), BW, I, w.nv_down, s.down, H, nullptr, nullptr, 0,
+                      nullptr, nullptr, 0, st);
+        } else if (fast16) {
             if (w.q8_down.q4 && dp4a_down)
                 dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
                     q81(s.gate, I), w.q8_down.q4, nullptr, nullptr,
@@ -2799,7 +2997,7 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
     if (!s.tp_peer) return forward_blocks_body(n, seg, proposals, stream, -1);
     // Split: rank 0 picks the path (it holds the head-side state the choice reads) and both ranks
     // take it. Per-session declines of forward_block are rank-0-only too, so they are checked here.
-    if (!s.fc || !s.embed || !s.lm_head) return false;
+    if ((!s.fc && !s.nv_fc) || !s.embed || !s.lm_head) return false;
     for (int j = 0; j < n; j++)
         if (!seg[j].ids || !seg[j].out_argmax) return false;
     std::vector<int> past(n), ctx_off(n);
@@ -2956,8 +3154,12 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
                 cu(cudaMemsetAsync(dst, 0, bytes, st), "multi ctx half zero");
             }
         }
-        proj(q81(s.m_th, fk, ctx_total), s.q8_fc, nullptr, nullptr, s.m_tp, nullptr, nullptr,
-             H, 0, 0, fk, ctx_total);
+        if (s.nv_on)
+            s.nv_proj(s.m_th, nullptr, ctx_total, fk, s.nv_fc, s.m_tp, H, nullptr, nullptr, 0,
+                      nullptr, nullptr, 0, st);
+        else
+            proj(q81(s.m_th, fk, ctx_total), s.q8_fc, nullptr, nullptr, s.m_tp, nullptr, nullptr,
+                 H, 0, 0, fk, ctx_total);
         if (!s.fc_split)
             dflash_kernels::launch_rms(s.m_tp, s.hidden_norm, s.m_tp, ctx_total, H, c.rms_eps, st);
     }
@@ -2981,10 +3183,17 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
     for (int L = 0; L < c.n_layers; L++) {
         const auto& w = s.layers[L];
         if (L == 0) dflash_kernels::launch_rms(s.m_x, w.input_norm, s.m_xn, rows, H, c.rms_eps, st);
-        proj(xn_ready ? s.m_xq81 : q81(s.m_xn, H, rows), w.q8_wq, &w.q8_wk, &w.q8_wv, s.m_q,
-             s.m_knew, s.m_vnew, qdim, kvdim, kvdim, H, rows);
-        proj(q81(s.m_tp, H, ctx_total), w.q8_wk, &w.q8_wv, nullptr, s.m_kctx, s.m_vctx, nullptr,
-             kvdim, kvdim, 0, H, ctx_total);
+        if (s.nv_on) {
+            s.nv_proj(s.m_xn, xn_ready ? s.m_xq81 : q81(s.m_xn, H, rows), rows, H, w.nv_wq, s.m_q,
+                      qdim, w.nv_wk, s.m_knew, kvdim, w.nv_wv, s.m_vnew, kvdim, st);
+            s.nv_proj(s.m_tp, nullptr, ctx_total, H, w.nv_wk, s.m_kctx, kvdim, w.nv_wv, s.m_vctx,
+                      kvdim, nullptr, nullptr, 0, st);
+        } else {
+            proj(xn_ready ? s.m_xq81 : q81(s.m_xn, H, rows), w.q8_wq, &w.q8_wk, &w.q8_wv, s.m_q,
+                 s.m_knew, s.m_vnew, qdim, kvdim, kvdim, H, rows);
+            proj(q81(s.m_tp, H, ctx_total), w.q8_wk, &w.q8_wv, nullptr, s.m_kctx, s.m_vctx,
+                 nullptr, kvdim, kvdim, 0, H, ctx_total);
+        }
         const bool causal = kForceCausal ||
                             (mixed_causal && L < (int)c.sliding_layers.size() && c.sliding_layers[L]);
         for (int j = 0; j < n; j++) {
@@ -3021,15 +3230,28 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
                                             g.pos0, /*k_pos0_cache=*/0, /*window=*/0, causal, scale,
                                             st, s.fa_m, s.fa_l, s.fa_acc);
         }
-        proj(q81(s.m_attn, qdim, rows), w.q8_wo, nullptr, nullptr, s.m_ao, nullptr, nullptr,
-             H, 0, 0, qdim, rows);
+        if (s.nv_on)
+            s.nv_proj(s.m_attn, q81(s.m_attn, qdim, rows), rows, qdim, w.nv_wo, s.m_ao, H, nullptr,
+                      nullptr, 0, nullptr, nullptr, 0, st);
+        else
+            proj(q81(s.m_attn, qdim, rows), w.q8_wo, nullptr, nullptr, s.m_ao, nullptr, nullptr,
+                 H, 0, 0, qdim, rows);
         if (split) tp_allreduce_bf16_on(s.m_ao, (size_t)rows * H, st);
         dflash_kernels::launch_add_rms(s.m_x, s.m_ao, s.m_h, w.post_norm, s.m_hn, rows, H,
                                        c.rms_eps, st, s.m_xq81);
-        proj(s.m_xq81, w.q8_gate, &w.q8_up, nullptr, s.m_gate, s.m_up, nullptr, I, I, 0, H, rows);
+        if (s.nv_on) {
+            s.nv_proj(s.m_hn, s.m_xq81, rows, H, w.nv_gate, s.m_gate, I, w.nv_up, s.m_up, I,
+                      nullptr, nullptr, 0, st);
+        } else {
+            proj(s.m_xq81, w.q8_gate, &w.q8_up, nullptr, s.m_gate, s.m_up, nullptr, I, I, 0, H, rows);
+        }
         dflash_kernels::launch_swiglu(s.m_gate, s.m_up, s.m_gate, rows * I, st);
-        proj(q81(s.m_gate, I, rows), w.q8_down, nullptr, nullptr, s.m_down, nullptr, nullptr,
-             H, 0, 0, I, rows);
+        if (s.nv_on)
+            s.nv_proj(s.m_gate, q81(s.m_gate, I, rows), rows, I, w.nv_down, s.m_down, H, nullptr,
+                      nullptr, 0, nullptr, nullptr, 0, st);
+        else
+            proj(q81(s.m_gate, I, rows), w.q8_down, nullptr, nullptr, s.m_down, nullptr, nullptr,
+                 H, 0, 0, I, rows);
         if (split) tp_allreduce_bf16_on(s.m_down, (size_t)rows * H, st);
         const bf16* next_norm = (L + 1 < c.n_layers) ? s.layers[L + 1].input_norm : s.final_norm;
         dflash_kernels::launch_add_rms(s.m_h, s.m_down, s.m_x, next_norm, s.m_xn, rows, H,
