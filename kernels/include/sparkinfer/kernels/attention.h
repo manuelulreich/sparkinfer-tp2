@@ -219,10 +219,10 @@ void launch_fa_kv_compact_view_pure(const int* seq_lens, const int* block_table,
 void launch_fa_kv_compact_view_pure_rows(const int* seq_lens, const int* block_table,
     int* view_table, int* view_len, int block_size, int window_w, int n_view, int max_blocks,
     int rows, cudaStream_t stream = nullptr);
-// (plan 07, B1) The verify's long-context int8 split for rows in pairs of one session (pairs[2p],
+// (plan 07, B1) The verify's long-context int8 / fp8 / nvfp4 split for rows in pairs of one session (pairs[2p],
 // pairs[2p + 1], -1 = none): one K/V read for both, bit-identical to launch_flash_decode_split on
-// each row. False (nothing launched) where that call would not take the int8 6:1 tensor-core
-// kernel. Then the combine over all num_seqs rows, as launch_flash_decode_split does.
+// each row. False (nothing launched) where that call would not take a 6:1 tensor-core kernel.
+// Then the combine over all num_seqs rows, as launch_flash_decode_split does.
 bool launch_flash_decode_split_pairs(
     const void* q, const void* k_pool, const void* v_pool,
     const int* block_table, const int* seq_lens, const int* pairs, int n_pairs, void* out,

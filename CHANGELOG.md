@@ -111,8 +111,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   whole prompt as context, past the draft's 16384 maximum, and failed, so such a request decoded
   without the drafter. It now starts the draft's context where the capture starts (as after a
   prefix-cache hit). A 25.6k-token prompt: 49.6 -> 74-76 tok/s.
-- **tp=2 verify attention reads the KV once per pair of a session's rows** at long context (int8
-  KV, the 6:1 tensor-core split): the second row's six query heads ride in the mma's unused rows.
+- **tp=2 verify attention reads the KV once per pair of a session's rows** at long context (int8,
+  fp8 and nvfp4 KV, the 6:1 tensor-core splits): the second row's six query heads ride in the mma's
+  unused rows. fp8 / nvfp4, 8 rows behind 14k: verify 27.4 -> 26.5 / 29.6 -> 27.7 ms.
   Bit-identical to the per-row kernel (checked in-server over 5000 calls, one and two sessions).
   Verify at depth 6 behind 25.6k: 30.3 -> 28.9 ms; 7 lookup rows behind 14k: 28.8 -> 27.6 ms.
   `SPARKINFER_FA_PAIRS=0` turns it off.
