@@ -1059,7 +1059,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // cannot fail on one rank alone mid-pass (see kernels::prefill_kvq_reserve). Sized for all
     // KV heads: the attention launch below passes the rank's share only on the tp wide branch.
     if (a.ok && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer &&
-        !kernels::prefill_kvq_reserve(pos0 + N, c.n_kv_heads, c.head_dim, s.kv->block_size()))
+        !kernels::prefill_kvq_reserve(pos0 + N, c.n_kv_heads, c.head_dim, s.kv->block_size(),
+                                      (int)s.kv->kv_dtype()))
         a.ok = false;
     // Headroom: the arena used to take the card down to a few MB, and whatever the pass or the
     // engine allocated next -- a session's state, the draft's capture rows, a CUDA stream --

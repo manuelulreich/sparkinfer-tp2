@@ -2271,17 +2271,77 @@ __global__ void pf_kv_dequant_kernel(const void* __restrict__ k_pool, const void
         *reinterpret_cast<uint4*>(vd + drow * head_dim + d) = *reinterpret_cast<const uint4*>(vb);
     }
 }
+// nvfp4 KV -> an e4m3 plane in the KV_FP8 layout (one byte per element, fp16 scale amax/448 per
+// (token, kv head)), for the e4m3 tensor-core attention. One warp per row of head_dim 256, eight
+// elements a lane. The nvfp4 value e2m1 * e4m3(block) * g has up to five significant bits, so the
+// e4m3 code rounds it once more (relative error <= 2^-4, the fp8 cache's own resolution).
+__global__ void pf_kv_nvfp4_to_e4m3_kernel(const void* __restrict__ k_pool, const void* __restrict__ v_pool,
+                                           const __half* __restrict__ k_scale, const __half* __restrict__ v_scale,
+                                           const int* __restrict__ block_table,
+                                           unsigned char* __restrict__ kd, unsigned char* __restrict__ vd,
+                                           __half* __restrict__ kds, __half* __restrict__ vds,
+                                           int n_kv_heads, int block_size) {
+    constexpr int HD = 256;
+    const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x, d = lane * 8;
+    const int phys = block_table[t / block_size];
+    const size_t srow = ((size_t)phys * block_size + t % block_size) * n_kv_heads + h;
+    const size_t drow = (size_t)t * n_kv_heads + h;
+    #pragma unroll
+    for (int kv = 0; kv < 2; kv++) {
+        const void* pool = kv ? v_pool : k_pool;
+        const float s = __half2float((kv ? v_scale : k_scale)[srow]);
+        float f[8];
+        kvq_load8<KVQ_NVFP4>(pool, srow * HD + d, HD, s, f);
+        float amax = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(f[j]));
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const __half dh = __float2half(amax / 448.0f);
+        const float dq = __half2float(dh);
+        const float inv = (amax == 0.f || dq == 0.f) ? 0.f : 1.0f / dq;
+        unsigned w[2] = {0u, 0u};
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            w[j >> 2] |= (unsigned)kvq_f2e4m3(f[j] * inv) << (8 * (j & 3));
+        *reinterpret_cast<uint2*>((kv ? vd : kd) + drow * HD + d) = make_uint2(w[0], w[1]);
+        if (lane == 0) (kv ? vds : kds)[drow] = dh;
+    }
+}
 __global__ void pf_iota_kernel(int* p, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) p[i] = i;
 }
 }  // namespace
 
+// The e4m3 tensor-core attention (launch_prefill_attn_mma_f8) serves fp8 KV straight from the
+// pool and nvfp4 KV through an 8-bit plane; it needs sm_89+ and head_dim 256. Same env switch as
+// the launcher, read here too so the reservation matches the path the pass will take.
+static bool kvq_f8_path(int head_dim) {
+    static const bool env_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_F8");
+        return !(e && e[0] == '0');
+    }();
+    if (!env_on || head_dim != 256) return false;
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return major * 10 + minor >= 89;
+}
+
 // Grow the thread's dequant plane + identity table to cover `total` tokens of history.
-static bool kvq_ensure(int total, int n_kv_heads, int head_dim, int block_size, cudaStream_t stream) {
+// e4m3: one byte per element plus the two fp16 scale rows, instead of two bf16 bytes.
+static bool kvq_ensure(int total, int n_kv_heads, int head_dim, int block_size, cudaStream_t stream,
+                       bool e4m3 = false) {
     const int n_blk = (total + block_size - 1) / block_size;
     const size_t plane = (size_t)n_blk * block_size * n_kv_heads * head_dim;   // elements
-    const size_t bytes = 2 * plane * sizeof(__nv_bfloat16);
+    const size_t rows  = (size_t)n_blk * block_size * n_kv_heads;
+    const size_t bytes = e4m3 ? 2 * plane + 2 * rows * sizeof(__half)
+                              : 2 * plane * sizeof(__nv_bfloat16);
     if (bytes > g_kvdq_bytes) {
         if (g_kvdq) { cudaFree(g_kvdq); g_kvdq = nullptr; g_kvdq_bytes = 0; note_prefill_scratch_moved(); }
         if (cudaMalloc(&g_kvdq, bytes) != cudaSuccess) { cudaGetLastError(); g_kvdq = nullptr; return false; }
@@ -2299,11 +2359,15 @@ static bool kvq_ensure(int total, int n_kv_heads, int head_dim, int block_size, 
     return true;
 }
 
-bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size) {
+bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size, int kv_fmt) {
     if (total_tokens <= 0 || n_kv_heads <= 0 || head_dim <= 0 || block_size <= 0) return true;
+    // fp8 on the e4m3 attention reads the pool itself: no plane to reserve.
+    const bool f8 = kvq_f8_path(head_dim);
+    if (f8 && kv_fmt == KVQ_FP8) return true;
     // The identity table is filled on the legacy stream; the pass's stream orders after it
     // through the synchronous cudaMalloc/cudaFree semantics of the arena that follows.
-    const bool ok = kvq_ensure(total_tokens, n_kv_heads, head_dim, block_size, nullptr);
+    const bool ok = kvq_ensure(total_tokens, n_kv_heads, head_dim, block_size, nullptr,
+                               f8 && kv_fmt == KVQ_NVFP4);
     if (ok) cudaStreamSynchronize(nullptr);
     return ok;
 }
@@ -2312,11 +2376,40 @@ static bool prefill_attn_kvq_dequant(
     const void* q, const void* k_pool, const void* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, float scale, int win_blocks, cudaStream_t stream, int q_pos0, int kv_fmt) {
+    int block_size, float scale, int win_blocks, cudaStream_t stream, int q_pos0, int kv_fmt,
+    int max_blocks_per_seq) {
     if (win_blocks > 0 || head_dim % 8 != 0) return false;   // full attention only
     const int total = q_pos0 + n_tokens;
     const int n_blk = (total + block_size - 1) / block_size;
     const size_t plane = (size_t)n_blk * block_size * n_kv_heads * head_dim;   // elements
+    // e4m3 tensor cores: fp8 straight off the paged pool; nvfp4 through an e4m3 plane of the
+    // history (identity block table, like the bf16 plane below but half its bytes).
+    if (kvq_f8_path(head_dim)) {
+        if (kv_fmt == KVQ_FP8 &&
+            launch_prefill_attn_mma_f8(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+                                       n_tokens, n_q_heads, n_kv_heads, head_dim, block_size,
+                                       max_blocks_per_seq, scale, 0, stream, q_pos0))
+            return true;
+        if (kv_fmt == KVQ_NVFP4 && block_size == 16 &&
+            kvq_ensure(total, n_kv_heads, head_dim, block_size, stream, true)) {
+            cudaGetLastError();
+            const size_t rows = (size_t)n_blk * block_size * n_kv_heads;
+            unsigned char* kd8 = reinterpret_cast<unsigned char*>(g_kvdq);
+            unsigned char* vd8 = kd8 + plane;
+            __half* kds = reinterpret_cast<__half*>(vd8 + plane);
+            __half* vds = kds + rows;
+            pf_kv_nvfp4_to_e4m3_kernel<<<dim3(total, n_kv_heads), 32, 0, stream>>>(
+                k_pool, v_pool, reinterpret_cast<const __half*>(k_scale),
+                reinterpret_cast<const __half*>(v_scale), block_table, kd8, vd8, kds, vds,
+                n_kv_heads, block_size);
+            if (cudaPeekAtLastError() == cudaSuccess &&
+                launch_prefill_attn_mma_f8(q, kd8, vd8, kds, vds, g_kvdq_ident, attn, n_tokens,
+                                           n_q_heads, n_kv_heads, head_dim, block_size, n_blk,
+                                           scale, 0, stream, q_pos0))
+                return true;
+            cudaGetLastError();
+        }
+    }
     if (!kvq_ensure(total, n_kv_heads, head_dim, block_size, stream)) return false;
     __nv_bfloat16* kd = reinterpret_cast<__nv_bfloat16*>(g_kvdq);
     __nv_bfloat16* vd = kd + plane;
@@ -2360,7 +2453,8 @@ bool launch_prefill_attn_int8_paged(
     if (kv_fmt == 2 || kv_fmt == 3)
         return prefill_attn_kvq_dequant(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
                                         n_tokens, n_q_heads, n_kv_heads, head_dim, block_size,
-                                        scale, win_blocks, stream, q_pos0, kv_fmt);
+                                        scale, win_blocks, stream, q_pos0, kv_fmt,
+                                        max_blocks_per_seq);
     // int8 tensor-core prefill attention: same mask + online softmax as the scalar path below,
     // run on the wmma int8 cores (the scalar kernels are compute-bound at ~8 TFLOP/s). Honours the
     // caller's per-layer window (zero means global/full). SPARKINFER_PREFILL_ATTN_MMA=0 falls through.

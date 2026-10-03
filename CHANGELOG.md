@@ -7,6 +7,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **fp8 and nvfp4 KV: prefill attention on the e4m3 tensor cores** (`SPARKINFER_PREFILL_ATTN_F8=0`
+  restores the bf16 path). The int8 kernel's tiers, loads and V repack now also run e4m3 codes:
+  Q and P' are quantized to e4m3 instead of int8 and both products use the e4m3 MMA with f32
+  sums. fp8 KV is read straight from the pool (no bf16 copy of the history); nvfp4 KV is first
+  rewritten into an e4m3 copy (half the bytes of the old bf16 one). On the RTX 50 cards the plain
+  f32-accumulate e4m3 MMA runs at half the int8 rate and the block-scaled form at the full rate
+  (bit-identical with unit scales), so the kernel is also built for sm_120a in its own library
+  (`si_attn_f8`). 2× RTX 5060 Ti, tp=2, `--ctx 131072`, prefill tok/s:
+
+  | KV | 60k before | 60k after | 118k before | 118k after |
+  |---|---:|---:|---:|---:|
+  | fp8 | 2168 | 2782 | 1569 | 2262 |
+  | nvfp4 | 2169 | 2778 | 1574 | 2269 |
+  | int8 (unchanged) | 2935 | | 2471 | |
+
+  Teacher-forced KL against bf16 KV (`/v1/score`, ~150 positions at 1k/4k/16k/48k) is unchanged:
+  fp8 0.062 / 0.055 / 0.052 / 0.458 (was 0.053 / 0.058 / 0.063 / 0.487), nvfp4 0.057 / 0.079 /
+  0.065 / 0.483 (was 0.068 / 0.072 / 0.063 / 0.515), int8 0.056 / 0.055 / 0.056 / 0.465.
+
 - **FP8 (e4m3) and NVFP4 KV cache for the Qwen3.5/3.6/3.8 hybrids:
   `SPARKINFER_KV_DTYPE=bf16|int8|fp8|nvfp4`.** fp8 uses the int8 cache's layout (one byte per
   element plus one fp16 scale per token and KV head, here amax/448). nvfp4 stores each head

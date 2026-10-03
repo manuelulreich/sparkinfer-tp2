@@ -35,6 +35,20 @@ bool launch_prefill_attn_mma(
     cudaStream_t stream = nullptr,
     int q_pos0 = 0);
 
+// fp8 (e4m3) twin of the entry above: the same kernel and tiers on a KV_FP8 pool (one e4m3 byte
+// per element, fp16 scale per (token, kv head) = amax/448 -- the int8 pool's layout), with Q and P'
+// quantized to e4m3 and both products on the e4m3 tensor cores (f32 sums). Also serves nvfp4 KV
+// through an e4m3 plane of the history (batched_prefill.cu). Returns false when no tier covers the
+// shape or below sm_89, so the caller keeps its bf16 path.
+//   SPARKINFER_PREFILL_ATTN_F8  (default 1)  0 = the dequantize-to-bf16 path (A/B in one binary).
+bool launch_prefill_attn_mma_f8(
+    const void* q, const void* k_pool, const void* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks,
+    cudaStream_t stream = nullptr,
+    int q_pos0 = 0);
+
 // BF16-KV twin, full causal, hd256 GQA. The int8 entry above cannot serve a bf16 KV pool, and the
 // bf16 pool is what the DSpark harness runs (dspark_tau_check pins int8_kv=false), so without this
 // the bf16 branch falls to a scalar warp-per-query kernel. Returns false when the shape is not

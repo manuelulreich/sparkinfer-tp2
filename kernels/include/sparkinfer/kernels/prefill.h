@@ -236,13 +236,17 @@ bool launch_prefill_attn_int8_paged(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int block_size, int max_blocks_per_seq, float scale, int win_blocks,
     cudaStream_t stream = nullptr, int q_pos0 = 0, int kv_fmt = 1);
-// kv_fmt 2 (fp8) / 3 (nvfp4) above: the history [0, q_pos0 + n_tokens) is dequantized from the
-// pool into a bf16 scratch plane (identity block table) and run through
-// launch_prefill_attn_bf16_paged; full attention only (win_blocks must be 0).
+// kv_fmt 2 (fp8) / 3 (nvfp4) above: on sm_89+ (hd 256) the e4m3 tensor-core attention runs fp8
+// straight off the pool and nvfp4 through an e4m3 plane of the history; otherwise the history
+// [0, q_pos0 + n_tokens) is dequantized into a bf16 scratch plane (identity block table) and run
+// through launch_prefill_attn_bf16_paged. Full attention only (win_blocks must be 0).
 // That plane grows on demand, which at tp>1 could fail on one card only -- in the middle of the
 // layer loop, after which the ranks' all-reduces no longer pair up. prefill_kvq_reserve sizes it
 // (on the calling thread, which owns it) for a pass up to `total_tokens` of history, so the
 // windowed prefill can take it with its arena, where the ranks agree. false = it does not fit.
-bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size);
+// kv_fmt picks the plane: fp8 on the e4m3 attention needs none, nvfp4 an e4m3 plane (half the
+// bf16 one); otherwise the bf16 plane.
+bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size,
+                         int kv_fmt = 3);
 
 }} // namespace sparkinfer::kernels

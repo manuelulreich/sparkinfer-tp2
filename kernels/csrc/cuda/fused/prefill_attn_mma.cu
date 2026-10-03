@@ -45,7 +45,9 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <mma.h>
+#include <type_traits>
 
 #include <cstdio>
 #include <cstdlib>
@@ -379,11 +381,44 @@ __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4]
                  : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+// The fp8 (e4m3) twin. m16n8k32 e4m3 has exactly the s8 fragment layout (8-bit elements, the same
+// lane -> row/k map for A, B and D), so every operand load, permutation and repack of the int8
+// kernel carries over byte for byte; only the codes and the accumulator type differ.
+__device__ __forceinline__ void pf_mma_16832(float (&d)[4], const unsigned (&a)[4],
+                                             unsigned b0, unsigned b1) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
+    // sm_120a: the block-scaled form with unit ue8m0 scales (0x7F = 2^0). On the RTX 50 parts the
+    // plain f32-accumulate e4m3 mma issues at HALF the int8 rate, the block-scaled one at the full
+    // rate, and with unit scales the two are bit-identical (measured: 229 vs 115 TOPS on a
+    // 5060 Ti, outputs equal over random e4m3 operands).
+    const unsigned one = 0x7F7F7F7Fu;
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X"
+                 ".f32.e4m3.e4m3.f32.ue8m0 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0,0}, %10, {0,0};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(one));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();   // launch_prefill_attn_mma_f8 declines below sm_89
+#endif
+}
+// Q and P' codes. int8 rounds to nearest (Q ties away, as it always has); e4m3 saturates at 448.
+template <bool F8>
+__device__ __forceinline__ signed char pf_code(float x) {
+    if constexpr (F8) return (signed char)__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+    else return (signed char)__float2int_rn(x);
+}
 
 // SINK=false drops the always-attended block 0, giving the PURE sliding window Muse Glimmer's
 // SWA layers use. Defaulted true, so every existing instantiation compiles to what it did before.
+// F8: the pool holds e4m3 codes (KV_FP8, same bytes and scale layout as int8, scale amax/448);
+// Q and P' are quantized to e4m3 and both products run on the e4m3 tensor cores with f32 sums.
 template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1,
-          bool SINK = true>
+          bool SINK = true, bool F8 = false>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
@@ -467,6 +502,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     // (see the V load), so the epilogue writes s_o itself instead of store_matrix_sync's fixed
     // one. Element e of a lane is row (e&2 ? rhi : rlo), dim 4*(lane&3) + 2*(e&1) + (e>>2).
     float ofr[RQH][DPW][8];
+    using AccT = typename std::conditional<F8, float, int>::type;   // the mma's sum type
     // A 16x16 accumulator gives every lane 8 elements spread over exactly TWO query rows, so the
     // per-row P quantum and the online-softmax correction the PV epilogue applies are two values
     // per head, not eight. The map: the fragment is two m16n8 halves and in each half a lane holds
@@ -507,7 +543,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             }
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-            const float d = amax / 127.0f;
+            const float d = amax / (F8 ? 448.0f : 127.0f);
             // The softmax scale and log2(e) are per-kernel constants and the Q scale is per row,
             // so all three fold into one number here -- once per row per block instead of once
             // per score. Folding log2(e) in is what lets the online softmax use a bare ex2:
@@ -520,7 +556,8 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             for (int e = 0; e < QE; e++)
                 s_qi[((size_t)h * BM + r) * qld
                      + (WIDEK ? pf_kperm(lane + e * 32) : (lane + e * 32))] =
-                    (signed char)((amax == 0.f) ? 0 : (int)roundf(qv[e] / d));
+                    (amax == 0.f) ? (signed char)0
+                    : (F8 ? pf_code<true>(qv[e] / d) : (signed char)(int)roundf(qv[e] / d));
         }
     }
     if (tid < RQH * BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
@@ -628,7 +665,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             auto qk_group = [&](auto H0T) {
                 constexpr int h0 = decltype(H0T)::value;
                 if (warp >= gblk) return;
-                int acc[SPL][2][4];
+                AccT acc[SPL][2][4];
                 #pragma unroll
                 for (int hp = 0; hp < SPL; hp++)
                     #pragma unroll
@@ -667,13 +704,20 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 const int dr = lane >> 2, dc = 2 * (lane & 3);
                 #pragma unroll
                 for (int hp = 0; hp < SPL; hp++) {
-                    int* sp = reinterpret_cast<int*>(s_s) + (size_t)hp * BM * SPLD + warp * 16;
+                    AccT* sp = reinterpret_cast<AccT*>(s_s) + (size_t)hp * BM * SPLD + warp * 16;
                     #pragma unroll
                     for (int t = 0; t < 2; t++) {
-                        *reinterpret_cast<int2*>(sp + dr * SPLD + t * 8 + dc) =
-                            make_int2(acc[hp][t][0], acc[hp][t][1]);
-                        *reinterpret_cast<int2*>(sp + (dr + 8) * SPLD + t * 8 + dc) =
-                            make_int2(acc[hp][t][2], acc[hp][t][3]);
+                        if constexpr (F8) {
+                            *reinterpret_cast<float2*>(sp + dr * SPLD + t * 8 + dc) =
+                                make_float2(acc[hp][t][0], acc[hp][t][1]);
+                            *reinterpret_cast<float2*>(sp + (dr + 8) * SPLD + t * 8 + dc) =
+                                make_float2(acc[hp][t][2], acc[hp][t][3]);
+                        } else {
+                            *reinterpret_cast<int2*>(sp + dr * SPLD + t * 8 + dc) =
+                                make_int2(acc[hp][t][0], acc[hp][t][1]);
+                            *reinterpret_cast<int2*>(sp + (dr + 8) * SPLD + t * 8 + dc) =
+                                make_int2(acc[hp][t][2], acc[hp][t][3]);
+                        }
                     }
                 }
             };
@@ -770,20 +814,28 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                         #pragma unroll
                         for (int v = 0; v < VU; v++) {
                             const int t0 = (v * 32 + lane) * VW;
-                            const int4 raw = *reinterpret_cast<const int4*>(s_si + r * SPLD + t0);
-                            const int rw[VW] = {raw.x, raw.y, raw.z, raw.w};
+                            float rw[VW];
+                            if constexpr (F8) {
+                                const float4 raw = *reinterpret_cast<const float4*>(
+                                    reinterpret_cast<const float*>(s_si) + r * SPLD + t0);
+                                rw[0] = raw.x; rw[1] = raw.y; rw[2] = raw.z; rw[3] = raw.w;
+                            } else {
+                                const int4 raw = *reinterpret_cast<const int4*>(s_si + r * SPLD + t0);
+                                rw[0] = (float)raw.x; rw[1] = (float)raw.y;
+                                rw[2] = (float)raw.z; rw[3] = (float)raw.w;
+                            }
                             #pragma unroll
                             for (int j = 0; j < VW; j++) {
                                 const int u = v * VW + j;
                                 if constexpr (FULL) {
-                                    sc[u] = (float)rw[j] * qs * PF_KS(u);
+                                    sc[u] = rw[j] * qs * PF_KS(u);
                                 } else {
                                     const int t = t0 + j, gtok = k0 + t;
                                     const bool live =
                                         (t < gblk * 16) && (gtok < hi) && (qtok < n_tokens) &&
                                         (gtok <= q_pos0 + qtok) &&
                                         (win_blocks <= 0 || (SINK && gtok < BLKSZ) || gtok >= blk_rs);
-                                    sc[u] = live ? (float)rw[j] * qs * PF_KS(u) : -1e30f;
+                                    sc[u] = live ? rw[j] * qs * PF_KS(u) : -1e30f;
                                 }
                                 mx = fmaxf(mx, sc[u]);
                             }
@@ -836,11 +888,11 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                                 pamax  = fmaxf(pamax, __shfl_xor_sync(0xffffffffu, pamax, o));
                             }
                         }
-                        const float pd = pamax / 127.0f;
+                        const float pd = pamax / (F8 ? 448.0f : 127.0f);
                         // The quantum is per row, so its reciprocal and its zero test are per row
                         // too: an all-zero row makes ipd zero and every P' falls out as zero,
                         // which is what the per-column ternary used to spell out GN/32 times.
-                        const float ipd = (pamax == 0.f) ? 0.f : 127.0f / pamax;
+                        const float ipd = (pamax == 0.f) ? 0.f : (F8 ? 448.0f : 127.0f) / pamax;
                         if (lane == 0) { s_m[h * BM + r] = m_new; s_l[h * BM + r] = s_l[h * BM + r] * corr + sum;
                                          s_ps[h * BM + r] = pd; s_corr[h * BM + r] = corr; }
                         // gblk*16 is a multiple of 16 and t0 of VW, so a lane's VW columns are
@@ -856,8 +908,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                                 unsigned packed = 0u;
                                 #pragma unroll
                                 for (int j = 0; j < VW; j++) {
-                                    const signed char q8 =
-                                        (signed char)__float2int_rn(sc[v * VW + j] * ipd);
+                                    const signed char q8 = pf_code<F8>(sc[v * VW + j] * ipd);
                                     packed |= ((unsigned)(unsigned char)q8) << (8 * j);
                                 }
                                 *reinterpret_cast<unsigned*>(s_pih + r * pstr + t0) = packed;
@@ -921,7 +972,7 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             #pragma unroll
             for (int dd = 0; dd < DPW; dd++) {
                 const int dt = warp * DPW + dd;
-                int cf[RQH][2][4];
+                AccT cf[RQH][2][4];
                 #pragma unroll
                 for (int h = 0; h < RQH; h++)
                     #pragma unroll
@@ -1163,7 +1214,7 @@ const signed char* vpack_build(const signed char* v_pool, const int* block_table
 }  // namespace
 
 template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1,
-          bool SINK = true>
+          bool SINK = true, bool F8 = false>
 static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
                             const void* k_scale, const void* v_scale, const int* block_table,
                             void* attn, int n_tokens, int n_q_heads, int n_kv_heads,
@@ -1215,13 +1266,13 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
                             + (size_t)2 * GN * sizeof(__half)
                             + (size_t)5 * RQH * BM * sizeof(float);
         const cudaError_t ce = cudaFuncSetAttribute(
-            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU, SINK>,
+            pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU, SINK, F8>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_max);
         if (ce != cudaSuccess && sm_max > 48u * 1024u) return false;  // opt-in refused where required
         cfg[dev] = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
-    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU, SINK><<<grid, GROUP_BLKS * 32, sm, stream>>>(
+    pf_attn_mma_gqa_kernel<HD, GROUP_BLKS, RQH, PLANES, VT, WIDEK, PVU, SINK, F8><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
@@ -1241,8 +1292,9 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
         announced[dev] = true;
         fprintf(stderr,
                 "[pf-attn-tier] RQH=%d SPL=%d GB=%d GN=%d smem=%zu qld=%d pld=%d n=%d vt=%d "
-                "widek=%d pvu=%d ok=%d\n",
-                RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)VT, (int)WIDEK, PVU, (int)ok);
+                "widek=%d pvu=%d f8=%d ok=%d\n",
+                RQH, SPL, GROUP_BLKS, GN, sm, qld, pld, n_tokens, (int)VT, (int)WIDEK, PVU, (int)F8,
+                (int)ok);
     }
     return ok;
 }
@@ -1252,6 +1304,7 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
 // launcher's hardcoded HD=256 and the sink. GROUP_BLKS must divide both BM(16) and HEAD_DIM/16,
 // which at hd128 is 8 -- so GB=8, NOT the hd256 default of 16. RQH=4 divides the GQA group of 16.
 // Returns false if the tier declines, so the caller keeps its own kernel.
+#ifndef SPARKINFER_ATTN_F8_TU
 bool launch_prefill_attn_mma_muse_hd128(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
@@ -1312,7 +1365,10 @@ bool launch_prefill_attn_mma_muse_hd128(
         block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0);
 }
 
-bool launch_prefill_attn_mma(
+#endif  // !SPARKINFER_ATTN_F8_TU
+
+template <bool F8>
+static bool prefill_attn_mma_tiers(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
@@ -1405,7 +1461,7 @@ bool launch_prefill_attn_mma(
     // 48 KB default — and finally to the per-q-head kernel below, instead of
     // returning success over an output buffer nothing wrote.
     if (gqa_rqh == 4 && gqa % 4 == 0 &&
-        launch_attn_gqa<HD, GROUP_BLKS, 4>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+        launch_attn_gqa<HD, GROUP_BLKS, 4, 0, false, false, 1, true, F8>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
         return true;
     // RQH=3 exists for GQA-6 (this checkpoint: 24 q-heads over 4 kv-heads), where 4 does not
@@ -1473,10 +1529,10 @@ bool launch_prefill_attn_mma(
         const signed char* vt =
             vpack_build(v_pool, block_table, n_blk, n_kv_heads, HD, stream);
         if (vt && (wide_k
-                ? launch_attn_gqa<HD, 16, 6, 2, true, true, 2>(q, k_pool, v_pool, k_scale, v_scale,
+                ? launch_attn_gqa<HD, 16, 6, 2, true, true, 2, true, F8>(q, k_pool, v_pool, k_scale, v_scale,
                       block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
                       max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vt)
-                : launch_attn_gqa<HD, 16, 6, 2, true, false, 1>(q, k_pool, v_pool, k_scale, v_scale,
+                : launch_attn_gqa<HD, 16, 6, 2, true, false, 1, true, F8>(q, k_pool, v_pool, k_scale, v_scale,
                       block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
                       max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vt)))
             return true;
@@ -1484,28 +1540,33 @@ bool launch_prefill_attn_mma(
         // tier and its numerics -- the fallback is the SAME six-head kernel on the paged loads,
         // not a narrower tier.
         if (wide_k
-                ? launch_attn_gqa<HD, 16, 6, 2, false, true, 2>(q, k_pool, v_pool, k_scale, v_scale,
+                ? launch_attn_gqa<HD, 16, 6, 2, false, true, 2, true, F8>(q, k_pool, v_pool, k_scale, v_scale,
                       block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
                       max_blocks_per_seq, scale, win_blocks, stream, q_pos0)
-                : launch_attn_gqa<HD, 16, 6, 2, false, false, 1>(q, k_pool, v_pool, k_scale, v_scale,
+                : launch_attn_gqa<HD, 16, 6, 2, false, false, 1, true, F8>(q, k_pool, v_pool, k_scale, v_scale,
                       block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
                       max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
             return true;
     }
     if (gqa_rqh >= 3 && gqa % 3 == 0 && n_tokens >= 2048) {
         if (gqa_gb >= 16 &&
-            launch_attn_gqa<HD, 16, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+            launch_attn_gqa<HD, 16, 3, 0, false, false, 1, true, F8>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
                 n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
             return true;
-        if (launch_attn_gqa<HD, GROUP_BLKS, 3>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+        if (launch_attn_gqa<HD, GROUP_BLKS, 3, 0, false, false, 1, true, F8>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
                 n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
             return true;
     }
     if (gqa_rqh >= 2 && gqa % 2 == 0 &&
-        launch_attn_gqa<HD, GROUP_BLKS, 2>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+        launch_attn_gqa<HD, GROUP_BLKS, 2, 0, false, false, 1, true, F8>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
             n_tokens, n_q_heads, n_kv_heads, block_size, max_blocks_per_seq, scale, win_blocks, stream, q_pos0))
         return true;
 
+    // The per-q-head kernel below is int8 only: an fp8 pool that no tier took goes back to the
+    // caller's bf16 path.
+    if constexpr (F8) {
+        return false;
+    } else {
     // Fallback: original per-q-head kernel.
     constexpr int GN = GROUP_BLKS * 16;
     const size_t sm = (size_t)BM * HD
@@ -1526,7 +1587,56 @@ bool launch_prefill_attn_mma(
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
         block_size, max_blocks_per_seq, scale, win_blocks, q_pos0);
     return true;
+    }
 }
+
+#ifndef SPARKINFER_ATTN_F8_TU
+bool launch_prefill_attn_mma(
+    const void* q, const signed char* k_pool, const signed char* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream,
+    int q_pos0) {
+    return prefill_attn_mma_tiers<false>(q, k_pool, v_pool, k_scale, v_scale, block_table, attn,
+                                         n_tokens, n_q_heads, n_kv_heads, head_dim, block_size,
+                                         max_blocks_per_seq, scale, win_blocks, stream, q_pos0);
+}
+
+#endif  // !SPARKINFER_ATTN_F8_TU
+
+// The fp8 entry is built ONCE: by prefill_attn_f8_sm120.cu (sm_120a, whole-program, the
+// block-scaled mma) when the NVFP4 kernels are built, else here with the plain e4m3 mma.
+#if defined(SPARKINFER_ATTN_F8_TU) || !defined(SPARKINFER_BUILD_NVFP4)
+bool launch_prefill_attn_mma_f8(
+    const void* q, const void* k_pool, const void* v_pool,
+    const void* k_scale, const void* v_scale, const int* block_table, void* attn,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, float scale, int win_blocks, cudaStream_t stream,
+    int q_pos0) {
+    static const bool enabled = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_F8");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled) return false;
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess)
+        return false;
+#ifdef SPARKINFER_ATTN_F8_TU
+    if (major != 12 || minor != 0) return false;  // the sm_120a cubin runs on cc 12.0 only
+#else
+    if (major * 10 + minor < 89) return false;    // no e4m3 mma
+#endif
+    return prefill_attn_mma_tiers<true>(q, reinterpret_cast<const signed char*>(k_pool),
+                                        reinterpret_cast<const signed char*>(v_pool), k_scale,
+                                        v_scale, block_table, attn, n_tokens, n_q_heads,
+                                        n_kv_heads, head_dim, block_size, max_blocks_per_seq,
+                                        scale, win_blocks, stream, q_pos0);
+}
+#endif
+
+#ifndef SPARKINFER_ATTN_F8_TU
 
 
 // ============================================================================
@@ -2204,6 +2314,8 @@ bool launch_prefill_attn_mma_bf16_vi8(
         q, k_pool, v_i8, v_scale, block_table, attn, n_tokens, n_q_heads, n_kv_heads,
         block_size, max_blocks_per_seq, scale, stream, q_pos0);
 }
+
+#endif  // !SPARKINFER_ATTN_F8_TU
 
 }  // namespace kernels
 }  // namespace sparkinfer

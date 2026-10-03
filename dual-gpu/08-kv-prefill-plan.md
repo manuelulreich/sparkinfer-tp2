@@ -84,6 +84,35 @@ Goal: fp8/nvfp4 prefill equal to int8 (2169 → ~2900 tok/s at 60k, 1570 → ~24
   0.018–0.025), the 118k retrieval prompt, `tp2_gates.py`, the lossless DSpark check (ctx 32k,
   deterministic).
 
+**A0 status: measured (2026-10-03).** RTX 5060 Ti, whole GPU at 3.1 GHz, `mma.sync` m16n8k32:
+int8 229 TOPS; e4m3 with f32 accumulate **115** (half rate, also `kind::f8f6f4`); e4m3 with f16
+accumulate 229; block-scaled `kind::mxf8f6f4 ... scale_vec::1X ... ue8m0` with f32 accumulate
+**229**, bit-identical to the plain form with unit scales (0x7F); f16/bf16 with f32 accumulate 57
+(1/4); `kind::mxf4nvf4` e2m1 x e2m1 (ue4m3, 4X) 458 (2x int8). The block-scaled forms only
+assemble for `compute_120a`. Converts: hardware `cvt.rn.f16x2.e2m1x2` 9.1 T-elem/s vs 4.1 for the
+byte_perm table path. f16 accumulation is out for QK (codes up to 448 x 448 overflow it).
+
+**A1/A2 status: done (2026-10-03).** `pf_attn_mma_gqa_kernel<..., F8>`: the int8 kernel's tiers,
+loads, k permutation and V repack unchanged (e4m3 m16n8k32 has the s8 fragment layout); Q and P'
+in e4m3, f32 sums. `prefill_attn_f8_sm120.cu` compiles it for sm_120a (library `si_attn_f8`,
+whole-program like `si_nvfp4`) with the block-scaled mma (SASS: `QMMA.SF.16832.F32.E4M3.E4M3.E8`);
+other archs get the plain mma. fp8 reads the pool, nvfp4 goes through an e4m3 plane
+(`pf_kv_nvfp4_to_e4m3_kernel`). Prefill at `--ctx 131072`: fp8 2168 -> 2782 (60k), 1569 -> 2262
+(118k); nvfp4 2169 -> 2778, 1574 -> 2269; int8 2935 / 2471. Teacher-forced KL vs bf16 KV unchanged
+(see the CHANGELOG). Gates pass. Still ~5-8 % behind int8: not profiled yet.
+
+**C0 status: measured (2026-10-03), from the 31k int8 profile.** Three windows (16384, 14592, 35),
+FFN chunk 4096. Exposed link time 4.89 s: FFN down 2.88 s (22.5 ms a call, nothing to hide behind:
+the next layer needs the whole row block), GDN out 1.39 s and attention o 0.46 s (14.4 ms a call:
+chunk 0 waits 6.8 ms behind a 1.75 ms GEMM, chunks 1-3 ~3.1 ms each), embedding 0.08 s. The link
+runs ~6.7 s of the 9.7 s pass at ~6.2 GB/s (one FIFO side stream per rank, ~0.8 ms of reduce and
+fences between copies) and sits idle for 2.87 s while the next layer's mixer runs over the full N.
+Ranked C1 levers: (1) two micro-batches per window (A.mixer, B.mixer, A.FFN, B.FFN: every
+all-reduce hides behind the other half), ~-2.5 s; (2) pipeline the next layer's row-wise front
+(residual add, norm, input projections) per down chunk, ~-0.8 s, bit-exact; (3) take the reduce
+off the copy queue, ~-0.5 s, bit-exact; (4) chunk the out/o GEMM and post each chunk's all-reduce
+early, ~-0.17 s. Floor without C2: ~6-6.6 s (link 41 GB a direction).
+
 ## Part B: nvfp4 decode at memory bandwidth
 
 Goal: nvfp4 decode faster than fp8 at long context (118k: 38.4 → ≥ 47 tok/s), and the verify's

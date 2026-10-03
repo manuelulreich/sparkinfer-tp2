@@ -105,9 +105,18 @@ if(BUILD_NVFP4_KERNELS)
         CUDA_ARCHITECTURES "120a"
         CUDA_SEPARABLE_COMPILATION OFF
         POSITION_INDEPENDENT_CODE ON)
-    # Compiles out the linkable fallbacks in prefill_nvfp4.cu, which si_fused owns.
+    # The e4m3 prefill attention, for the same reason: its block-scaled mma (full int8 rate on
+    # sm_120, where the plain f32-accumulate e4m3 mma runs at half) only assembles for sm_120a.
+    add_library(si_attn_f8 STATIC csrc/cuda/fused/prefill_attn_f8_sm120.cu)
+    target_include_directories(si_attn_f8 PRIVATE include)
+    set_target_properties(si_attn_f8 PROPERTIES
+        CUDA_ARCHITECTURES "120a"
+        CUDA_SEPARABLE_COMPILATION OFF
+        POSITION_INDEPENDENT_CODE ON)
+    # Compiles out the linkable fallbacks in prefill_nvfp4.cu (and the plain-mma fp8 attention
+    # entry in prefill_attn_mma.cu), which si_nvfp4 / si_attn_f8 own.
     target_compile_definitions(si_fused PRIVATE SPARKINFER_BUILD_NVFP4=1)
-    list(APPEND SPARKINFER_KERNEL_LIBS si_nvfp4)
+    list(APPEND SPARKINFER_KERNEL_LIBS si_nvfp4 si_attn_f8)
 endif()
 
 # Unified interface library
