@@ -2393,6 +2393,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                  !c.muse_glimmer && !moe && FC < N;
     std::vector<int> tail_tickets(tp_tail_chunked ? (size_t)((N + FC - 1) / FC) : 0, -1);
     bool tail_pending = false;
+    // (plan 08, C1 lever 2) Pipelined layer front. When layer L's FFN down all-reduces are all
+    // posted async and the next layer is a tp GDN layer on the FP4 qkv/z arm, the full-N
+    // `x += ao` and input norm are not run at the end of L; layer L+1 instead takes the rows chunk
+    // by chunk as each down all-reduce lands -- residual add, input norm, FP4 quantize, the qkv/z
+    // GEMMs, the gathers and the alpha/beta projections are all row-wise -- so the link moves
+    // chunk c+1 while chunk c's front computes, instead of idling through the whole front.
+    // Element-wise / row-wise ops on the same rows: bit-identical to the unpipelined order
+    // (checked teacher-forced). SPARKINFER_TP_FRONT_PIPE=0 disables.
+    static const bool tp_front_pipe_env = [] {
+        const char* e = getenv("SPARKINFER_TP_FRONT_PIPE");
+        return !(e && e[0] == '0');
+    }();
+    static const bool tp_ar_overlap_env = [] {
+        const char* e = getenv("SPARKINFER_TP_AR_OVERLAP");
+        return !(e && e[0] == '0');
+    }();
+    bool front_pending = false;     // layer L left its tail for layer L+1's front (see above)
+    bool front_norm_xn = false;     // ...and the rmsnorm into xn the tail would have run
+    std::vector<int> front_tickets;
     auto tp_tail_allreduce = [&] {
         if (!tp_tail_chunked) { tp_prefill_allreduce_bf16(ao, (size_t)N * H); return; }
         for (int fo = 0, i = 0; fo < N; fo += FC, ++i) {
@@ -2417,6 +2436,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
             const bool restore_i8_gdn = use_i8;
             if (use_i8 && !use_i8_gdn) use_i8 = false;
+            bool gdn_front_done = false;
             // S7b-v3: tp=2 window-fill GDN head. Each rank's qkv/z/alpha/beta blobs are
             // rank-width (head-grouped q|k|v per v-head window), so under tp the GEMMs run
             // rank-dense into rank-sized scratch and the results are gathered into this rank's
@@ -2438,6 +2458,67 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 if (!tp_gdn_z)   tp_gdn_z   = a.alloc<bf16>((size_t)N * gdn_vl);
                 bf16* tp_qkv = tp_gdn_qkv;
                 bf16* tp_z   = tp_gdn_z;
+                if (front_pending) {
+                    // C1 lever 2: the previous layer's tail and this layer's row-wise front, one
+                    // FFN chunk at a time behind that chunk's down all-reduce (see front_pending).
+                    front_pending = false;
+                    if (!tp_gdn_a) tp_gdn_a = a.alloc<bf16>((size_t)N * gdn_vh);
+                    if (!tp_gdn_b) tp_gdn_b = a.alloc<bf16>((size_t)N * gdn_vh);
+                    for (int fo = 0, ci = 0; fo < N; fo += FC, ++ci) {
+                        const int fn = (N - fo < FC) ? (N - fo) : FC;
+                        bf16* xc = x + (size_t)fo * H;
+                        bf16* xnc = xn + (size_t)fo * H;
+                        tp_prefill_allreduce_wait(front_tickets[(size_t)ci]);
+                        kernels::launch_prefill_add(xc, ao + (size_t)fo * H, xc, (long)fn * H, st);
+                        if (front_norm_xn)
+                            kernels::launch_rmsnorm(xc, w.input_norm, xnc, fn, H, c.rms_eps, st);
+                        bf16* qkv_c = tp_qkv + (size_t)fo * rowqkv;
+                        bf16* z_c = tp_z + (size_t)fo * gdn_vl;
+                        const bool ok =
+                            (attn_norm_deferred
+                             ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                                   xc, w.input_norm, fp4_gdn_a, fp4_gdn_as, fn, H, c.rms_eps, st)
+                             : kernels::launch_prefill_nvfp4_quant_a(xnc, fp4_gdn_a, fp4_gdn_as,
+                                                                     fn, H, st)) &&
+                            kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                               w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
+                                                               qkv_c, fn, (int)rowqkv, H,
+                                                               fp4_gdn_ws, st, w.gdn_qkv_fp4_alpha) &&
+                            kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                               w.gdn_z_fp4, w.gdn_z_fp4_sf,
+                                                               z_c, fn, gdn_vl, H, fp4_gdn_ws, st,
+                                                               w.gdn_z_fp4_alpha);
+                        if (!ok) {
+                            // A declined launch (both ranks see the same shapes): the converted path
+                            // on these rows, as the unpipelined fallback below does for all of them.
+                            if (attn_norm_deferred)
+                                kernels::launch_rmsnorm(xc, w.input_norm, xnc, fn, H, c.rms_eps, st);
+                            proj_fused(xnc, w.wqkv, w.wqkv_type, w.wqkv_rs, qkv_c, rowqkv, H, fn);
+                            proj_fused(xnc, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, z_c,
+                                       gdn_vl, H, fn);
+                        }
+                        kernels::launch_gather_rows(b8 + (size_t)fo * lqkv + gdn_r * gdn_ql, lqkv,
+                                                    qkv_c, rowqkv, gdn_ql, fn, st);
+                        kernels::launch_gather_rows(b8 + (size_t)fo * lqkv + (lqkv - lvdim) / 2 +
+                                                        gdn_r * gdn_ql, lqkv,
+                                                    qkv_c + gdn_ql, rowqkv, gdn_ql, fn, st);
+                        kernels::launch_gather_rows(b8 + (size_t)fo * lqkv + (lqkv - lvdim) +
+                                                        gdn_r * gdn_vl, lqkv,
+                                                    qkv_c + 2 * gdn_ql, rowqkv, gdn_vl, fn, st);
+                        kernels::launch_gather_rows(lz + (size_t)fo * lvdim + gdn_r * gdn_vl, lvdim,
+                                                    z_c, gdn_vl, gdn_vl, fn, st);
+                        bf16* a_c = tp_gdn_a + (size_t)fo * gdn_vh;
+                        bf16* b_c = tp_gdn_b + (size_t)fo * gdn_vh;
+                        proj(xnc, w.ssm_alpha, w.ssm_alpha_type, a_c, gdn_vh, H, fn);
+                        kernels::launch_gather_rows(la + (size_t)fo * vh + gdn_r * gdn_vh, vh, a_c,
+                                                    gdn_vh, gdn_vh, fn, st);
+                        proj(xnc, w.ssm_beta, w.ssm_beta_type, b_c, gdn_vh, H, fn);
+                        kernels::launch_gather_rows(lb + (size_t)fo * vh + gdn_r * gdn_vh, vh, b_c,
+                                                    gdn_vh, gdn_vh, fn, st);
+                    }
+                    gdn_front_done = true;
+                }
+                if (!gdn_front_done) {
                 // A2: the rank's own NVFP4 qkv/z operands on the block-scaled GEMM, one A quantize
                 // for both, exactly gdn_qkv_z's tp=1 arm at the rank widths. That arm is also what
                 // makes the deferred input norm sound here: at N >= 16384 the previous layer
@@ -2478,10 +2559,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 kernels::launch_gather_rows(b8 + (lqkv - lvdim) / 2 + gdn_r * gdn_ql, lqkv, tp_qkv + gdn_ql, rowqkv, gdn_ql, N, st);
                 kernels::launch_gather_rows(b8 + (lqkv - lvdim) + gdn_r * gdn_vl, lqkv, tp_qkv + 2 * gdn_ql, rowqkv, gdn_vl, N, st);
                 kernels::launch_gather_rows(lz + gdn_r * gdn_vl, lvdim, tp_z, gdn_vl, gdn_vl, N, st);
+                }   // !gdn_front_done
             } else {
                 gdn_qkv_z(xn, w, attn_norm_deferred);                    // qkv + z gate (fp8: fused)
             }
-            if (tp_gdn) {
+            if (gdn_front_done) {
+                // alpha / beta were projected per chunk above
+            } else if (tp_gdn) {
                 if (!tp_gdn_a) tp_gdn_a = a.alloc<bf16>((size_t)N * gdn_vh);
                 bf16* tp_a = tp_gdn_a;
                 proj(xn, w.ssm_alpha, w.ssm_alpha_type, tp_a, gdn_vh, H, N);
@@ -3405,6 +3489,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     dn_fp4_sf = dn_st_sf;
                 }
             }
+            bool front_pipe = false;
+            {
+                const Qwen35LayerWeights* nwf = (L + 1 < c.n_layers) ? &s.w.layers[L + 1] : nullptr;
+                const int rk = tp_active ? c.linear_v_heads / s.gdn_window.v_count : 1;
+                bool capture_here = false;
+                if (capture_dflash)
+                    for (int slot = 0; slot < s.n_capture; ++slot)
+                        capture_here = capture_here || s.capture_layers[slot] == L;
+                front_pipe = tp_front_pipe_env && tp_ar_overlap_env && tp_ffn_split &&
+                    rk > 1 && ffn % rk == 0 && FC < N && !moe && !multi && !c.muse_glimmer &&
+                    !capture_here && nwf && nwf->linear_attn && gdn_nvfp4 && (gdn_fp4_mask & 1) &&
+                    nwf->gdn_qkv_fp4 && nwf->gdn_qkv_fp4_sf && nwf->gdn_z_fp4 &&
+                    nwf->gdn_z_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws;
+                if (front_pipe) {
+                    const int rowqkv_f = 2 * ((lqkv - lvdim) / (2 * rk)) + lvdim / rk;
+                    for (int fo = 0; fo < N && front_pipe; fo += FC) {
+                        const int fn = (N - fo < FC) ? (N - fo) : FC;
+                        front_pipe = kernels::prefill_nvfp4_supported(fn, rowqkv_f, H) &&
+                                     kernels::prefill_nvfp4_supported(fn, lvdim / rk, H);
+                    }
+                }
+                front_tickets.assign(front_pipe ? (size_t)((N + FC - 1) / FC) : 0, -1);
+            }
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
@@ -3694,7 +3801,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             const char* e = getenv("SPARKINFER_TP_AR_OVERLAP");
                             return !(e && e[0] == '0');
                         }();
-                        if (ar_overlap && fo + fn < N)
+                        if (front_pipe)
+                            front_tickets[(size_t)(fo / FC)] =
+                                tp_prefill_allreduce_bf16_async(ao + (size_t)fo * H, (size_t)fn * H);
+                        else if (ar_overlap && fo + fn < N)
                             tp_prefill_allreduce_bf16_async(ao + (size_t)fo * H, (size_t)fn * H);
                         else
                             tp_prefill_allreduce_bf16(ao + (size_t)fo * H, (size_t)fn * H);
@@ -3766,6 +3876,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                       w.post_ffn_norm, x, N, H, 1e-8f, st);
                 else if (tail_rows != N)   // re-running rows a chunk already did is harmless
                     kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
+            } else if (front_pipe) {
+                front_pending = true;   // the next layer's front adds ao chunk by chunk
             } else if (!ffn_fused && !ffn_fp4_resid) {
                 // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk,
                 // whether through the int8 fused-residual GEMM or the FP4 epilogue's C operand)
@@ -4334,7 +4446,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             return e ? atoi(e) : 32768;
         }();
         const bool next_needs_raw_xn = gdn_xn_fix && N >= xn_fix_minctx && nw && nw->linear_attn;
-        if (!defer_next_attn_norm || next_needs_raw_xn)
+        if (front_pending)
+            front_norm_xn = !defer_next_attn_norm || next_needs_raw_xn;   // run per chunk instead
+        else if (!defer_next_attn_norm || next_needs_raw_xn)
             kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
         attn_norm_deferred = defer_next_attn_norm;
     }

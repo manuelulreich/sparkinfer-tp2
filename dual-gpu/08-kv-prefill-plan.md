@@ -123,6 +123,19 @@ int8 codec 0.060 / 0.051 / 0.072 at 4k / 16k / 48k, e4m3 0.064 / 0.050 / 0.088 (
 ops, exact). Not the default (plan 05: lossy link formats are opt-in). Still open: C1 levers 1, 2
 and 4 (micro-batch interleave, pipelined next-layer front, early out/o chunks).
 
+**C1 lever 2 status: done (2026-10-03).** `front_pending` in qwen35_prefill.cpp: when the next
+layer is a tp GDN layer on the FP4 qkv/z arm (and no DSpark capture is taken at this layer), every
+down chunk is posted async and the next layer's residual add, norm, FP4 quantize, qkv/z GEMMs,
+gathers and alpha/beta projections run per chunk behind its ticket. Bit-identical (KL 0 at
+1k-48k). int8 KV, 31k: 3247 -> 3458 tok/s; with the int8 wire 4271 -> 4775. Not done: the same for
+attention layers (16 of 64), the micro-batch interleave (lever 1).
+
+**Open (found 2026-10-03): DSpark is not lossless with fp8 or nvfp4 KV.** `tp2_gates.py` with
+`SPARKINFER_KV_DTYPE=nvfp4` (old and new decode kernel alike) or `fp8`: 2-3 of 7 prompts differ
+between the drafter and plain greedy; int8 passes. The gate prompts are short (decode takes the
+tile kernel below 512 keys), so the cause is upstream of the decode MMA kernels -- likely the
+verify's KV append / attention path for the quantized formats. To investigate.
+
 ## Part B: nvfp4 decode at memory bandwidth
 
 Goal: nvfp4 decode faster than fp8 at long context (118k: 38.4 → ≥ 47 tok/s), and the verify's
@@ -165,6 +178,14 @@ paired kernel too.
     Never the default.
 - Hardware note: on a PCIe Gen4/Gen5 host the same cards get 2–4× the link, and prefill would be
   compute-bound without C2.
+
+**B status: done (2026-10-03).** `fa_split_gqa_mma_nvfp4_kernel` (flash_decode_split.cu): direct
+e2m1 -> f16 bit placement with one HMUL2 per two elements (B1), operands swapped (K x Q^T and
+V^T x P^T: tokens on M, the 6 q heads on N) which made B2/B3 unnecessary, 128-bit K loads, V via
+cp.async, ~29 KB smem / <= 85 registers (3 CTAs per SM). Plain sm_120 build; the hardware
+`cvt.rn.f16x2.e2m1x2` (120a only) would add ~1 %. Kernel at 118k 480 -> 175 us (fp8 275 us);
+decode 38.4 -> 48.0 tok/s at 118k, 44.7 -> 50.8 at 60k. Follow-ups: a paired form for the
+verify (pairs decline nvfp4 meanwhile), and the operand swap for the fp8 kernel.
 
 ## Notes from other setups
 

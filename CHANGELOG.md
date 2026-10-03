@@ -7,6 +7,23 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **nvfp4 KV decode at memory bandwidth.** A new decode attention kernel for nvfp4
+  (`fa_split_gqa_mma_nvfp4_kernel`): e2m1 widened straight to f16 (magnitude bits into the f16
+  exponent field, one HMUL2 by the block scale -- exact) instead of e2m1 -> e4m3 -> f16, the
+  operands swapped (16 tokens on the mma's M, the 6 q heads on N: no padded rows, half the
+  mmas), 128-bit K loads, V staged with cp.async during QK. Kernel time at 118k context
+  480 -> 175 us a call (143 -> 394 GB/s; fp8 275 us). End to end, tp=2, 128-token decode:
+  nvfp4 44.7 -> 50.8 tok/s at 60k, 38.4 -> 48.0 at 118k (fp8 48.2 / 44.0, int8 46.4 / 41.0), so
+  nvfp4 is now the fastest KV format at long context. The paired verify kernel declines nvfp4
+  for now (its rows take the new single-row kernel).
+- **tp=2 prefill: the next layer's front runs behind the down all-reduce chunks**
+  (`SPARKINFER_TP_FRONT_PIPE=0` disables). When the next layer is a Gated-DeltaNet layer, the
+  residual add, input norm, FP4 qkv/z GEMMs, gathers and alpha/beta projections run chunk by
+  chunk as each FFN down all-reduce lands, instead of after the whole block -- the link no
+  longer idles through them. Bit-identical (teacher-forced KL 0). int8 KV prefill at 31k
+  3247 -> 3458 tok/s (with `SPARKINFER_TP_AR_WIRE=int8` 4271 -> 4775); tp2 gate prefill@3072
+  3540 -> 3721.
+
 - **tp=2 prefill: optional compressed all-reduce (`SPARKINFER_TP_AR_WIRE=int8|e4m3`, default
   off).** The chunked prefill all-reduces can send blocks of 128 values as 8-bit codes plus one
   fp32 scale (132 instead of 256 bytes, the codec of b12x's PCIe wire modes); each card quantizes
