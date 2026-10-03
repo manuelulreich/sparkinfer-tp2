@@ -110,11 +110,35 @@ paired kernel too.
   chunks earlier (inside the projection GEMM's row loop), and start the next layer's input
   projections per chunk (plan 05 B6). Ceiling: max(link 5.9 s, compute 5.1 s) ≈ 6 s at 31k,
   ~5k tok/s instead of 3.1k.
-- **C2. Optional lossy link format** (opt-in only, as plan 05 decided): fp8 e4m3 with a per-row
-  scale halves the bytes; with C1 the pass becomes compute-bound (~6k tok/s at 31k). Needs the KL
-  and lossless-spec checks; never the default.
+- **C2. Optional lossy link format** (opt-in only, as plan 05 decided). Today every prefill
+  all-reduce sends raw bf16 partials (`tp_prefill_allreduce_bf16`); nothing is compressed.
+  - Codec as in b12x's `PCIeDmaAllReduce` wire modes: blocks of 128 values, e4m3 or int8 codes
+    plus one fp32 scale a block, 132 B instead of 256 B (−48 %). At tp=2 the direct exchange stays
+    (b12x's ring/RS+AG phases send the same bytes on two ranks), i.e. its quantize-once `a2a` form.
+  - **Both ranks must add the same values**: each rank sums q(own) + q(peer), not own + q(peer),
+    or the replicated residual stream diverges between the cards.
+  - Decode all-reduces (10 KB rows, ~24 µs, latency-bound) stay bf16: fewer bytes do not help them.
+  - Estimate at 31k: link 5.9 → 3.05 s; with today's overlap the pass goes ~10 → ~7 s (+40 %),
+    with C1 it becomes compute-bound (~6k tok/s).
+  - Gates: KL against the bf16 link at 4k/16k/64k for e4m3 and int8 (residual-stream partials
+    carry outlier channels, so the per-block codec choice matters), retrieval at 118k, and the
+    lossless DSpark check (prefill is shared by both servers, so it stays lossless if deterministic).
+    Never the default.
 - Hardware note: on a PCIe Gen4/Gen5 host the same cards get 2–4× the link, and prefill would be
   compute-bound without C2.
+
+## Notes from other setups
+
+- **co-l's single-5090 vLLM gist** (Qwen3.8-27B NVFP4, nvfp4 KV, 451K-token pool): the nvfp4
+  KV there has one static global scale a layer (checkpoint k_scale/v_scale) under the per-16 e4m3
+  scales, and attention reads it through FlashInfer's FA2 reader with bf16 queries, i.e. the same
+  dequantize-then-bf16-MMA as our prefill today. No new kernel technique; our second level (an
+  fp16 scale per token and head) is finer. Its practical point is capacity: with nvfp4 KV,
+  several sessions' KV stays resident (3 × 75K), so agent sub-sessions resume without
+  re-prefill. For us that is nvfp4 KV at `--ctx 262144` (the pool is shared across sessions);
+  each session's GDN state (~148 MB) still counts separately.
+- Its prefill (single 5090: 11.4k tok/s at 4K, 2.9k at 128K) is below our own tp=1 5090 numbers
+  (14.4k at 4K); nothing to take for prefill.
 
 ## Not in this plan
 
