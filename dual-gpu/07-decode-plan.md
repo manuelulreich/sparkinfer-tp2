@@ -45,6 +45,8 @@ What this means:
   - Expected: sampled tokens per step near greedy's (2.0–2.3 → ~3). That is sampled C1 80 → ~105, and the gain guard stops ending sampled groups.
   - Check: acceptance per step, sampled against greedy, on the cohort and the multi-turn replay. Byte-identity at a fixed seed against ordinary sampled decode.
 
+**A2 status: done (2026-10-03).** `decode_packed` takes a `SpecSampleRow` per row and the tp rows pass draws sampled rows with P's exact sampler; `tp_rows_forward` declines before touching state when a sampled row cannot take that draw. Deterministic check: two concurrent seeded sampled requests identical packed and unpacked. No drafter, sampled cohort C4: 54 -> 184 tok/s. With the drafter (512 tokens, sampled): C1 / C2 / C4 95.8 / 157 / 248 tok/s; the gain check compares against the packed step now.
+
 **A2. Batched sampled plain decode.** `step_jobs_packed` declines when a session samples, so sampled sessions fall back one row at a time (S × 18 ms a step). This hurts twice: every handed-back sampled request at C2/C4 is slow, and the gain guard compares against that slow baseline.
   - Give the packed decode per-row sampling (the same kernel as P's per-row draw) so 2–4 sampled sessions share one weight read.
   - Expected: sampled ordinary decode at C4 ~4× faster (the same as greedy packed), and an honest guard.

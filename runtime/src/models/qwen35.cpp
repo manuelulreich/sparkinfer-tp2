@@ -3858,6 +3858,18 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
     const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * lqkv;
 
     if (!s.vr_ready && !tp_verify_alloc()) return -1;
+    // A sampled row must take the exact sampled draw below (top_k in [1, 64], its scratch
+    // allocated); otherwise decline now, before any state is touched, rather than emit an argmax.
+    if (row_sample) {
+        bool any = false;
+        for (int r = 0; r < n; r++)
+            if (row_sample[r].temperature > 0.f) {
+                any = true;
+                if (row_sample[r].top_k < 1 || row_sample[r].top_k > dflash_kernels::kRowsTopkMax)
+                    return -1;
+            }
+        if (any && !s.h_vr_smp) return -1;
+    }
 
     // (dual-GPU C1b) Multi-session rows on the FP4 tensor cores. The dp4a rows kernels re-read
     // the weights for every 8 rows, while the block-scaled GEMM reads them once for up to ~32
@@ -4597,7 +4609,8 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
 }
 
 bool Qwen35Model::decode_packed_tp(const int* tokens, const int* positions,
-                                   const uint64_t* seq_ids, int n, int* out_sampled) {
+                                   const uint64_t* seq_ids, int n, int* out_sampled,
+                                   const SpecSampleRow* row_sample) {
     if (!tokens || !positions || !seq_ids || !out_sampled) return false;
     if (n < 1 || n > kQwen35MaxPackedRows) return false;
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
@@ -4644,14 +4657,16 @@ bool Qwen35Model::decode_packed_tp(const int* tokens, const int* positions,
         for (int i0 = 0; i0 < n && ok; i0 += kTpVerifyRows) {
             const int m = std::min(kTpVerifyRows, n - i0);
             ok = tp_rows_forward(tokens + i0, m, 0, positions + i0, seq_ids + i0, nullptr,
-                                 out_sampled + i0) == m;
+                                 out_sampled + i0, 0, nullptr, nullptr,
+                                 row_sample ? row_sample + i0 : nullptr) == m;
             // A decline happens before any state is touched, so the rows from i0 on can still
             // take the loop; rows already run must not run again.
             if (!ok) {
                 for (int i = i0; i < n; i++) {
                     activate_session(seq_ids[i]);
-                    out_sampled[i] = forward_token_tp(tokens[i], positions[i], true, 0.f, 0, 0,
-                                                      0, 1.f, 0.f, 0.f);
+                    const SpecSampleRow rs = row_sample ? row_sample[i] : SpecSampleRow{};
+                    out_sampled[i] = forward_token_tp(tokens[i], positions[i], true, rs.temperature,
+                                                      rs.seed, rs.step, rs.top_k, rs.top_p, 0.f, 0.f);
                 }
                 return true;
             }
@@ -6827,14 +6842,19 @@ int Qwen35Model::max_packed_rows() {
 }
 
 bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
-                                const uint64_t* seq_ids, int n, int* out_sampled) {
+                                const uint64_t* seq_ids, int n, int* out_sampled,
+                                const SpecSampleRow* row_sample) {
     // (dual-GPU WP-9) tp=2: same split-weights story as forward_token above -- the step runs on
     // the per-rank twin instead; this guard is the ONLY tp>1 delta on the tp=1 packed path.
     if (tp_active()) {
         std::vector<int> tp_peer_out(n > 0 ? n : 0);
-        TP_MIRROR(decode_packed(tokens, positions, seq_ids, n, tp_peer_out.data()));
-        return decode_packed_tp(tokens, positions, seq_ids, n, out_sampled);
+        TP_MIRROR(decode_packed(tokens, positions, seq_ids, n, tp_peer_out.data(), row_sample));
+        return decode_packed_tp(tokens, positions, seq_ids, n, out_sampled, row_sample);
     }
+    // Sampled rows pack at tp=2 only (the rows pass's sampled draw).
+    if (row_sample)
+        for (int i = 0; i < n; i++)
+            if (row_sample[i].temperature > 0.f) return false;
     Impl& s = *p_;
     if (!tokens || !positions || !seq_ids || !out_sampled) return false;
     if (n < 1 || n > kQwen35MaxPackedRows) return false;
@@ -9301,11 +9321,16 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             }
         }
         if (kMinGain > 0) {
-            // Ordinary decode packs greedy sessions into one step; with a sampled one among them
-            // every session takes its own (ContinuousBatchEngine::step_jobs_packed declines).
+            // Ordinary decode packs the sessions into one step, sampled ones included (their
+            // top_k is 1..64 here); SPARKINFER_PACKED_SAMPLING=0 runs each sampled one alone.
+            static const bool packed_sampling = [] {
+                const char* e = getenv("SPARKINFER_PACKED_SAMPLING");
+                return !(e && e[0] == '0');
+            }();
             bool any_sampled = false;
             for (G* g : act) any_sampled |= g->job->temperature > 0.f;
-            const double plain = any_sampled ? S * plain_decode_ms(1) : plain_decode_ms(S);
+            const double plain = any_sampled && !packed_sampling ? S * plain_decode_ms(1)
+                                                                 : plain_decode_ms(S);
             gain_won[gain_steps % kGainWindow] = (double)step_tokens * plain;
             gain_cost[gain_steps % kGainWindow] = (double)S * step_ms;
             double won = 0, cost = 0;

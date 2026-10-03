@@ -103,6 +103,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2: concurrent sampled requests decode in one batched step.** The packed decode took only
+  greedy requests, so sampled ones (opencode's default) decoded one forward each. The rows pass
+  now draws each sampled row as decode does (exact top-64 per card, the same seeded Gumbel noise),
+  so the output is unchanged (identical in deterministic mode). Sampled, no drafter, cohort C4:
+  54 -> 184 tok/s. With the drafter, sampled cohort (512 tokens) C1 / C2 / C4: 88.7 / 158 / 238 ->
+  95.8 / 157 / 248 tok/s (the gain check now compares against the batched step).
+  `SPARKINFER_PACKED_SAMPLING=0` restores per-request sampled decode.
 - **tp=2: the flag all-reduce moves 16 bytes a thread** (push and reduce), where it moved one
   element: element-wide stores left the PCIe link as 64-byte writes. Verify step at C4 (cohort,
   256 tokens) 28.7 -> 26.6 ms, the split draft 6.0 -> 5.4 ms; greedy cohort C4 ~290 -> 336 tok/s.

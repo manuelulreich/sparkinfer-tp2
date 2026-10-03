@@ -972,6 +972,14 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 // per-token logprobs, or any sampler setting other than plain greedy -- decode_packed() returns
 // the argmax, which is exactly forward_token()'s result at temperature 0 with no truncation or
 // penalties, and nothing else. A declined batch just falls back to the sequential loop.
+static bool packed_sampling_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PACKED_SAMPLING");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished) {
     static const bool enabled = [] {
         const char* e = getenv("SPARKINFER_PACKED_DECODE");
@@ -1001,13 +1009,17 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         if (j->next_token < 0 || j->next_token >= cfg.vocab) return false;
         if (!j->req.forced_tokens.empty()) return false;
         if (j->req.logprobs || j->on_token_logprob) return false;
-        if (j->req.temperature != 0.f) return false;
+        // A sampled row packs at tp=2 (the rows pass draws it as decode would; top_k 1..64);
+        // tp=1's decode_packed declines it and the loop below runs the rows one by one.
+        // SPARKINFER_PACKED_SAMPLING=0 keeps every sampled request on its own forward.
+        if (j->req.temperature != 0.f &&
+            !(packed_sampling_enabled() && j->req.top_k >= 1 && j->req.top_k <= 64))
+            return false;
         // Truncation is inert at temperature 0 (forward_token's top-k/top-p mask cannot move the
         // argmax -- see qwen35.h's forward_token doc), so it must not decline the pack. It used to:
         // the server fills top_k/top_p from generation_config.json (Qwen3.8: 20 / 0.95) for any
         // request that omits them, so a plain temperature-0 request was never packed and
         // concurrent greedy decode ran one forward per sequence.
-        if (j->req.temperature != 0.f && (j->req.top_k > 0 || j->req.top_p < 1.0f)) return false;
         if (j->req.presence_penalty != 0.f || j->req.frequency_penalty != 0.f) return false;
         // decode_packed applies no logit bias: a request with logit_bias or a constraint decodes on
         // its own, where forward_token applies it.
@@ -1061,6 +1073,7 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
     // work by a different route, not a retry.
     std::vector<int> toks, pos, out;
     std::vector<uint64_t> seqs;
+    std::vector<Qwen35Model::SpecSampleRow> smp;
     for (size_t off = 0; off < live.size(); off += (size_t)cap) {
         const size_t m = std::min((size_t)cap, live.size() - off);
         const auto t_chunk = std::chrono::steady_clock::now();
@@ -1071,9 +1084,21 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
             pos.push_back((int)j->req.prompt.size() + j->decode_emitted - 1);
             seqs.push_back(j->seq_id);
         }
+        smp.clear();
+        for (size_t i = 0; i < m && smp.empty(); i++)
+            if (live[off + i]->req.temperature != 0.f) smp.resize(m);
+        for (size_t i = 0; i < smp.size(); i++) {
+            const Job* j = live[off + i];
+            smp[i].temperature = j->req.temperature;
+            smp[i].top_k = j->req.top_k;
+            smp[i].top_p = j->req.top_p;
+            smp[i].seed = j->req.seed;
+            smp[i].step = (unsigned long long)j->decode_emitted;
+        }
         bool ok = false;
         if (m >= 2)
-            ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data());
+            ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data(),
+                                       smp.empty() ? nullptr : smp.data());
         if (!ok) {
             for (size_t i = 0; i < m; i++) {
                 Job* j = live[off + i];

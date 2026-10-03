@@ -750,8 +750,10 @@ public:
     // stepping the jobs one at a time.
     //
     // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
+    // row_sample (optional, n entries): a row with temperature > 0 draws its token as decode
+    // would (SpecSampleRow, step = the request's tokens emitted so far). tp=2 only; tp=1 declines.
     bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
-                       int* out_sampled);
+                       int* out_sampled, const SpecSampleRow* row_sample = nullptr);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.
     static int max_packed_rows();
     uint64_t active_session() const;
@@ -866,9 +868,9 @@ private:
     // code-complete + in-regime unit test). The leader activates each row's session before its
     // call (the single-row path keys its per-rank state off the model's active session); the
     // peer replays the whole decode_packed call (mirrored in decode_packed), so it activates the
-    // same sessions in the same order. Plain greedy only, exactly like decode_packed: out_sampled holds the argmax.
+    // same sessions in the same order. Greedy rows get the argmax, sampled rows (row_sample) decode's draw.
     bool decode_packed_tp(const int* tokens, const int* positions, const uint64_t* seq_ids,
-                          int n, int* out_sampled);
+                          int n, int* out_sampled, const SpecSampleRow* row_sample = nullptr);
 
     // (dual-GPU WP-9) tp>1 per-layer helpers: the real per-rank partial bodies (see the locked
     // design in wp-i2-brief.md). Each one computes this rank's partial into the tp_ar row --
