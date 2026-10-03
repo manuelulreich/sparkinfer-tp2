@@ -5273,11 +5273,35 @@ struct TpArSide {
                                        // by a LATER op of the same in-order stream, so waiting on
                                        // it can only over-wait, never under-wait
     cudaStream_t side = nullptr;
+    // (C1) The ops' reduce kernels run here, not on `side`, so the copy engines start the next
+    // op's copy while this one reduces (GpuLink::allreduce_pipelined). `done` is recorded here.
+    cudaStream_t red = nullptr;
     cudaEvent_t ready = nullptr;
     cudaEvent_t done[kRing] = {};
     int seq = 0;
     bool pending = false;
 };
+// SPARKINFER_TP_AR_WIRE=e4m3|int8: the async prefill all-reduces send 8-bit codes with a scale
+// per 128 values (48 % fewer bytes over the link; lossy, both ranks keep identical sums). Default
+// off. Needs the pipelined path.
+static int tp_ar_wire() {
+    static const int w = [] {
+        const char* e = getenv("SPARKINFER_TP_AR_WIRE");
+        if (!e) return 0;
+        if (!strcmp(e, "e4m3") || !strcmp(e, "fp8") || !strcmp(e, "1")) return 1;
+        if (!strcmp(e, "int8") || !strcmp(e, "2")) return 2;
+        return 0;
+    }();
+    return w;
+}
+// SPARKINFER_TP_AR_PIPE=0: copy and reduce of an async prefill all-reduce on one stream again.
+static bool tp_ar_pipe_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_TP_AR_PIPE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 static TpArSide g_tp_ar_side[2];
 
 static int tp_prefill_rank() {
@@ -5314,9 +5338,10 @@ bool tp_prefill_ar_side_prepare() {
     TpArSide& sd = g_tp_ar_side[r];
     if (sd.side) return true;
     // Created by the rank's own thread, on its own (current) device; all or nothing.
-    cudaStream_t side = nullptr;
+    cudaStream_t side = nullptr, red = nullptr;
     cudaEvent_t ready = nullptr, done[TpArSide::kRing] = {};
     bool ok = cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaStreamCreateWithFlags(&red, cudaStreamNonBlocking) == cudaSuccess &&
               cudaEventCreateWithFlags(&ready, cudaEventDisableTiming) == cudaSuccess;
     for (cudaEvent_t& e : done)
         ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
@@ -5324,10 +5349,12 @@ bool tp_prefill_ar_side_prepare() {
         cudaGetLastError();
         for (cudaEvent_t e : done) if (e) cudaEventDestroy(e);
         if (ready) cudaEventDestroy(ready);
+        if (red) cudaStreamDestroy(red);
         if (side) cudaStreamDestroy(side);
         return false;
     }
     sd.side = side;
+    sd.red = red;
     sd.ready = ready;
     for (int i = 0; i < TpArSide::kRing; i++) sd.done[i] = done[i];
     return true;
@@ -5342,20 +5369,35 @@ int tp_prefill_allreduce_bf16_async(void* in_out, size_t elems) {
         cu(cudaErrorMemoryAllocation, "tp ar side stream");
     cu(cudaEventRecord(sd.ready, g_tp_prefill_stream[r]), "tp ar ready record");
     cu(cudaStreamWaitEvent(sd.side, sd.ready, 0), "tp ar side wait");
+    const bool pipe = tp_ar_pipe_on() && sd.red;
+    // Pipelined: this op lands in scratch half (seq & 1), which op seq-2 read in its reduce on
+    // `red`; the copy may not overwrite it before that reduce has run.
+    if (pipe && sd.pending && sd.seq >= 2)
+        cu(cudaStreamWaitEvent(sd.side, sd.done[(sd.seq - 2) % TpArSide::kRing], 0),
+           "tp ar slot wait");
+    // Both ranks post the same op sequence, so their seq (and slot) agree.
+    const int slot = sd.seq & 1;
     g_tp_prefill_buf[r] = in_out;
     auto post = [&] {
         GpuLink::RankRef a{g_tp_prefill_dev[0], g_tp_ar_side[0].side, g_tp_prefill_buf[0],
                            g_tp_prefill_buf[0]};
         GpuLink::RankRef b{g_tp_prefill_dev[1], g_tp_ar_side[1].side, g_tp_prefill_buf[1],
                            g_tp_prefill_buf[1]};
-        if (!g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16))
+        const bool ok = pipe
+            ? g_tp_prefill_link->allreduce_pipelined(a, b, elems * sizeof(bf16),
+                                                     GpuLink::Dtype::BFloat16, g_tp_ar_side[0].red,
+                                                     g_tp_ar_side[1].red, slot, tp_ar_wire())
+            : g_tp_prefill_link->allreduce(a, b, elems * sizeof(bf16), GpuLink::Dtype::BFloat16);
+        if (!ok)
             { cu(cudaErrorUnknown, "tp prefill allreduce async"); note_tp_fatal("GpuLink prefill allreduce failed"); }
     };
     if (r != 0) tp_peer_rendezvous("prefill allreduce async");
     else tp_leader_rendezvous("prefill allreduce async", post);
-    // After the rendezvous the op is on both side streams; `done` marks everything posted so far.
+    // After the rendezvous the op is on both ranks' streams; `done` marks everything posted so far
+    // (on `red` when pipelined: the reduces run there in op order).
     const int ticket = sd.seq++;
-    cu(cudaEventRecord(sd.done[ticket % TpArSide::kRing], sd.side), "tp ar done record");
+    cu(cudaEventRecord(sd.done[ticket % TpArSide::kRing], pipe ? sd.red : sd.side),
+       "tp ar done record");
     sd.pending = true;
     return ticket;
 }

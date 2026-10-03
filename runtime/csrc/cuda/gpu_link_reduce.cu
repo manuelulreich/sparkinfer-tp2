@@ -17,6 +17,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 // The module header must be included at GLOBAL scope: a #include inside a namespace
@@ -123,9 +124,108 @@ __global__ void glink_flag_allreduce_kernel(const T* __restrict__ in, T* out, T*
   }
 }
 
+// Compressed wire (opt-in, prefill only): a bf16 partial as blocks of 128 values, one 8-bit code
+// each (e4m3 or int8) followed by one fp32 scale per block -- [n codes][n/128 scales], 132 bytes
+// per 128 values instead of 256. One warp per block, four values a lane.
+template <int FMT>   // 1 e4m3 (scale amax/448), 2 int8 (scale amax/127)
+__global__ void glink_wire_quant_bf16(const __nv_bfloat16* __restrict__ in,
+                                      unsigned char* __restrict__ wire, int nblk) {
+  const int lane = threadIdx.x & 31;
+  const int warps = (gridDim.x * blockDim.x) >> 5;
+  float* scales = reinterpret_cast<float*>(wire + (size_t)nblk * 128);
+  for (int blk = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; blk < nblk; blk += warps) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(in + (size_t)blk * 128 + lane * 4);
+    const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    float f[4], amax = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { f[j] = __bfloat162float(v[j]); amax = fmaxf(amax, fabsf(f[j])); }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / (FMT == 1 ? 448.0f : 127.0f);
+    const float inv = (amax > 0.f) ? 1.0f / d : 0.f;
+    unsigned w = 0u;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      unsigned c;
+      if constexpr (FMT == 1)
+        c = (unsigned)__nv_cvt_float_to_fp8(f[j] * inv, __NV_SATFINITE, __NV_E4M3);
+      else
+        c = (unsigned)(unsigned char)(signed char)__float2int_rn(f[j] * inv);
+      w |= c << (8 * j);
+    }
+    *reinterpret_cast<unsigned*>(wire + (size_t)blk * 128 + lane * 4) = w;
+    if (lane == 0) scales[blk] = d;
+  }
+}
+
+template <int FMT>
+__device__ __forceinline__ float glink_wire_deq(unsigned w, int j, float d) {
+  const unsigned c = (w >> (8 * j)) & 0xffu;
+  if constexpr (FMT == 1) {
+    const __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)c, __NV_E4M3);
+    return __half2float(__half(h)) * d;
+  } else {
+    return (float)(signed char)c * d;
+  }
+}
+
+// out = bf16(deq(own) + deq(peer)). Both ranks add the SAME two dequantized values (fp32 addition
+// commutes), so the replicated sum stays bit-identical across the ranks.
+template <int FMT>
+__global__ void glink_wire_reduce_bf16(__nv_bfloat16* __restrict__ out,
+                                       const unsigned char* __restrict__ own,
+                                       const unsigned char* __restrict__ peer, int nblk) {
+  const int lane = threadIdx.x & 31;
+  const int warps = (gridDim.x * blockDim.x) >> 5;
+  const float* so = reinterpret_cast<const float*>(own + (size_t)nblk * 128);
+  const float* sp = reinterpret_cast<const float*>(peer + (size_t)nblk * 128);
+  for (int blk = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; blk < nblk; blk += warps) {
+    const unsigned wo = *reinterpret_cast<const unsigned*>(own + (size_t)blk * 128 + lane * 4);
+    const unsigned wp = *reinterpret_cast<const unsigned*>(peer + (size_t)blk * 128 + lane * 4);
+    const float d_o = so[blk], d_p = sp[blk];
+    __align__(8) __nv_bfloat16 r[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+      r[j] = __float2bfloat16(glink_wire_deq<FMT>(wo, j, d_o) + glink_wire_deq<FMT>(wp, j, d_p));
+    *reinterpret_cast<uint2*>(out + (size_t)blk * 128 + lane * 4) = *reinterpret_cast<const uint2*>(r);
+  }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 
 namespace detail {
+
+cudaError_t launch_glink_wire_quant(const void* in, void* wire, size_t n, int fmt,
+                                    cudaStream_t stream) {
+  if (n == 0 || n % 128 != 0 || n / 128 > (size_t)INT_MAX) return cudaErrorInvalidValue;
+  const int nblk = (int)(n / 128);
+  int blocks = (nblk + 7) / 8;
+  if (blocks > 1024) blocks = 1024;
+  (void)cudaGetLastError();
+  if (fmt == 1)
+    glink_wire_quant_bf16<1><<<blocks, 256, 0, stream>>>((const __nv_bfloat16*)in,
+                                                         (unsigned char*)wire, nblk);
+  else
+    glink_wire_quant_bf16<2><<<blocks, 256, 0, stream>>>((const __nv_bfloat16*)in,
+                                                         (unsigned char*)wire, nblk);
+  return cudaGetLastError();
+}
+
+cudaError_t launch_glink_wire_reduce(void* out, const void* own, const void* peer, size_t n,
+                                     int fmt, cudaStream_t stream) {
+  if (n == 0 || n % 128 != 0 || n / 128 > (size_t)INT_MAX) return cudaErrorInvalidValue;
+  const int nblk = (int)(n / 128);
+  int blocks = (nblk + 7) / 8;
+  if (blocks > 1024) blocks = 1024;
+  (void)cudaGetLastError();
+  if (fmt == 1)
+    glink_wire_reduce_bf16<1><<<blocks, 256, 0, stream>>>(
+        (__nv_bfloat16*)out, (const unsigned char*)own, (const unsigned char*)peer, nblk);
+  else
+    glink_wire_reduce_bf16<2><<<blocks, 256, 0, stream>>>(
+        (__nv_bfloat16*)out, (const unsigned char*)own, (const unsigned char*)peer, nblk);
+  return cudaGetLastError();
+}
 
 cudaError_t launch_glink_reduce(void* dst, const void* a, const void* b, size_t n,
                                  GpuLink::Dtype dtype, bool is_max, cudaStream_t stream) {

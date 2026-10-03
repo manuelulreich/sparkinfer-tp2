@@ -667,6 +667,92 @@ bool GpuLink::allreduce(const RankRef& a, const RankRef& b, size_t bytes, Dtype 
   return reduce_impl(a, b, bytes, dtype, /*is_max=*/false);
 }
 
+bool GpuLink::allreduce_pipelined(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype,
+                                  cudaStream_t red_a, cudaStream_t red_b, int slot, int wire) {
+  auto fail = [&](const char* why, cudaError_t e) -> bool {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20)
+      GLINK_LOG("[gpu_link] allreduce_pipelined: %s: %s\n", why, cudaGetErrorString(e));
+    return false;
+  };
+  if (!impl_ || !impl_->ready || !red_a || !red_b) return reduce_impl(a, b, bytes, dtype, false);
+  const Impl& im = *impl_;
+  const size_t esize = detail::glink_dtype_size(dtype);
+  const bool pipe = im.resolved == GpuLink::Transport::P2pMapped && a.in == a.out &&
+                    b.in == b.out && bytes > detail::kFlagMaxBytes && bytes <= im.max_bytes / 2 &&
+                    bytes % esize == 0 && a.device == im.dev_a && b.device == im.dev_b &&
+                    a.stream && b.stream && a.in && b.in;
+  if (!pipe) {
+    // The plain op on the copy streams, then the red streams take its completion.
+    if (!reduce_impl(a, b, bytes, dtype, false)) return false;
+    cudaError_t e = cudaEventRecord(im.ranks[0].event, a.stream);
+    if (e == cudaSuccess) e = cudaEventRecord(im.ranks[1].event, b.stream);
+    if (e == cudaSuccess) e = cudaStreamWaitEvent(red_a, im.ranks[0].event, 0);
+    if (e == cudaSuccess) e = cudaStreamWaitEvent(red_b, im.ranks[1].event, 0);
+    return e == cudaSuccess || fail("fallback completion handoff", e);
+  }
+  const size_t n = bytes / esize;
+  // Compressed wire: each rank's own codes go to the upper quarter of its slot half, the peer's
+  // land at the start of it; the copy then moves the codes instead of the partial.
+  const bool wq = wire != 0 && dtype == Dtype::BFloat16 && n % 128 == 0 &&
+                  detail::glink_wire_bytes(n) <= im.max_bytes / 4;
+  const size_t half_off = (slot & 1) ? im.max_bytes / 2 : 0;
+  void* wire_a = static_cast<char*>(im.ranks[0].scratch) + half_off + im.max_bytes / 4;
+  void* wire_b = static_cast<char*>(im.ranks[1].scratch) + half_off + im.max_bytes / 4;
+  if (wq) {
+    cudaError_t qe = detail::launch_glink_wire_quant(a.in, wire_a, n, wire, a.stream);
+    if (qe == cudaSuccess) qe = detail::launch_glink_wire_quant(b.in, wire_b, n, wire, b.stream);
+    if (qe != cudaSuccess) return fail("wire quantize", qe);
+  }
+  const void* src_a = wq ? wire_a : a.in;   // what rank B pulls from rank A
+  const void* src_b = wq ? wire_b : b.in;
+  const size_t cbytes = wq ? detail::glink_wire_bytes(n) : bytes;
+  // Entry snapshots and the cross waits, as in reduce_impl: each copy reads the peer's `in` only
+  // after the peer's producers (everything enqueued on its copy stream so far) are done.
+  cudaError_t e = cudaEventRecord(im.ranks[0].event, a.stream);
+  if (e == cudaSuccess) e = cudaEventRecord(im.ranks[1].event, b.stream);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(a.stream, im.ranks[1].event, 0);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(b.stream, im.ranks[0].event, 0);
+  if (e != cudaSuccess) return fail("entry events", e);
+  void* dst_a = static_cast<char*>(im.ranks[0].scratch) + half_off;
+  void* dst_b = static_cast<char*>(im.ranks[1].scratch) + half_off;
+  const char* op = "allreduce";
+  if (glink_needs_prime(impl_->prim_mu, impl_->primed, dst_a, cbytes)) {
+    e = post_copy_retry(op, "P2P priming copy into rank A", dst_a, src_b, cbytes,
+                        cudaMemcpyDeviceToDevice, a.stream);
+    if (e != cudaSuccess) return fail("P2P priming copy into rank A", e);
+  }
+  if (glink_needs_prime(impl_->prim_mu, impl_->primed, dst_b, cbytes)) {
+    e = post_copy_retry(op, "P2P priming copy into rank B", dst_b, src_a, cbytes,
+                        cudaMemcpyDeviceToDevice, b.stream);
+    if (e != cudaSuccess) return fail("P2P priming copy into rank B", e);
+  }
+  e = post_copy_retry(op, "D2D copy into rank A", dst_a, src_b, cbytes, cudaMemcpyDeviceToDevice,
+                      a.stream);
+  if (e == cudaSuccess)
+    e = post_copy_retry(op, "D2D copy into rank B", dst_b, src_a, cbytes, cudaMemcpyDeviceToDevice,
+                        b.stream);
+  if (e != cudaSuccess) return fail("D2D copies", e);
+  // Copy-done snapshots. Each reduce waits for BOTH copies: its own (the landing is complete) and
+  // the peer's (the exit fence -- the in-place sum may not overwrite `in` while the peer still
+  // reads it). The copy streams wait on nothing here, so the next op's copies start at once.
+  e = cudaEventRecord(im.ranks[0].event, a.stream);
+  if (e == cudaSuccess) e = cudaEventRecord(im.ranks[1].event, b.stream);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(red_a, im.ranks[0].event, 0);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(red_a, im.ranks[1].event, 0);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(red_b, im.ranks[0].event, 0);
+  if (e == cudaSuccess) e = cudaStreamWaitEvent(red_b, im.ranks[1].event, 0);
+  if (e != cudaSuccess) return fail("copy-done events", e);
+  if (wq) {
+    e = detail::launch_glink_wire_reduce(a.out, wire_a, dst_a, n, wire, red_a);
+    if (e == cudaSuccess) e = detail::launch_glink_wire_reduce(b.out, wire_b, dst_b, n, wire, red_b);
+  } else {
+    e = detail::launch_glink_reduce(a.out, a.in, dst_a, n, dtype, false, red_a);
+    if (e == cudaSuccess) e = detail::launch_glink_reduce(b.out, b.in, dst_b, n, dtype, false, red_b);
+  }
+  return e == cudaSuccess || fail("reduce kernels", e);
+}
+
 bool GpuLink::maxreduce(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype) {
   return reduce_impl(a, b, bytes, dtype, /*is_max=*/true);
 }

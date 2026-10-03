@@ -113,6 +113,16 @@ all-reduce hides behind the other half), ~-2.5 s; (2) pipeline the next layer's 
 off the copy queue, ~-0.5 s, bit-exact; (4) chunk the out/o GEMM and post each chunk's all-reduce
 early, ~-0.17 s. Floor without C2: ~6-6.6 s (link 41 GB a direction).
 
+**C1 (lever 3) and C2 status: done (2026-10-03).** `GpuLink::allreduce_pipelined`: the async
+prefill ops copy on the side stream and reduce on a second per-rank stream, landing in
+alternating halves of the 512 MiB scratch (bit-identical, KL 0; +2 % at 31k, within noise at 3k:
+the link, not the reduce, is the bound). Its `wire` argument (`SPARKINFER_TP_AR_WIRE=int8|e4m3`)
+sends 8-bit codes + an fp32 scale per 128 values and both ranks add deq(own) + deq(peer):
+int8 KV prefill 3253 -> 4156 tok/s at 3k, 3173 -> 4271 at 31k. KL against the exact link:
+int8 codec 0.060 / 0.051 / 0.072 at 4k / 16k / 48k, e4m3 0.064 / 0.050 / 0.088 (1k: no chunked
+ops, exact). Not the default (plan 05: lossy link formats are opt-in). Still open: C1 levers 1, 2
+and 4 (micro-batch interleave, pipelined next-layer front, early out/o chunks).
+
 ## Part B: nvfp4 decode at memory bandwidth
 
 Goal: nvfp4 decode faster than fp8 at long context (118k: 38.4 → ≥ 47 tok/s), and the verify's

@@ -77,6 +77,22 @@ public:
   // No cudaSetDevice, no host sync, no host memory on the path.
   bool allreduce(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype);
 
+  // In-place sum (in == out on both ranks) with the copy and the reduce on DIFFERENT streams:
+  // the peer copy runs on a.stream / b.stream, the reduce kernel on red_a / red_b, so a queue of
+  // ops keeps the copy engines busy while the previous op reduces. The peer's data lands in half
+  // `slot` (0 or 1) of the scratch; the caller must order the copy of an op after the reduce of
+  // the previous op that used the same slot (red stream event -> copy stream wait), and the op is
+  // complete when red_a / red_b reach it. Same sum, bit for bit, as allreduce(). Falls back to
+  // allreduce() on the copy streams (then hands completion to the red streams) where the
+  // transport is not P2P, the buffers are not in place, or bytes exceed half the scratch.
+  //
+  // wire != 0 (bf16 only, elements % 128 == 0): each rank first quantizes its partial in place of
+  // sending it -- blocks of 128 values as 8-bit codes (1 e4m3, 2 int8) plus one fp32 scale, 132
+  // instead of 256 bytes -- and both ranks then add the two dequantized partials, so the sums are
+  // identical on both ranks but no longer exact. Opt-in (lossy).
+  bool allreduce_pipelined(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype,
+                           cudaStream_t red_a, cudaStream_t red_b, int slot, int wire = 0);
+
   // Elementwise max, same shape (for the vocab-split lm_head logits):
   //   out_r[i] = max(in_r[i], in_peer[i])
   bool maxreduce(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype);
@@ -111,6 +127,14 @@ cudaError_t launch_glink_reduce(void* dst, const void* a, const void* b, size_t 
 constexpr size_t kFlagMaxBytes = 256u << 10;
 // Forces the flag kernels' module to load on the current device (lazy loading); false on failure.
 bool preload_glink_flag_kernels();
+// Compressed wire (allreduce_pipelined with wire != 0): bf16 -> [n 8-bit codes][n/128 fp32
+// scales] (fmt 1 e4m3, 2 int8), and out = bf16(deq(own) + deq(peer)). n % 128 == 0.
+cudaError_t launch_glink_wire_quant(const void* in, void* wire, size_t n, int fmt,
+                                    cudaStream_t stream);
+cudaError_t launch_glink_wire_reduce(void* out, const void* own, const void* peer, size_t n,
+                                     int fmt, cudaStream_t stream);
+inline size_t glink_wire_bytes(size_t n) { return n + n / 128 * sizeof(float); }
+
 cudaError_t launch_glink_flag_allreduce(const void* in, void* out, void* peer_land,
                                         const void* my_land, unsigned* peer_flag,
                                         const unsigned* my_flag, unsigned seq, size_t n,

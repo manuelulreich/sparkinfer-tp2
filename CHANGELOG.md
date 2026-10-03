@@ -7,6 +7,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2 prefill: optional compressed all-reduce (`SPARKINFER_TP_AR_WIRE=int8|e4m3`, default
+  off).** The chunked prefill all-reduces can send blocks of 128 values as 8-bit codes plus one
+  fp32 scale (132 instead of 256 bytes, the codec of b12x's PCIe wire modes); each card quantizes
+  its own partial and both add the same two dequantized partials, so the replicated residual
+  stream stays identical on both cards. On 2× RTX 5060 Ti (PCIe Gen3 x8, ~6.5 GB/s P2P) prefill
+  goes 3253 -> 4156 tok/s at 3k and 3173 -> 4271 at 31k (int8 KV). Lossy: teacher-forced KL
+  against the exact link 0.06 / 0.05 / 0.07 at 4k / 16k / 48k (int8 codec; e4m3 0.06 / 0.05 /
+  0.09), the same order as int8 KV against bf16 KV. Also: the asynchronous prefill all-reduces
+  now copy and reduce on separate streams (`SPARKINFER_TP_AR_PIPE=0` restores one stream;
+  bit-identical, +2 % at 31k).
+
 - **fp8 and nvfp4 KV: prefill attention on the e4m3 tensor cores** (`SPARKINFER_PREFILL_ATTN_F8=0`
   restores the bf16 path). The int8 kernel's tiers, loads and V repack now also run e4m3 codes:
   Q and P' are quantized to e4m3 instead of int8 and both products use the e4m3 MMA with f32
