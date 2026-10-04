@@ -718,6 +718,7 @@ struct DFlashDraftModel::Impl {
     bf16* d2_hproj = nullptr;
     bf16* d2_pred = nullptr;
     bf16* d2_succ = nullptr;
+    void* d2_host_cb = nullptr;   // the two codebooks in pinned, mapped host memory (or null)
     bf16* d2_coef = nullptr;     // [B, 2 * taps * H / group]: the row's conv coefficients
     bf16* d2_cv = nullptr;       // [B, H]: a convolution's output
     bf16* d2_hp = nullptr;       // [B, rank]: the selector's hidden projection
@@ -1595,6 +1596,7 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
     if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
     if (p_->d2_h_tk_v) cudaFreeHost(p_->d2_h_tk_v);
+    if (p_->d2_host_cb) cudaFreeHost(p_->d2_host_cb);
     if (p_->d2_h_tk_i) cudaFreeHost(p_->d2_h_tk_i);
     if (p_->m_h_ids) cudaFreeHost(p_->m_h_ids);
     if (p_->m_h_out) cudaFreeHost(p_->m_h_out);
@@ -1725,12 +1727,29 @@ int DFlashDraftModel::kv_slide_capacity() const {
     return std::min(p_->cfg.max_seq, std::max(want, floor));
 }
 
+// DFlash2 windows every layer at sliding_window (2048), so a block's queries never read a key
+// older than its first position minus the window: that plus two blocks of slack is all a slide has
+// to keep. Half of the 4096 kept before, ~25 KB a position per card, so ~50 MB less per running
+// stream on each card. SPARKINFER_DFLASH2_TIGHT=0 restores 4096 (and the 4096-row capture).
+bool dflash2_tight_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_DFLASH2_TIGHT");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 int DFlashDraftModel::kv_slide_keep() const {
     static const int env = [] {
         const char* e = getenv("SPARKINFER_DSPARK_KV_KEEP");
         return e ? atoi(e) : 0;
     }();
-    return env > 0 ? env : 4096;
+    if (env > 0) return env;
+    const DFlashDraftConfig& c = p_->cfg;
+    if (c.dflash2 && dflash2_tight_on() && c.sliding_window > 0 &&
+        !getenv("SPARKINFER_DFLASH_FULL_WINDOW"))
+        return c.sliding_window + 2 * (c.block_size + 1);
+    return 4096;
 }
 
 int DFlashDraftModel::kv_valid_lo() const { return std::max(p_->kv_valid_lo, p_->kv_base); }
@@ -2221,8 +2240,37 @@ bool DFlashDraftModel::load(const std::string& dir) {
             return false;
         }
         s.d2_hproj = s.upload(*hp);
-        s.d2_pred = s.upload(*pc);
-        s.d2_succ = s.upload(*sc);
+        // (tp=2) The codebooks are [vocab, rank] bf16, 121 MiB each, and the walk reads only the
+        // anchor's and the candidates' rows -- at most 1 + depth * k of each a draft, ~58 KB. Keep
+        // them in pinned, mapped host memory and let the select kernel read those rows over PCIe:
+        // 243 MiB more free on card 0, the card that sets the KV pool. Same bytes, same kernel.
+        // SPARKINFER_DFLASH2_SELECTOR_HOST=0 keeps them on the device.
+        static const bool cb_host = [] {
+            const char* e = getenv("SPARKINFER_DFLASH2_SELECTOR_HOST");
+            return !(e && e[0] == '0');
+        }();
+        if (cb_host && s.cfg.tp_size == 2 && pc->nbytes == sc->nbytes &&
+            cudaHostAlloc(&s.d2_host_cb, 2 * pc->nbytes, cudaHostAllocMapped | cudaHostAllocPortable) ==
+                cudaSuccess) {
+            std::memcpy(s.d2_host_cb, pc->data, pc->nbytes);
+            std::memcpy((char*)s.d2_host_cb + pc->nbytes, sc->data, sc->nbytes);
+            void* dp = nullptr;
+            if (cudaHostGetDevicePointer(&dp, s.d2_host_cb, 0) == cudaSuccess) {
+                s.d2_pred = (bf16*)dp;
+                s.d2_succ = (bf16*)((char*)dp + pc->nbytes);
+            } else {
+                cudaGetLastError();
+                cudaFreeHost(s.d2_host_cb);
+                s.d2_host_cb = nullptr;
+            }
+        } else {
+            cudaGetLastError();
+            s.d2_host_cb = nullptr;
+        }
+        if (!s.d2_host_cb) {
+            s.d2_pred = s.upload(*pc);
+            s.d2_succ = s.upload(*sc);
+        }
     }
 
     auto* mw1 = optional("markov_head.markov_w1.weight");
@@ -2454,9 +2502,12 @@ bool DFlashDraftModel::tp_attach(DFlashDraftModel* peer, int peer_device, cudaSt
     }
     // The batched path's row scratch is taken now, on both cards: a rank that could not allocate
     // it lazily, mid-step, would leave the other one waiting in a link op.
+    // DFlash2 never takes it (multi_plan wants DSpark's Markov head and an unwindowed draft), and
+    // rank 0's share holds a [32, vocab] f32 logits plane: 30 MiB for nothing.
     bool peer_multi = false;
-    tp_run_with_peer(peer_device, [&] { peer_multi = peer->p_->multi_alloc(); },
-                     [&] { s.multi_alloc(); });
+    if (!s.cfg.dflash2)
+        tp_run_with_peer(peer_device, [&] { peer_multi = peer->p_->multi_alloc(); },
+                         [&] { s.multi_alloc(); });
     s.tp_peer = peer;
     s.tp_peer_dev = peer_device;
     s.tp_stream = stream;

@@ -7,6 +7,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2 DFlash2: ~280 MiB more free on card 0, ~35 MiB less per running stream**
+  (`SPARKINFER_DFLASH2_SELECTOR_HOST`, `SPARKINFER_DFLASH2_TIGHT`). The selector's codebooks
+  (243 MiB, card 0 only) moved to pinned, mapped host memory, read row by row by the unchanged
+  select kernel (drafts bit-identical, draft time unchanged); the batched-path scratch DFlash2
+  never uses (36 MiB on card 0) is no longer allocated; the draft KV keeps window + two blocks and
+  a joining stream captures only that much of its prompt. The cards now differ by 4 MiB after
+  load (was 248). Peak with 4 concurrent streams: +652/+718 -> +522 MiB per card over idle.
+  At `CTX=262144` a 360,448-token pool now leaves 646 MiB free and 4 x 89k concurrent streams
+  keep the drafter (they lost it before).
+
 - **tp=2: prefill scratch reserved at load, fixed 4096-token windows** (`SPARKINFER_PREFILL_RESERVE`,
   on by default at `--tp 2`). A warm-up of each pass shape (two windows, a 512-row and a 127-row
   pass, ~2 s) takes the scratch once; every pass then reuses it, and the per-pass choices that

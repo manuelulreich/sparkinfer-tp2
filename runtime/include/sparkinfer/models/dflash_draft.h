@@ -86,6 +86,9 @@ struct DFlashDraftConfig {
 // packed e2m1], the tp=2 target's NVFP4 head once its Q4_K copy is released): scored with
 // kernels::launch_gemv_nvfp4_rows_dp4a_f32 where the tensor-core head does not apply.
 constexpr int kLmHeadNvfp4Type = 1000;
+// DFlash2 keeps only its attention window (+ two blocks) of draft KV and captures only that much
+// of a joining prompt (SPARKINFER_DFLASH2_TIGHT, default on).
+bool dflash2_tight_on();
 
 class DFlashDraftModel {
 public:

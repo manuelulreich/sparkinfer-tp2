@@ -9545,6 +9545,12 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         int capture_start = 0;
         if (kCaptureMax > 0 && g.n > kCaptureMax) capture_start = g.n - kCaptureMax;
         else if (g.n >= 12288) capture_start = g.n - 4096;
+        // DFlash2 attends a 2048 window in every layer, so the first draft reads only the kept
+        // span: capture that much of the prompt, not all of it below 12288 (up to ~0.3 GB a card
+        // while the stream joins) or 4096 rows above.
+        if (dc.dflash2 && kCaptureMax == 0 && g.n > draft.kv_slide_keep() &&
+            draft.kv_slide_keep() < 4096)
+            capture_start = std::max(capture_start, g.n - draft.kv_slide_keep());
         capture_start = std::max(capture_start, h);
         if (g.n - capture_start + 2L * (B + 1) > dc.max_seq) return false;
         // The context buffer only feeds this join's first draft (the prompt's rows); every later

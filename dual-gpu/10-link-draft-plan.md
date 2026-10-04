@@ -87,6 +87,16 @@ out of memory (those streams decoded without the drafter). Practical maximum: ~3
 total. Decode cohort at `CTX=262144` (512 tok, prompts_real): greedy C1/C2/C4 130/231/292,
 sampled 132/178/270; C4 A/B (131k 307, old memory layout 276) is within its run-to-run noise.
 
+**Per-stream memory (2026-10-04).** Card 0 carried the DFlash2 selector codebooks alone
+(243 MiB) and 36 MiB of unused batched-path scratch: codebooks now in mapped host memory (the
+select kernel reads its ~113 rows per table over PCIe, draft 3.51 ms either way, bit-identical),
+scratch skipped; cards within 4 MiB. Draft KV keep 4096 -> 2066 (window + two blocks) and the
+join capture capped at the same span: deterministic acceptance unchanged at 2k/4k/10k, 21k
+1.908-1.922 vs 1.892, 51k 1.688 vs 1.719 (rounding of the drafts). Peak over idle per card:
+1 stream +168 MiB, 4 streams +522 (was +652 at 15k-token prompts, +718 at 7k). A load-time
+reservation for 4 streams (item 1) would therefore take ~520 MiB per card (~57k pool tokens).
+360k pool: 646 MiB free after load, 4 x 89k concurrent ran with no allocation failure.
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |
