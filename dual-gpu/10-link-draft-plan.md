@@ -49,6 +49,23 @@ micro-batch interleave (~0.9 s of link waits a 20k prefill); fusing the GDN comm
 verify; DFlash2 batched drafting for concurrent sessions; first-request determinism (prefill
 windows follow free memory).
 
+## Memory audit (2026-10-04)
+
+`SPARKINFER_MEM_LOG=1` (981c147) prints each card's used memory at the load milestones. Idle per
+card at `CTX=131072`, before -> after: 13,159 -> 11,191 MiB (nvidia-smi, card 0), from
+(1) the token embedding table in pinned host memory, 1,212 MiB (6bf4cfa, exact);
+(2) the all-reduce scratch 512 -> 96 MiB with larger ops in pieces, 416 MiB (dcba169, exact);
+(3) one lm_head: the Q4_K copy released, the NVFP4 head serving every row, ~340 MiB (71ca887;
+gates pass, eval-corpus perplexity 4.468 -> 4.459). Left as it was: layers 7,856 MiB, DFlash2
+draft 970/690 MiB, NVFP4 head 380 MiB, constructor (decode buffers) 240 MiB, CUDA context 204 MiB.
+
+`SPARKINFER_KV_POOL_TOKENS` sizes the shared KV pool apart from `--ctx` (default: equal). Fresh
+prompt, `startup.sh`, by pool size: 131k 3.7 / 13.8 s (20k / 60k), 262k 3.7 / 13.9 s, 327k
+3.8 / 14.3 s. `CTX=262144` (pool = model max, 2.25 GiB per card) now costs no prefill speed
+(it was 60k 20.8 s before the audit). HyperQwen's fp8 pool on the same cards: 210k tokens.
+Note: more free memory can change the prefill's window choices (16k windows where 8k were
+taken), which changes long-prompt output slightly -- the known "windows follow free memory".
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |
