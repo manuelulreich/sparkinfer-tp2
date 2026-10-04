@@ -719,10 +719,17 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             // layer). Rank 1 (impl_->tp_models[0]) is handed nothing -- it only runs on the
             // leader's threads and never issues a link op itself.
             impl_->tp_link = std::make_unique<sparkinfer::GpuLink>();
-            // max_bytes 512 MiB: the 1 MiB default sits below the ~168 MB prefill
-            // all-reduce at m=16k, so every large op would be refused by the byte budget.
+            // The landing scratch on each card. A larger op runs as pieces that fit it (same
+            // sums), so this only needs to hold the prefill's per-chunk all-reduces whole: a
+            // 2048-row chunk is 21 MB, which fits a pipelined half of 96 MiB with its wire codes.
+            // It was 512 MiB (sized for one 168 MB op at m=16k), 416 MiB more on each card.
+            // SPARKINFER_TP_LINK_MB overrides (min 8).
+            const size_t link_mb = [] {
+                const char* e = getenv("SPARKINFER_TP_LINK_MB");
+                return (size_t)(e && atoi(e) >= 8 ? atoi(e) : 96);
+            }();
             if (!impl_->tp_link->init(eff[0], eff[1], sparkinfer::GpuLink::Transport::Auto,
-                512 * 1024 * 1024)) {
+                link_mb << 20)) {
                 fprintf(stderr,
                         "[sparkinfer-server] tp=2: GpuLink init failed (dev %d/%d)\n",
                         eff[0], eff[1]);

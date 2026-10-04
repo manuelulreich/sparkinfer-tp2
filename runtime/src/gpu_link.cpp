@@ -509,8 +509,22 @@ bool GpuLink::reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtyp
   if (a.in == nullptr || a.out == nullptr || b.in == nullptr || b.out == nullptr)
     return fail("null buffer pointer", cudaSuccess);
   const size_t esize = detail::glink_dtype_size(dtype);
-  if (bytes == 0 || bytes > im.max_bytes) return fail("size 0 or beyond max_bytes", cudaSuccess);
+  if (bytes == 0) return fail("size 0", cudaSuccess);
   if (bytes % esize != 0) return fail("size not a multiple of the element size", cudaSuccess);
+  if (bytes > im.max_bytes) {
+    // Beyond the landing scratch: consecutive pieces that fit it. Each piece is a whole op with
+    // its own entry and exit fences, and the sum is elementwise, so the result is the same.
+    const size_t piece = im.max_bytes / esize * esize;
+    for (size_t off = 0; off < bytes; off += piece) {
+      const size_t nb = (bytes - off < piece) ? bytes - off : piece;
+      const RankRef pa{a.device, a.stream, static_cast<const char*>(a.in) + off,
+                       static_cast<char*>(a.out) + off};
+      const RankRef pb{b.device, b.stream, static_cast<const char*>(b.in) + off,
+                       static_cast<char*>(b.out) + off};
+      if (!reduce_impl(pa, pb, nb, dtype, is_max)) return false;
+    }
+    return true;
+  }
   const size_t n = bytes / esize;
 
   // Entry-time cross-context events: record each rank's event on its own stream NOW, before this
@@ -669,6 +683,40 @@ bool GpuLink::allreduce(const RankRef& a, const RankRef& b, size_t bytes, Dtype 
 
 bool GpuLink::allreduce_pipelined(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype,
                                   cudaStream_t red_a, cudaStream_t red_b, int slot, int wire) {
+  if (!impl_ || !impl_->ready || !red_a || !red_b) return reduce_impl(a, b, bytes, dtype, false);
+  const Impl& im = *impl_;
+  // A piece fits half the scratch with its wire codes in a quarter: 15/32 of the half, rounded
+  // down to whole 128-value wire blocks so the codes and scales are those of the whole op.
+  const size_t piece = (im.max_bytes / 2) * 15 / 32 / 256 * 256;
+  if (piece == 0 || bytes <= piece || a.in != a.out || b.in != b.out ||
+      im.resolved != GpuLink::Transport::P2pMapped)
+    return pipelined_piece(a, b, bytes, dtype, red_a, red_b, slot, wire);
+  // Larger: pieces through the same slot half. Piece k+1's quantize and copy reuse what piece
+  // k's reduce reads, so each copy stream first waits for its own rank's previous reduce (which
+  // itself waited for both copies). The caller's slot ordering covers the first piece.
+  for (size_t off = 0; off < bytes; off += piece) {
+    const size_t nb = (bytes - off < piece) ? bytes - off : piece;
+    if (off) {
+      cudaError_t e = cudaEventRecord(im.ranks[0].event, red_a);
+      if (e == cudaSuccess) e = cudaEventRecord(im.ranks[1].event, red_b);
+      if (e == cudaSuccess) e = cudaStreamWaitEvent(a.stream, im.ranks[0].event, 0);
+      if (e == cudaSuccess) e = cudaStreamWaitEvent(b.stream, im.ranks[1].event, 0);
+      if (e != cudaSuccess) {
+        GLINK_LOG("[gpu_link] allreduce_pipelined: piece ordering: %s\n", cudaGetErrorString(e));
+        return false;
+      }
+    }
+    const RankRef pa{a.device, a.stream, static_cast<const char*>(a.in) + off,
+                     static_cast<char*>(a.out) + off};
+    const RankRef pb{b.device, b.stream, static_cast<const char*>(b.in) + off,
+                     static_cast<char*>(b.out) + off};
+    if (!pipelined_piece(pa, pb, nb, dtype, red_a, red_b, slot, wire)) return false;
+  }
+  return true;
+}
+
+bool GpuLink::pipelined_piece(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype,
+                              cudaStream_t red_a, cudaStream_t red_b, int slot, int wire) {
   auto fail = [&](const char* why, cudaError_t e) -> bool {
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 20)

@@ -215,6 +215,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2: 416 MiB more free on each card (all-reduce scratch 512 -> 96 MiB).** The GpuLink landing
+  scratch was sized for one 168 MB all-reduce (a 16k-row prefill window); an op larger than it now
+  runs as consecutive pieces (the pipelined int8-wire path in whole 128-value blocks, so codes,
+  scales and sums are those of the whole op). Greedy output identical at 96 and at 16 MiB
+  (deterministic mode, 300 / 9k / 20k tokens); 20k prefill unchanged. `SPARKINFER_TP_LINK_MB`.
 - **tp=2 prefill: the link stays busy through the GDN middle and the attention front
   (+8-12 % prefill, bit-identical).** With the int8 wire one 1024-row all-reduce takes ~0.85 ms
   on the PCIe Gen3 link, about one FFN chunk of compute, but the link sat idle through each GDN

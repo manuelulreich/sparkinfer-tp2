@@ -56,8 +56,9 @@ public:
   // P2P-mapped fast path (peer access in both directions) and falls back to pinned-host
   // staging; the choice is logged to stdout. Forced transports fail init (loudly) when
   // unavailable — a forced-P2pMapped failure on a pair that showed P2P at probe time is
-  // the G1 regression signal. `max_bytes` bounds every op (bytes <= max_bytes and
-  // bytes % element_size == 0). Returns false (and logs) on any driver failure.
+  // the G1 regression signal. `max_bytes` sizes each rank's landing scratch; a larger op runs
+  // as consecutive pieces that fit it (elementwise, so the same sums). bytes % element_size
+  // must be 0. Returns false (and logs) on any driver failure.
   bool init(int dev_a, int dev_b, Transport transport = Transport::Auto,
             size_t max_bytes = 1u << 20);
 
@@ -102,6 +103,8 @@ private:
   std::unique_ptr<Impl> impl_;
 
   bool reduce_impl(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype, bool is_max);
+  bool pipelined_piece(const RankRef& a, const RankRef& b, size_t bytes, Dtype dtype,
+                       cudaStream_t red_a, cudaStream_t red_b, int slot, int wire);
 };
 
 namespace detail {
