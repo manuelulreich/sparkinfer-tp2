@@ -401,3 +401,25 @@ If 2–5 land, a step at 20k drops from ~31 ms to ~26–27 ms, i.e. ~100 → ~11
 
 Measurements stay short (a few minutes): the 60k replay (256 tokens), the ~20k opencode final answer,
 `tp2_gates.py`, and the deterministic exactness check.
+
+## Future: interleave a joining request's prefill with the group's steps (not started)
+
+Found reading the request path (2026-10-04); nothing is implemented.
+
+- **What happens now.** A request that joins a running speculative group is prefilled whole
+  inside `join()` (`Qwen35Model::dflash_generate_group`, runtime/src/models/qwen35.cpp,
+  `prefill_range`) before the group takes its next step. Every other stream in the group stops
+  for that time.
+- **What it costs.** It costs nothing with one agent. With several, each turn's uncached tail stalls all the
+  others. Live opencode numbers: 93 % of prompt tokens come from the prefix cache, leaving ~4k
+  tokens a turn, i.e. 1–2 s of stall per foreign turn. At four agents taking a turn every ~10 s
+  that is an estimated 20–40 % of aggregate throughput (not measured).
+- **What vLLM does.** Chunked prefill: prefill chunks share steps with decode, so running streams
+  slow down a little instead of stopping.
+- **Fix.** Prefill the newcomer in 1–2k-token windows (`prefill_batched_resume` already resumes
+  at any block-aligned position), one window between group steps.
+  - The newcomer joins the verify/draft rows only once its prefill is complete.
+  - Prefix-cache checkpoints and the drafter's capture rows have to follow the windows.
+  - Effort: medium.
+- **Measure.** Four synthetic agents with staggered turns: per-stream tok/s during a foreign
+  turn's prefill, before and after.
