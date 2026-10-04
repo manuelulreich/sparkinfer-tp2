@@ -215,6 +215,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **1.2 GB more free on each card: the token embedding table in pinned host memory.** The bf16
+  table (half the vocabulary per card at tp=2, 1.27 GB) was read a few rows a step; it is now one
+  mapped host table shared by both ranks (and read whole by the DFlash2 drafter, which drops its
+  split lookup and peer copies). Same bytes through the same kernels: deterministic greedy
+  output identical with matched free memory (more free memory can change the prefill's window
+  choices, and with them the output, as before). Greedy cohort C1/C4 unchanged within noise;
+  20k prefill 3.7 -> 3.6 s. `SPARKINFER_EMBED_HOST=0` restores the device table.
 - **tp=2: 416 MiB more free on each card (all-reduce scratch 512 -> 96 MiB).** The GpuLink landing
   scratch was sized for one 168 MB all-reduce (a 16k-row prefill window); an op larger than it now
   runs as consecutive pieces (the pipelined int8-wire path in whole 128-value blocks, so codes,

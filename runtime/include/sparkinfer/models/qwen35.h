@@ -808,6 +808,9 @@ public:
 
     // Shared weights for DFlash draft (embed + lm_head come from target).
     const void* embed_weights() const;
+    // The whole [vocab, hidden] bf16 embedding table when it lives in pinned host memory (shared
+    // by both tp ranks, each reading its own vocab window of it); null when it is on the device.
+    const void* embed_host_table() const;
     const void* lm_head_weights() const;
     int lm_head_quant_type() const;
 

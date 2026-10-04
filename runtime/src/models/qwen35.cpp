@@ -751,6 +751,7 @@ struct Qwen35Model::Impl {
     float* d_denom_det = nullptr;
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
+    const void* embed_host_full = nullptr;   // see embed_host_table()
     // GGUF fused-expert decode scratch (allocated by load_gguf)
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     // Decode-side NVFP4 FFN scratch (the default path; SPARKINFER_QWEN38_DECODE_NVFP4=0 opts out):
@@ -7597,6 +7598,7 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
 }
 
 const void* Qwen35Model::embed_weights() const { return p_->w.embed_tokens; }
+const void* Qwen35Model::embed_host_table() const { return p_->embed_host_full; }
 const void* Qwen35Model::lm_head_weights() const { return p_->w.lm_head; }
 int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
@@ -8052,9 +8054,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // half (the mask token among them) come from the peer's table.
     Qwen35Model* tp_draft_peer = (tp_active() && s.tp_rank == 0 && s.tp_peers.size() == 2)
                                      ? s.tp_peers[1] : nullptr;
-    draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
+    // A host-resident embedding table is whole: the draft reads it directly, unsplit.
+    const void* draft_embed = embed_host_table() ? embed_host_table() : embed_weights();
+    draft.set_shared_weights(draft_embed, draft_head, draft_head_type,
                              tp_draft_peer ? s.cfg.vocab / 2 : s.cfg.vocab, s.cfg.hidden);
-    if (tp_draft_peer)
+    if (tp_draft_peer && !embed_host_table())
         draft.set_embed_split(s.cfg.vocab / 2, tp_draft_peer->embed_weights(),
                               tp_draft_peer->tp_rank_view().device);
     else
@@ -9367,11 +9371,14 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                                : (s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights());
         const int draft_head_type = use_q4_head ? lm_head_quant_type()
                                   : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
-        draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
+        draft.set_shared_weights(embed_host_table() ? embed_host_table() : embed_weights(),
+                                 draft_head, draft_head_type,
                                  tp_draft_peer ? s.cfg.vocab / 2 : s.cfg.vocab, s.cfg.hidden);
-        if (tp_draft_peer)
+        if (tp_draft_peer && !embed_host_table())
             draft.set_embed_split(s.cfg.vocab / 2, tp_draft_peer->embed_weights(),
                                   tp_draft_peer->tp_rank_view().device);
+        else
+            draft.set_embed_split(0, nullptr, -1);
         draft.set_head_fp4(s.w.lm_head_fp4, s.w.lm_head_fp4_sf, s.w.lm_head_fp4_alpha);
         if (tp_draft_peer)   // DFlash2 scores the second card's vocab half there
             draft.set_peer_head([pm = tp_draft_peer] {
@@ -12145,6 +12152,32 @@ void Qwen35Model::print_tp_audit(int ctx) const {
 // requantized to Q4_K (attn q/k/v/o, lm_head, FFN layers 56-63). NVFP4 FFN tensors
 // (layers 0-55) keep the checkpoint packed bytes for prefill (CUTLASS SFB + GEMM
 // alpha = 1/weight_global_scale) and a Q4_K decode copy (native GEMV is slower).
+// (plan 10 memory audit) The token embedding table in pinned, mapped host memory instead of on the
+// cards: 1.2 GB of bf16 rows per card at tp=2 of which a step reads a handful (8 for a verify, a
+// window's 4096 for a prefill, ~41 MB over PCIe). The kernels read it through unified addressing,
+// so every lookup returns the same bytes. One table for the whole vocabulary, process-wide: each
+// tp rank copies its own vocab window in and reads its window of it, and the draft reads all of it.
+// SPARKINFER_EMBED_HOST=0 keeps the table on the device.
+static bool embed_host_on() {
+    static const bool on = [] { const char* e = getenv("SPARKINFER_EMBED_HOST"); return !(e && e[0] == '0'); }();
+    return on;
+}
+static void* embed_host_table_alloc(size_t bytes) {
+    static std::mutex mu;
+    static void* table = nullptr;
+    static size_t table_bytes = 0;
+    std::lock_guard<std::mutex> lk(mu);
+    if (table && table_bytes == bytes) return table;
+    if (table) return nullptr;   // a second, different model: keep it on the device
+    if (cudaHostAlloc(&table, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        table = nullptr;
+        return nullptr;
+    }
+    table_bytes = bytes;
+    return table;
+}
+
 bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     Impl& s = *p_;
     q35_mem_mark("ctor done (load start)");
@@ -12967,6 +13000,34 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             return ct_bf16_slice("model.language_model.embed_tokens.weight", c.vocab, H, false,
                                  sl, nullptr);
         });
+    if (s.w.embed_tokens && embed_host_on()) {
+        TpSlice esl;
+        const TpDec ed = tp_decide("model.language_model.embed_tokens.weight", tp_rank, &esl);
+        size_t r0 = 0, nr = (size_t)c.vocab;
+        bool ok = ed == TpDec::Whole;
+        if (ed != TpDec::Whole && ed != TpDec::Skip && esl.axis == tp::Axis::Rows &&
+            esl.ranges.size() == 1) {
+            r0 = esl.ranges[0].begin;
+            nr = esl.ranges[0].len;
+            ok = r0 + nr <= (size_t)c.vocab;
+        }
+        bf16* host = ok ? static_cast<bf16*>(embed_host_table_alloc((size_t)c.vocab * H * sizeof(bf16)))
+                        : nullptr;
+        auto it = std::find(s.owned.begin(), s.owned.end(), s.w.embed_tokens);
+        if (host && it != s.owned.end() &&
+            cudaMemcpy(host + r0 * H, s.w.embed_tokens, nr * H * sizeof(bf16),
+                       cudaMemcpyDeviceToHost) == cudaSuccess) {
+            cudaFree(*it);
+            s.owned.erase(it);
+            s.w.embed_tokens = host + r0 * H;
+            s.embed_host_full = host;
+            fprintf(stderr, "[compressed-tensors] embedding rows [%zu, %zu) in pinned host memory "
+                            "(%.2f GB off the card; SPARKINFER_EMBED_HOST=0 keeps them on it)\n",
+                    r0, r0 + nr, nr * H * sizeof(bf16) / 1e9);
+        } else {
+            cudaGetLastError();
+        }
+    }
     s.w.final_norm = tp_pick("model.language_model.norm.weight",
         [&]{ return load_norm_plus1("model.language_model.norm.weight", H); },
         [&](const TpSlice& sl) {
