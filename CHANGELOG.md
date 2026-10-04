@@ -7,6 +7,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2: opt-in speculative (rejection) sampling for DFlash2** (`SPARKINFER_SPEC_REJECTION=1`).
+  The selector's sampled walk reports its proposal distribution q (the candidates it draws from,
+  softmax(score / temperature)); the verify accepts a drafted token with probability min(1, p/q)
+  and draws the first rejected position from max(0, p - q), so the output follows the model's
+  sampling distribution, as vLLM's speculative decoding does, without reproducing ordinary
+  decode's tokens for a seed. Sampled acceptance 3.09-3.12 -> 3.28-3.42 tokens a step at 20k,
+  2.93 -> 3.23 at 60k; 113 -> 120-124 tok/s and 96 -> 105 tok/s. In the near-greedy limit
+  (temperature 0.01, deterministic mode) it gives exactly the exact mode's output. Default off:
+  sampled speculation stays byte-identical to ordinary sampled decode.
+
 - **tp=2: DFlash2 drafter** (`--draft-model` on `incoai/Qwen3.8-27B-DFlash2`, detected from
   `config.json`; DSpark keeps working unchanged). The same block-drafter family as DSpark plus
   a grouped 2-tap convolution around each attention and MLP, a native 2048-token sliding window

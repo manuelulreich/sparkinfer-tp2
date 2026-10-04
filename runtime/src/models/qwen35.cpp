@@ -4677,6 +4677,79 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
            "smp out");
         cu(cudaStreamSynchronize(st), "tp verify sample sync");
         for (int r = 0; r < n; r++) out_argmax[r] = h_out[r];
+        // Rejection sampling (rows carrying the draft's q, see SpecSampleRow): walk each session's
+        // rows in order; row t accepts the token it checks (the next row's id) with probability
+        // min(1, p/q), else draws from max(0, p - q) and the session stops there. p is this row's
+        // sampling distribution as k_rows_sample_candidates draws it (top_k, the top_p prefix at
+        // temperature 1, softmax(logit / temperature)); a proposal outside the walk's table (an
+        // n-gram lookup) is a point mass, q = 1. A fully accepted session keeps the last row's
+        // ordinary draw. Host-side, from data both ranks hold identically, with a counter-based
+        // RNG of (seed, step): both ranks keep the same tokens.
+        if (seg) {
+            constexpr int QT = dflash_kernels::kDraftQTab;
+            auto rng = [](unsigned long long seed, unsigned long long step, unsigned long long salt) {
+                unsigned long long z = seed ^ (step * 0x9E3779B97F4A7C15ull) ^ (salt * 0xD1B54A32D192ED03ull);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+                z ^= z >> 31;
+                return (double)(z >> 11) * (1.0 / 9007199254740992.0);   // [0, 1)
+            };
+            for (int j = 0; j < S; j++) {
+                for (int t = 0; t + 1 < T; t++) {
+                    const int r = t * S + j;
+                    const SpecSampleRow& rs = row_sample[r];
+                    if (!(rs.temperature > 0.f) || !rs.q_p || !rs.q_ids) break;
+                    const float* v = h_mv + (size_t)r * K;
+                    const int* ix = h_mi + (size_t)r * K;
+                    int kk = rs.top_k;
+                    if (kk <= 0 || kk > K) kk = K;
+                    double cum[dflash_kernels::kRowsTopkMax];
+                    double run = 0.0;
+                    for (int i = 0; i < kk; i++) { run += std::exp((double)v[i] - v[0]); cum[i] = run; }
+                    const bool p_active = rs.top_p >= 0.f && rs.top_p < 1.f;
+                    int m = 0;
+                    for (int i = 0; i < kk; i++) {
+                        if (i > 0 && p_active && !(cum[i - 1] < rs.top_p * cum[kk - 1])) break;
+                        if (ix[i] == INT_MAX || v[i] == -INFINITY) break;
+                        m = i + 1;
+                    }
+                    if (m == 0) break;
+                    double pw[dflash_kernels::kRowsTopkMax], z = 0.0;
+                    for (int i = 0; i < m; i++) { pw[i] = std::exp(((double)v[i] - v[0]) / rs.temperature); z += pw[i]; }
+                    for (int i = 0; i < m; i++) pw[i] /= z;
+                    const int x = ids[(size_t)(t + 1) * S + j];
+                    double px = 0.0, qx = -1.0;
+                    for (int i = 0; i < m; i++) if (ix[i] == x) { px = pw[i]; break; }
+                    for (int i = 0; i < QT && rs.q_ids[i] >= 0; i++)
+                        if (rs.q_ids[i] == x) { qx = rs.q_p[i]; break; }
+                    const bool point = !(qx > 0.0);   // not in the walk's table: an n-gram proposal
+                    if (point) qx = 1.0;
+                    if (rng(rs.seed, rs.step, 1) * qx < px) { out_argmax[r] = x; continue; }
+                    // Rejected: draw from max(0, p - q) over this row's candidates.
+                    double rw[dflash_kernels::kRowsTopkMax], rz = 0.0;
+                    for (int i = 0; i < m; i++) {
+                        double qv = 0.0;
+                        if (point) qv = ix[i] == x ? 1.0 : 0.0;
+                        else
+                            for (int q = 0; q < QT && rs.q_ids[q] >= 0; q++)
+                                if (rs.q_ids[q] == ix[i]) { qv = rs.q_p[q]; break; }
+                        rw[i] = std::max(0.0, pw[i] - qv);
+                        rz += rw[i];
+                    }
+                    if (!(rz > 0.0)) { for (int i = 0; i < m; i++) rw[i] = pw[i]; rz = 1.0; }
+                    double u = rng(rs.seed, rs.step, 2) * rz;
+                    int pick = ix[m - 1];
+                    for (int i = 0; i < m; i++) {
+                        if (rw[i] <= 0.0) continue;
+                        if (u < rw[i]) { pick = ix[i]; break; }
+                        u -= rw[i];
+                        pick = ix[i];
+                    }
+                    out_argmax[r] = pick;
+                    break;
+                }
+            }
+        }
     } else if (!head_ar && n <= 64) {
         kernels::launch_argmax(s.vr_lh, s.vr_out, n, Vr, st);
         cu(cudaMemcpyAsync(s.h_vr + 3 * R, s.vr_out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
@@ -9259,6 +9332,8 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
         int lk_len = 0;          // its match length (0: none)
         bool lk_run = false;     // the last step accepted every row and the lookup agreed
         std::vector<uint32_t> masks;   // constrained: each verify row's allowed tokens, [T][words]
+        std::vector<float> q_p;        // rejection sampling: the draft's q per proposal, [B][kDraftQTab]
+        std::vector<int> q_ids;
         bool done = false;
     };
     std::vector<G> gs;
@@ -9304,7 +9379,16 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
     // A sampled session's draft walk (DFlash2) draws each proposal with the noise its verify row
     // will: block[i] sits at the request's step start + i - n, so the walk's first proposal
     // (block[1]) is at start + 1 - n.
-    auto walk_of = [](const SpecGroupJob& job, int start, int n) {
+    // SPARKINFER_SPEC_REJECTION=1: sampled sessions accept a drafted token with probability
+    // min(1, p / q) and draw the first rejected position from max(0, p - q) (speculative sampling),
+    // instead of accepting only what plain sampled decode would draw. The output has the target's
+    // distribution, but not plain decode's tokens for the same seed. DFlash2 only (its walk
+    // reports q); off by default.
+    static const bool kRejection = [] {
+        const char* e = getenv("SPARKINFER_SPEC_REJECTION");
+        return e && e[0] == '1';
+    }();
+    auto walk_of = [&](const SpecGroupJob& job, int start, int n, G* gq = nullptr) {
         DFlashDraftModel::DraftWalk w;
         if (job.temperature > 0.f) {
             w.temperature = job.temperature;
@@ -9312,6 +9396,13 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
             w.top_p = job.top_p;
             w.seed = job.seed;
             w.step0 = (unsigned long long)(start + 1 - n);
+            if (kRejection && gq && dc.dflash2) {
+                constexpr int QT = dflash_kernels::kDraftQTab;
+                gq->q_p.assign((size_t)(BB + 1) * QT, 0.f);
+                gq->q_ids.assign((size_t)(BB + 1) * QT, -1);
+                w.q_p = gq->q_p.data();
+                w.q_ids = gq->q_ids.data();
+            }
         }
         return w;
     };
@@ -9519,7 +9610,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                         snap && from < h ? "snapshot" : "none");
         }
         if (first_ok) {
-            draft.set_walk(walk_of(*job, g.start, g.n));
+            draft.set_walk(walk_of(*job, g.start, g.n, &g));
             first_ok = draft.forward_block(dflash_context_buffer(), ctx_rows, g.block.data(),
                                            g.start, draft_ids.data(), nullptr, D, nullptr,
                                            ctx_hidden_start);
@@ -9661,7 +9752,7 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                 ds.ids = g->block.data();
                 ds.pos0 = g->start;
                 ds.out_argmax = g->draft_out.data();
-                ds.walk = walk_of(*g->job, g->start, g->n);
+                ds.walk = walk_of(*g->job, g->start, g->n, g);
                 dsegs.push_back(ds);
                 dg.push_back(g);
             }
@@ -9718,6 +9809,12 @@ void Qwen35Model::dflash_generate_group(std::vector<SpecGroupJob*> jobs,
                     rs.top_p = jb.top_p;
                     rs.seed = jb.seed;
                     rs.step = (unsigned long long)(act[j]->start + t + 1 - act[j]->n);
+                    // Row t checks block[t + 1], the walk's proposal t (its q table t).
+                    const G& gg = *act[j];
+                    if (kRejection && t + 1 < T && !gg.q_p.empty()) {
+                        rs.q_p = gg.q_p.data() + (size_t)t * dflash_kernels::kDraftQTab;
+                        rs.q_ids = gg.q_ids.data() + (size_t)t * dflash_kernels::kDraftQTab;
+                    }
                 }
             }
             auto _tv = std::chrono::steady_clock::now();

@@ -78,12 +78,17 @@ void launch_dflash2_conv(const void* x, const void* coef, const void* base, void
 // over the scores (top_k, top_p at temperature 1, argmax of score / temp + the Philox Gumbel noise
 // of (seed, token id, step0 + l))). out[l] = the id. k <= 32. Candidates outside [0, vocab) score
 // -inf.
+// q_p / q_i (optional, sampled walk only): per step, the walk's proposal distribution -- the
+// candidates it draws from (top_k and the top_p prefix) as ids and softmax(score / temp)
+// probabilities, kDraftQTab entries a step (id -1 past the last). For rejection sampling.
+constexpr int kDraftQTab = 32;
 void launch_dflash2_select(const int* cand_i, const float* cand_v, int cand_stride,
                            const void* hp, int hp_stride, const int* anchor, const void* pred,
                            const void* succ, int vocab, int rank, int k, int steps,
                            float multiplier, float softcap, int* out, cudaStream_t stream,
                            float temp = 0.f, int top_k = 0, float top_p = 1.f,
-                           unsigned long long seed = 0, unsigned long long step0 = 0);
+                           unsigned long long seed = 0, unsigned long long step0 = 0,
+                           float* q_p = nullptr, int* q_i = nullptr);
 
 // x[i] *= s over n bf16 values.
 void launch_scale_bf16(void* x, long n, float s, cudaStream_t stream);

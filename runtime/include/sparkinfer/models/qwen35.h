@@ -466,6 +466,11 @@ public:
         int top_k = 0;
         float top_p = 1.f;
         unsigned long long seed = 0, step = 0;
+        // Rejection sampling (SPARKINFER_SPEC_REJECTION=1): the draft's proposal distribution for
+        // the token this row checks (the session's next row's id) -- dflash_kernels::kDraftQTab
+        // ids and probabilities -- or null (the row then draws as ordinary decode would).
+        const float* q_p = nullptr;
+        const int* q_ids = nullptr;
     };
     // row_mask (optional, per row): the allowed-token bitmask over the whole vocabulary (bit id % 32
     // of word id / 32), or null for an unconstrained row. A masked-out token's logit gets the

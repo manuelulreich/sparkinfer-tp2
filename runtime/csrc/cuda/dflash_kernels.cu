@@ -2993,7 +2993,8 @@ __global__ void k_dflash2_select(const int* __restrict__ cand_i, const float* __
                                  const bf16* __restrict__ succ, int vocab, int rank, int k,
                                  int steps, float multiplier, float softcap,
                                  int* __restrict__ out, float temp, int top_k, float top_p,
-                                 unsigned long long seed, unsigned long long step0) {
+                                 unsigned long long seed, unsigned long long step0,
+                                 float* __restrict__ q_p, int* __restrict__ q_i) {
     extern __shared__ float ph[];   // [rank]
     __shared__ float sc[kSelMaxK];
     __shared__ int prev_tok;
@@ -3045,6 +3046,25 @@ __global__ void k_dflash2_select(const int* __restrict__ cand_i, const float* __
                 const bool p_active = top_p >= 0.f && top_p < 1.f;
                 const float total = cum[kk - 1];
                 const float inv_t = 1.f / temp;
+                if (q_p) {
+                    // The distribution the draw below samples: softmax(score / temp) over the
+                    // same candidate set.
+                    float* qp = q_p + (size_t)l * kDraftQTab;
+                    int* qi = q_i + (size_t)l * kDraftQTab;
+                    int m = 0;
+                    float z = 0.f;
+                    for (int i = 0; i < kk && i < kDraftQTab; i++) {
+                        if (i > 0 && p_active && !(cum[i - 1] < top_p * total)) break;
+                        if (sc[ord[i]] == -INFINITY) break;
+                        const float e = __expf((sc[ord[i]] - sc[ord[0]]) * inv_t);
+                        qp[i] = e;
+                        qi[i] = cand_i[(size_t)l * cand_stride + ord[i]];
+                        z += e;
+                        m = i + 1;
+                    }
+                    for (int i = 0; i < m; i++) qp[i] /= z;
+                    for (int i = m; i < kDraftQTab; i++) { qp[i] = 0.f; qi[i] = -1; }
+                }
                 float bv = -INFINITY;
                 int btok = INT_MAX;
                 for (int i = 0; i < kk; i++) {
@@ -3088,12 +3108,12 @@ void launch_dflash2_select(const int* cand_i, const float* cand_v, int cand_stri
                            const void* succ, int vocab, int rank, int k, int steps,
                            float multiplier, float softcap, int* out, cudaStream_t stream,
                            float temp, int top_k, float top_p, unsigned long long seed,
-                           unsigned long long step0) {
+                           unsigned long long step0, float* q_p, int* q_i) {
     if (steps <= 0 || k < 1 || k > kSelMaxK || rank < 1) return;
     k_dflash2_select<<<1, 256, (size_t)rank * sizeof(float), stream>>>(
         cand_i, cand_v, cand_stride, (const bf16*)hp, hp_stride, anchor, (const bf16*)pred,
         (const bf16*)succ, vocab, rank, k, steps, multiplier, softcap, out, temp, top_k, top_p,
-        seed, step0);
+        seed, step0, temp > 0.f ? q_p : nullptr, temp > 0.f ? q_i : nullptr);
 }
 
 void launch_scale_bf16(void* x, long n, float s, cudaStream_t stream) {

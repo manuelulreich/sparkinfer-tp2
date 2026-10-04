@@ -222,6 +222,10 @@ public:
         int top_k = 0;
         float top_p = 1.f;
         unsigned long long seed = 0, step0 = 0;
+        // Host arrays, [proposals][dflash_kernels::kDraftQTab] each (optional): the walk's
+        // proposal distribution per drafted position (ids, probabilities), for rejection sampling.
+        float* q_p = nullptr;
+        int* q_ids = nullptr;
     };
     // The walk of the next forward_block (it reverts to greedy after it).
     void set_walk(const DraftWalk& walk);

@@ -105,6 +105,18 @@ split differs); only the tensor-core verify takes it, which was not exact agains
 anyway. Also tried: more KV splits under tp (64 / 128): no gain -- the nvfp4 rows kernel is bound
 by per-SM work, not by the split's serial key groups.
 
+**Rejection sampling (opt-in, 2026-10-04).** `SPARKINFER_SPEC_REJECTION=1`: the DFlash2 walk
+reports q, the verify accepts with min(1, p/q) and draws a rejection from max(0, p - q) (host,
+counter RNG, identical on both ranks; an n-gram proposal is a point mass). Sampled acceptance
++6-10 %, decode +6-10 %. Exact mode (default) stays byte-identical to plain sampled decode; this
+one keeps only the distribution.
+
+**Open (found 2026-10-04): the first request after start computes differently.** Deterministic
+mode, exact link, no prefix cache, the same greedy request: the first one after start gives one
+output, every later one another. The prefill's window partition follows free memory (the scratch
+arena is held after the first long prefill), and different window sizes take kernels that round
+differently. Fix: a window size that does not depend on memory (reserve it at start, plan 09 C).
+
 ## D. Decode all-reduce (lossless first)
 
 - **D1. Fuse the receive with what follows** (lossless). After every all-reduce come the residual

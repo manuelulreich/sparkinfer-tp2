@@ -718,6 +718,8 @@ struct DFlashDraftModel::Impl {
     bf16* d2_coef = nullptr;     // [B, 2 * taps * H / group]: the row's conv coefficients
     bf16* d2_cv = nullptr;       // [B, H]: a convolution's output
     bf16* d2_hp = nullptr;       // [B, rank]: the selector's hidden projection
+    float* d2_q_p = nullptr;     // [B, kDraftQTab]: the sampled walk's proposal distribution
+    int* d2_q_i = nullptr;
     float* d2_tk_v = nullptr;    // [B, kRowsTopkMax]: candidates per proposal row, best first
     int* d2_tk_i = nullptr;
     float* d2_h_tk_v = nullptr;  // pinned twins, for the cross-card merge
@@ -1506,11 +1508,27 @@ struct DFlashDraftModel::Impl {
         if (!ok || !lead) return ok;
         const int R = cfg.selector_rank;
         dflash_kernels::launch_gemv_batched16(xn, d2_hproj, d2_hp, R, H, st, BW);
+        const bool want_q = walk.temperature > 0.f && walk.q_p && walk.q_ids;
+        constexpr int QT = dflash_kernels::kDraftQTab;
+        if (want_q && !d2_q_p) {
+            if (cudaMalloc(&d2_q_p, (size_t)kMultiRows * QT * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&d2_q_i, (size_t)kMultiRows * QT * sizeof(int)) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+        }
         dflash_kernels::launch_dflash2_select(d2_tk_i, d2_tk_v, TK, d2_hp + R, R, d_ids, d2_pred,
                                               d2_succ, cfg.vocab, R, K, depth,
                                               cfg.output_multiplier, cfg.logit_softcap, d_out + 1,
                                               st, walk.temperature, walk.top_k, walk.top_p,
-                                              walk.seed, walk.step0);
+                                              walk.seed, walk.step0, want_q ? d2_q_p : nullptr,
+                                              want_q ? d2_q_i : nullptr);
+        if (want_q) {
+            cu(cudaMemcpyAsync(walk.q_p, d2_q_p, (size_t)depth * QT * sizeof(float),
+                               cudaMemcpyDeviceToHost, st), "dflash2 q");
+            cu(cudaMemcpyAsync(walk.q_ids, d2_q_i, (size_t)depth * QT * sizeof(int),
+                               cudaMemcpyDeviceToHost, st), "dflash2 q ids");
+        }
         walk = DraftWalk{};
         cu(cudaMemcpyAsync(h_out + 1, d_out + 1, depth * sizeof(int), cudaMemcpyDeviceToHost, st),
            "dflash2 proposals");
