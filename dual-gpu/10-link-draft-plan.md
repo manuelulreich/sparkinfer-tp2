@@ -226,8 +226,26 @@ Today the draft is 15 % of a step (4.6 of 31 ms), and only ~2 ms of it is weight
   it) hides behind the other half's compute. With the wire, the link (~3.4 s at 31k) is below compute
   (~5 s), so this should bring prefill close to compute-bound.
   Estimate: re-profile at 31k with the wire first; −1 to −1.5 s.
+**F1 status: done as a pipelined GDN middle (2026-10-04, bit-identical).** Profile first (20k,
+`startup.sh`, nsys): per 4096-row window, one 1024-row int8-wire all-reduce is 5.4 MB and ~0.85 ms
+on the link, an FFN chunk ~0.9 ms of compute, so the FFN keeps the link just busy; but the GDN
+middle (conv, scan, gated norm, ~2.3 ms) ran over the whole window with the link idle, and every
+next-layer front chunk (~0.25 ms of compute) waited ~0.4-0.6 ms for its down all-reduce. Link per
+layer ~6.8 ms against ~7.6 ms of compute, so a full two-half interleave could gain at most the
+exposed waits. Instead of interleaving halves, the conv and scan (causal in the rows) run over
+2048-row ranges as their fronts land, carrying the conv state and recurrence as consecutive windows
+do, and each range posts its out-projection all-reduces before the next range's fronts. Then F2
+(below) for the attention layers. Compute-stream gaps 0.87 -> ~0.4 s a 20k prompt.
+Measured with `longdec.py` (random words, `/v1/completions`, fresh server), both off -> on:
+20k 4.2 -> 3.8 s (4.7k -> 5.3k tok/s), 60k 15.2 -> 14.1 s (3.9k -> 4.2k tok/s). Of that, F1 ~+7 %,
+F2 ~+2 % at 20k; 1024-row ranges measure the same as 2048. Left (~70 ms a 20k prompt): the first
+FFN chunk after an attention layer waits for o-proj chunk 0 (the attention middle keeps the link
+idle; chunking it is not bit-identical with the F8 history planes).
+
 - **F2. Pipelined next-layer front for attention layers** (plan 08 C1 lever 2, bit-exact).
   It is done for the 48 GDN layers but not for the 16 attention layers.
+  **Status: done (2026-10-04, bit-identical):** the tp wide arm's [q|gate] / k / v front runs chunk
+  by chunk behind the down all-reduces (`SPARKINFER_TP_FRONT_PIPE_ATTN`), ~+2 % at 20k.
 - **F3. 4-bit wire** (lossy, experimental). nvfp4 codes with per-16 scales are 4.5 bits instead of
   8.25, roughly halving the bytes again. Only useful if F1 leaves the link exposed; gate it on KL
   (expected to be noticeably worse than int8's 0.05–0.09).

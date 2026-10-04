@@ -45,6 +45,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -2441,6 +2442,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         tail_pending = true;
         return true;
     };
+    // (plan 10, F1) Pipelined GDN middle. With the front pipelined, the conv / scan / gated norm
+    // ran over all N rows only after the last front chunk, and the link sat idle through them
+    // (~2.3 ms a layer at N = 4096) while every front chunk waited for its down all-reduce. The
+    // conv and the scan are causal in the rows, so they run here over ranges of gdn_mid_rows rows
+    // as soon as those rows' fronts are in, each range continuing the conv state and the
+    // recurrence the previous one left (the carry consecutive prefill windows already use), and
+    // each range's out-projection chunks post their all-reduces before the next range's fronts
+    // run. Ranges are whole FFN chunks, multiples of the scan's 32-row chunks and at least 2048
+    // rows (the chunked scan's wide-block arm, as for the full window). Bit-identical to the
+    // unpipelined order (checked in the tp2 gates). SPARKINFER_TP_GDN_MID_PIPE=0 disables;
+    // SPARKINFER_TP_GDN_MID_ROWS sets the range (default 2048).
+    static const int gdn_mid_rows_env = [] {
+        const char* e = getenv("SPARKINFER_TP_GDN_MID_PIPE");
+        if (e && e[0] == '0') return 0;
+        const char* r = getenv("SPARKINFER_TP_GDN_MID_ROWS");
+        return (r && atoi(r) > 0) ? atoi(r) : 2048;
+    }();
+    const int gdn_mid_rows = (gdn_mid_rows_env > 0 && FC > 0)
+        ? ((gdn_mid_rows_env + FC - 1) / FC) * FC : 0;
+    auto gdn_mid_pipe_ok = [&](int L) {
+        return gdn_mid_rows > 0 && gdn_mid_rows < N && !multi && tp_tail_chunked &&
+               tp_out_chunk_env && FC % 32 == 0 && gdn_conv_repad_dev(L) != nullptr;
+    };
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         // A sliding-window layer reads and writes its own (possibly capped, ring-mapped) slice;
@@ -2458,6 +2482,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const bool restore_i8_gdn = use_i8;
             if (use_i8 && !use_i8_gdn) use_i8 = false;
             bool gdn_front_done = false;
+            // (plan 10, F1) With gdn_mid_pipe the front chunks run inside the middle's pipeline.
+            std::function<void(int, int, int)> gdn_front_chunk;
+            bool gdn_mid_pipe = false;
             // S7b-v3: tp=2 window-fill GDN head. Each rank's qkv/z/alpha/beta blobs are
             // rank-width (head-grouped q|k|v per v-head window), so under tp the GEMMs run
             // rank-dense into rank-sized scratch and the results are gathered into this rank's
@@ -2485,8 +2512,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     front_pending = false;
                     if (!tp_gdn_a) tp_gdn_a = a.alloc<bf16>((size_t)N * gdn_vh);
                     if (!tp_gdn_b) tp_gdn_b = a.alloc<bf16>((size_t)N * gdn_vh);
-                    for (int fo = 0, ci = 0; fo < N; fo += FC, ++ci) {
-                        const int fn = (N - fo < FC) ? (N - fo) : FC;
+                    // Captures the block's locals by value: with the middle pipelined (below) the
+                    // chunks run from the out-projection's block.
+                    gdn_front_chunk = [&, tp_qkv, tp_z, rowqkv](int fo, int fn, int ci) {
                         bf16* xc = x + (size_t)fo * H;
                         bf16* xnc = xn + (size_t)fo * H;
                         tp_prefill_allreduce_wait(front_tickets[(size_t)ci]);
@@ -2536,7 +2564,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         proj(xnc, w.ssm_beta, w.ssm_beta_type, b_c, gdn_vh, H, fn);
                         kernels::launch_gather_rows(lb + (size_t)fo * vh + gdn_r * gdn_vh, vh, b_c,
                                                     gdn_vh, gdn_vh, fn, st);
+                    };
+                    gdn_mid_pipe = gdn_mid_pipe_ok(L);
+                    static bool mid_pipe_noted = false;
+                    if (gdn_mid_pipe && !mid_pipe_noted) {
+                        mid_pipe_noted = true;
+                        fprintf(stderr, "[tp] prefill GDN middle pipelined: ranges of %d rows, "
+                                        "window %d (SPARKINFER_TP_GDN_MID_PIPE=0 disables)\n",
+                                gdn_mid_rows, N);
                     }
+                    if (!gdn_mid_pipe)
+                        for (int fo = 0, ci = 0; fo < N; fo += FC, ++ci)
+                            gdn_front_chunk(fo, (N - fo < FC) ? (N - fo) : FC, ci);
                     gdn_front_done = true;
                 }
                 if (!gdn_front_done) {
@@ -2682,14 +2721,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         if (gdn_scr) gdn_extract(s, gdn_state_slot(c, L), s.multi_lin_state[i]);
                     }
                 }
-            } else {
+            }
+            // Rows [r0, r0 + nr) of the single-prompt middle: conv, scan and gated norm. Range 0 of
+            // the window takes the window's carry-in (zeros at pos0 == 0); a later range continues
+            // the conv state and the recurrence the range before it left.
+            auto gdn_mid = [&](int r0, int nr) {
+                const int lq = s.linear_qdim;
                 bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-                if (cconv)
+                const bool carry = pos0 != 0 || r0 > 0;
+                if (carry)
                     pf_cu(cudaMemcpyAsync(cprev, conv_state,
                                           (size_t)(c.linear_conv_kernel - 1) * lqkv * sizeof(bf16),
                                           cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
-                kernels::launch_prefill_gdn_conv(b8, gdn_conv_w, conv_state, gq, gk, gv,
-                    N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
+                kernels::launch_prefill_gdn_conv(b8 + (size_t)r0 * lqkv, gdn_conv_w, conv_state,
+                    gq + (size_t)r0 * lq, gk + (size_t)r0 * lq, gv + (size_t)r0 * lvdim,
+                    nr, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st,
+                    carry ? cprev : nullptr);
                 float* layer_state = s.lin_state +
                     (size_t)gdn_state_slot(c, L) * gdn_vloc(s) * c.linear_head_dim * c.linear_head_dim;
                 // A pass that does not start at position 0 continues the recurrence already in `state`
@@ -2699,27 +2746,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // windowed slot whose chunked path declines falls back to the full-layout scratch
                 // staging (inject, scan, extract).
                 const bool gdn_scr = gdn_via_scratch(s);
+                const bf16 *qr = gq + (size_t)r0 * lq, *kr = gk + (size_t)r0 * lq,
+                           *vr = gv + (size_t)r0 * lvdim, *ar = la + (size_t)r0 * vh,
+                           *br = lb + (size_t)r0 * vh;
+                bf16* outr = att + (size_t)r0 * lvdim;
                 if (!gdn_scr ||
                     !kernels::launch_prefill_gdn_chunk(
-                        gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
-                        layer_state, att,
-                        N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block,
-                        st, /*carry_in=*/pos0 != 0, gdn_v0, gdn_vloc(s))) {
+                        qr, kr, vr, ar, br, w.ssm_dt, w.ssm_a,
+                        layer_state, outr,
+                        nr, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block,
+                        st, /*carry_in=*/carry, gdn_v0, gdn_vloc(s))) {
                     if (gdn_scr) {
                         gdn_scratch_fallback_note("prefill single-scan (chunked path declined)");
                         gdn_inject(s, gdn_state_slot(c, L), s.lin_state);
                     }
-                    kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
+                    kernels::launch_prefill_gdn_scan(qr, kr, vr, ar, br, w.ssm_dt, w.ssm_a,
                         gdn_scr
                             ? s.gdn_scratch + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim *
                                   c.linear_head_dim
                             : layer_state,
-                        att, N, c.linear_q_heads, vh, c.linear_head_dim,
-                        c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
+                        outr, nr, c.linear_q_heads, vh, c.linear_head_dim,
+                        c.gdn_qh_block, st, /*carry_in=*/carry);
                     if (gdn_scr) gdn_extract(s, gdn_state_slot(c, L), s.lin_state);
                 }
-            }
-            kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
+                kernels::launch_prefill_gated_norm(outr, lz + (size_t)r0 * lvdim, w.ssm_norm,
+                                                   lnrm + (size_t)r0 * lvdim, nr, vh,
+                                                   c.linear_head_dim, eps, st);
+            };
+            if (multi)
+                kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
+            else if (!gdn_mid_pipe)
+                gdn_mid(0, N);
             // out_proj off the same NVFP4 bytes, with the residual folded into the block-scaled
             // GEMM's own epilogue (D = A*B + C, C aliasing D aliasing x) instead of written raw
             // to `ao` for a separate full-tensor add. That add is three N*H bf16 streams (read x,
@@ -2735,7 +2792,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             if (tp_gdn) {
                 if (!tp_gdn_ln) tp_gdn_ln = a.alloc<bf16>((size_t)N * gdn_vl);
                 bf16* tp_lnA = tp_gdn_ln;
-                kernels::launch_gather_rows(tp_lnA, gdn_vl, lnrm + gdn_r * gdn_vl, lvdim, gdn_vl, N, st);
+                if (!gdn_mid_pipe)
+                    kernels::launch_gather_rows(tp_lnA, gdn_vl, lnrm + gdn_r * gdn_vl, lvdim, gdn_vl, N, st);
                 // A2: K-split out_proj on the rank's NVFP4 operand, raw into ao (the all-reduce
                 // sums the partials before the residual, so no fused-residual epilogue here).
                 static const bool tp_gdn_out_fp4_on = [] {
@@ -2744,8 +2802,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }();
                 const bool out_fp4_arm = tp_gdn_out_fp4_on && gdn_nvfp4 && (gdn_fp4_mask & 2) &&
                     w.gdn_out_fp4 && w.gdn_out_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws;
-                const bool out_chunked = tp_tail_proj_chunked(
-                    [&](int fo, int fn) {
+                auto out_chunk_gemm = [&](int fo, int fn) {
                         return out_fp4_arm && kernels::prefill_nvfp4_supported(fn, H, gdn_vl) &&
                                kernels::launch_prefill_nvfp4_quant_a(tp_lnA + (size_t)fo * gdn_vl,
                                                                      fp4_gdn_a, fp4_gdn_as, fn,
@@ -2754,11 +2811,34 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                                   w.gdn_out_fp4, w.gdn_out_fp4_sf,
                                                                   ao + (size_t)fo * H, fn, H, gdn_vl,
                                                                   fp4_gdn_ws, st, w.gdn_out_fp4_alpha);
-                    },
-                    [&](int fo, int fn) {
+                };
+                auto out_chunk_fallback = [&](int fo, int fn) {
                         proj(tp_lnA + (size_t)fo * gdn_vl, w.ssm_out, w.ssm_out_type,
                              ao + (size_t)fo * H, H, gdn_vl, fn);
-                    });
+                };
+                bool out_chunked = false;
+                if (gdn_mid_pipe) {
+                    // (F1) fronts, middle, out-projection and its all-reduce posts, a range at a time.
+                    for (int r0 = 0, ci = 0; r0 < N; r0 += gdn_mid_rows) {
+                        const int nr = (N - r0 < gdn_mid_rows) ? (N - r0) : gdn_mid_rows;
+                        for (int fo = r0; fo < r0 + nr; fo += FC)
+                            gdn_front_chunk(fo, (r0 + nr - fo < FC) ? (r0 + nr - fo) : FC, ci + (fo - r0) / FC);
+                        gdn_mid(r0, nr);
+                        kernels::launch_gather_rows(tp_lnA + (size_t)r0 * gdn_vl, gdn_vl,
+                                                    lnrm + (size_t)r0 * lvdim + gdn_r * gdn_vl, lvdim,
+                                                    gdn_vl, nr, st);
+                        for (int fo = r0; fo < r0 + nr; fo += FC, ++ci) {
+                            const int fn = (r0 + nr - fo < FC) ? (r0 + nr - fo) : FC;
+                            if (!out_chunk_gemm(fo, fn)) out_chunk_fallback(fo, fn);
+                            tail_tickets[(size_t)ci] =
+                                tp_prefill_allreduce_bf16_async(ao + (size_t)fo * H, (size_t)fn * H);
+                        }
+                    }
+                    tail_pending = true;
+                    out_chunked = true;
+                } else {
+                    out_chunked = tp_tail_proj_chunked(out_chunk_gemm, out_chunk_fallback);
+                }
                 if (!out_chunked) {
                 const bool tp_out_fp4 = out_fp4_arm &&
                     kernels::prefill_nvfp4_supported(N, H, gdn_vl) &&
@@ -2805,6 +2885,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             use_i8 = restore_i8_gdn;
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
+            // (F2) A front left by the previous layer is taken chunk by chunk on the tp wide arm
+            // below; any other arm takes the whole tail here first.
+            if (front_pending &&
+                !(tp_active && !c.muse_glimmer && s.gdn_window.v_count &&
+                  c.linear_v_heads / s.gdn_window.v_count > 1 &&
+                  wide % (c.linear_v_heads / s.gdn_window.v_count) == 0 &&
+                  kvdim % (c.linear_v_heads / s.gdn_window.v_count) == 0)) {
+                front_pending = false;
+                tp_prefill_allreduce_join();
+                kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
+                if (front_norm_xn) kernels::launch_rmsnorm(x, w.input_norm, xn, N, H, eps, st);
+            }
             // Set when q|gate|k|v came out of ONE GEMM and q/k/v were left in that packed buffer
             // instead of being copied to tight arrays (see the Muse arm below).
             bool qkv_packed = false;
@@ -2974,7 +3066,57 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     if (!tp_qwide) tp_qwide = a.alloc<bf16>((size_t)N * wide_r);
                     if (!tp_att)   tp_att   = a.alloc<bf16>((size_t)N * q_r);
                     bool qkv_fp4_tp = false;
-                    if (attn_nvfp4 && (attn_fp4_mask & 1) &&
+                    bool split_done = false;
+                    if (front_pending) {
+                        // (F2) The previous layer's tail and this layer's row-wise front, one FFN
+                        // chunk at a time behind that chunk's down all-reduce (see front_pending).
+                        front_pending = false;
+                        for (int fo = 0, ci = 0; fo < N; fo += FC, ++ci) {
+                            const int fn = (N - fo < FC) ? (N - fo) : FC;
+                            bf16* xc = x + (size_t)fo * H;
+                            bf16* xnc = xn + (size_t)fo * H;
+                            tp_prefill_allreduce_wait(front_tickets[(size_t)ci]);
+                            kernels::launch_prefill_add(xc, ao + (size_t)fo * H, xc, (long)fn * H, st);
+                            if (front_norm_xn)
+                                kernels::launch_rmsnorm(xc, w.input_norm, xnc, fn, H, eps, st);
+                            bf16* qw_c = tp_qwide + (size_t)fo * wide_r;
+                            bf16* k_c = tp_kf + (size_t)fo * kv_r;
+                            bf16* v_c = tp_vf + (size_t)fo * kv_r;
+                            const bool ok =
+                                (attn_norm_deferred
+                                 ? kernels::launch_prefill_nvfp4_rmsnorm_quant_a(
+                                       xc, w.input_norm, fp4_attn_a, fp4_attn_as, fn, H, eps, st)
+                                 : kernels::launch_prefill_nvfp4_quant_a(
+                                       xnc, fp4_attn_a, fp4_attn_as, fn, H, st)) &&
+                                kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                                   w.wq_fp4, w.wq_fp4_sf, qw_c, fn,
+                                                                   wide_r, H, fp4_attn_ws, st,
+                                                                   w.wq_fp4_alpha) &&
+                                kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                                   w.wk_fp4, w.wk_fp4_sf, k_c, fn,
+                                                                   kv_r, H, fp4_attn_ws, st,
+                                                                   w.wk_fp4_alpha) &&
+                                kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                                   w.wv_fp4, w.wv_fp4_sf, v_c, fn,
+                                                                   kv_r, H, fp4_attn_ws, st,
+                                                                   w.wv_fp4_alpha);
+                            if (!ok) {
+                                // A declined launch (both ranks see the same shapes): the converted
+                                // path on these rows, as the unpipelined fallback below does.
+                                if (attn_norm_deferred)
+                                    kernels::launch_rmsnorm(xc, w.input_norm, xnc, fn, H, eps, st);
+                                proj_fused(xnc, w.wq, w.wq_type, w.wq_rs, qw_c, wide_r, H, fn);
+                                proj_fused(xnc, w.wk, w.wk_type, w.wk_rs, k_c, kv_r, H, fn);
+                                proj_fused(xnc, w.wv, w.wv_type, w.wv_rs, v_c, kv_r, H, fn);
+                            }
+                            kernels::launch_prefill_split_q_gate(qw_c, tp_qb + (size_t)fo * q_r,
+                                                                 tp_qg + (size_t)fo * q_r, fn,
+                                                                 c.n_q_heads / wide_tp_ranks,
+                                                                 c.head_dim, st);
+                        }
+                        qkv_fp4_tp = true;
+                        split_done = true;
+                    } else if (attn_nvfp4 && (attn_fp4_mask & 1) &&
                         w.wq_fp4 && w.wq_fp4_sf && w.wk_fp4 && w.wk_fp4_sf &&
                         w.wv_fp4 && w.wv_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
                         (attn_norm_deferred
@@ -3003,9 +3145,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         proj_fused(xn, w.wk, w.wk_type, w.wk_rs, tp_kf, kv_r, H);
                         proj_fused(xn, w.wv, w.wv_type, w.wv_rs, tp_vf, kv_r, H);
                     }
-                    kernels::launch_prefill_split_q_gate(tp_qwide, tp_qb, tp_qg, N,
-                                                         c.n_q_heads / wide_tp_ranks,
-                                                         c.head_dim, st);
+                    if (!split_done)
+                        kernels::launch_prefill_split_q_gate(tp_qwide, tp_qb, tp_qg, N,
+                                                             c.n_q_heads / wide_tp_ranks,
+                                                             c.head_dim, st);
                     tp_wide = true;
                 } else {
                     if (tp_active && wide_tp_ranks > 1) {
@@ -3564,6 +3707,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         const int fn = (N - fo < FC) ? (N - fo) : FC;
                         front_pipe = kernels::prefill_nvfp4_supported(fn, rowqkv_f, H) &&
                                      kernels::prefill_nvfp4_supported(fn, lvdim / rk, H);
+                    }
+                }
+                // (plan 10, F2) The same for a full-attention next layer on the tp wide arm: its
+                // front (residual add, input norm, FP4 quantize, the [q|gate] / k / v GEMMs and
+                // the q / gate split) is row-wise too. SPARKINFER_TP_FRONT_PIPE_ATTN=0 disables.
+                static const bool tp_front_pipe_attn_env = [] {
+                    const char* e = getenv("SPARKINFER_TP_FRONT_PIPE_ATTN");
+                    return !(e && e[0] == '0');
+                }();
+                if (!front_pipe && tp_front_pipe_attn_env && tp_front_pipe_env && tp_ar_overlap_env &&
+                    tp_ffn_split && rk > 1 && ffn % rk == 0 && FC < N && !moe && !multi &&
+                    !c.muse_glimmer && !capture_here && nwf && !nwf->linear_attn && attn_nvfp4 &&
+                    (attn_fp4_mask & 1) && nwf->wq_fp4 && nwf->wq_fp4_sf && nwf->wk_fp4 &&
+                    nwf->wk_fp4_sf && nwf->wv_fp4 && nwf->wv_fp4_sf && fp4_attn_a && fp4_attn_as &&
+                    fp4_attn_ws && wide % rk == 0 && kvdim % rk == 0 && c.n_q_heads % rk == 0) {
+                    front_pipe = true;
+                    for (int fo = 0; fo < N && front_pipe; fo += FC) {
+                        const int fn = (N - fo < FC) ? (N - fo) : FC;
+                        front_pipe = kernels::prefill_nvfp4_supported(fn, wide / rk, H) &&
+                                     kernels::prefill_nvfp4_supported(fn, kvdim / rk, H);
                     }
                 }
                 front_tickets.assign(front_pipe ? (size_t)((N + FC - 1) / FC) : 0, -1);

@@ -215,6 +215,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 prefill: the link stays busy through the GDN middle and the attention front
+  (+8-12 % prefill, bit-identical).** With the int8 wire one 1024-row all-reduce takes ~0.85 ms
+  on the PCIe Gen3 link, about one FFN chunk of compute, but the link sat idle through each GDN
+  layer's conv / scan / gated norm (~2.3 ms a 4096-row window) while every next-layer front chunk
+  waited for its down all-reduce. (1) The GDN middle now runs over 2048-row ranges as soon as
+  their front chunks are in, each range continuing the conv state and recurrence of the one before
+  (the carry consecutive windows use), and posts its out-projection all-reduces before the next
+  range's fronts (`SPARKINFER_TP_GDN_MID_PIPE`, `SPARKINFER_TP_GDN_MID_ROWS`). (2) A
+  full-attention layer's front ([q|gate] / k / v GEMMs, q/gate split) runs chunk by chunk behind
+  the previous FFN's down all-reduces, as the GDN front already did
+  (`SPARKINFER_TP_FRONT_PIPE_ATTN`). Idle gaps on the compute stream 0.87 -> ~0.4 s a 20k prompt;
+  `startup.sh` configuration, fresh prompt: 20k 4.2 -> 3.8 s (4.7k -> 5.3k tok/s), 60k 15.2 ->
+  14.1 s. Greedy output and logprobs identical with both on and off (deterministic mode, 300 / 9k
+  / 20k tokens).
 - **Agent turns: faster prefill of small deltas over a long history.** (1) The six-head prefill
   attention tier now takes passes from 1024 query rows (was 2048) once the span passes its 16k
   floor: an agent turn's 1-2k-token delta, split further at prefix-cache checkpoints, ran the
