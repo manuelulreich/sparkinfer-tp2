@@ -16,6 +16,9 @@ namespace sparkinfer {
 // (dual-GPU) Marks the end of the load-time prefill warm-up under SPARKINFER_PREFILL_RESERVE=1:
 // from here on, a pass that grows the reserved scratch is logged.
 void prefill_reserve_seal();
+// Prefill passes so far whose scratch fell short (declined to a narrower window, or lost the
+// int8 arena). The load-time warm-up must leave it unchanged.
+int prefill_scratch_short_count();
 
 // Largest packed continuous-batch decode row count. Mirrors the verify graph tiers in
 // qwen35_prefill.cpp -- one captured graph per row count, so this bounds how many are kept.

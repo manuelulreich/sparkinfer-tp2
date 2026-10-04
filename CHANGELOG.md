@@ -15,7 +15,8 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   greedy 300 / 9k / 20k-token prompts are byte-identical with 2.8 GB or 0.6 GB free. Prefill at
   `startup.sh`'s config: 20k 3.6 s, 60k 13.8 s (the adaptive default, which declined to 8k
   windows after two failed attempts, measured the same). Idle per card at `--ctx 131072`:
-  ~12.9 GiB, 2.8 GiB free; at 262144, 1.4 GiB free.
+  ~12.9 GiB, 2.8 GiB free; at 262144, 1.4 GiB free. A warm-up pass that falls back to a narrower
+  window stops the load (the reservation would otherwise hold the narrower window's scratch).
 
 - **tp=2: opt-in speculative (rejection) sampling for DFlash2** (`SPARKINFER_SPEC_REJECTION=1`).
   The selector's sampled walk reports its proposal distribution q (the candidates it draws from,

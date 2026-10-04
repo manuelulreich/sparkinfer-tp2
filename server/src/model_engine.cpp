@@ -1396,6 +1396,7 @@ bool ModelEngine::reserve_prefill(std::string& err) {
         return f;
     };
     free0 = card_free();
+    const int short0 = sparkinfer::prefill_scratch_short_count();
     const auto t0 = std::chrono::steady_clock::now();
     CompletionResult r = complete(make_prompt(n), 2);
     if (r.error.empty()) r = complete(make_prompt(512 + 127), 2);
@@ -1403,6 +1404,13 @@ bool ModelEngine::reserve_prefill(std::string& err) {
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (!r.error.empty()) {
         err = "prefill reservation failed (" + r.error + ")";
+        return false;
+    }
+    // A pass that fell back to a narrower window still answers, but then the reservation holds
+    // that narrower window's scratch and every long prompt would take the same fallback.
+    if (sparkinfer::prefill_scratch_short_count() != short0) {
+        err = "prefill reservation failed: " + std::to_string(window) +
+              "-token windows do not fit beside this KV pool";
         return false;
     }
     sparkinfer::prefill_reserve_seal();

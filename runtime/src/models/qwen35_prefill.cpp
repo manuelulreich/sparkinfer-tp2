@@ -144,6 +144,8 @@ void gdn_conv_repad_prime(const Qwen35PrefillCtx& s, const Qwen35Config& c, cuda
 // held between passes. The server runs a short warm-up at load, so the scratch is taken
 // before the first request and a pass computes the same way however full the card is.
 std::atomic<bool> g_prefill_reserve_sealed{false};   // set once the load's warm-up has run
+// Passes whose scratch fell short (declined, or lost the int8 arena): the warm-up must see none.
+std::atomic<int> g_prefill_scratch_short{0};
 bool prefill_reserved_on() {
     static const bool v = [] {
         const char* e = getenv("SPARKINFER_PREFILL_RESERVE");
@@ -1112,6 +1114,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         fprintf(stderr, "[prefill] scratch alloc failed (ctx=%d, chunk=%d, held=%zu MB, "
                         "free=%zu/%zu MB) -> fallback\n",
                 N, FC, held >> 20, fb >> 20, tb >> 20);
+        ++g_prefill_scratch_short;
         if (s.scratch_oom_out) *s.scratch_oom_out = true;
         return -1;
     }
@@ -1296,6 +1299,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     int* sk_p = want_sk ? a8.alloc<int>((size_t)N * maxNO) : nullptr;
     if (tp_active && need_i8) a8.ok = tp_prefill_agree_min(a8.ok ? 1 : 0) != 0;
     if (need_i8 && !a8.ok) {
+        ++g_prefill_scratch_short;
         a8.free_all();
         A_i8p = nullptr;
         use_i8 = false;
@@ -1321,7 +1325,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (!a8.ok) {
             a.free_all(); a8.free_all();
             fprintf(stderr, "[prefill] lm-head seed scratch alloc failed (ctx=%d) -> fallback\n", N);
-            if (s.scratch_oom_out) *s.scratch_oom_out = true;
+            ++g_prefill_scratch_short;
+        if (s.scratch_oom_out) *s.scratch_oom_out = true;
             return -1;
         }
     }
@@ -1989,7 +1994,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (!am.ok) {
             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
             fprintf(stderr, "[prefill] MoE scratch alloc failed (ctx=%d) -> fallback\n", N);
-            if (s.scratch_oom_out) *s.scratch_oom_out = true;
+            ++g_prefill_scratch_short;
+        if (s.scratch_oom_out) *s.scratch_oom_out = true;
             return -1;
         }
     }
@@ -7535,5 +7541,6 @@ verify_forward_done:
 }
 
 void prefill_reserve_seal() { g_prefill_reserve_sealed = true; }
+int prefill_scratch_short_count() { return g_prefill_scratch_short.load(); }
 
 } // namespace sparkinfer

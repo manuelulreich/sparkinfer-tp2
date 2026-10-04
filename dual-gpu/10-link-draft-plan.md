@@ -78,6 +78,15 @@ every pass-shape class at its largest member (4096, 512 = largest split-K pass, 
 unaligned tail); remaining growth after it: 2 MB once. Exposed and fixed a startup race in
 `batched_prefill_enabled()` (a rank could take the token loop alone).
 
+**KV capacity with the reservation** (`CTX=262144`, nvfp4, DFlash2; free on card 0 after load):
+pool 262,144 1.4 GiB; 327,680 674 MiB; 360,448 364 MiB; 393,216 does not load (its warm-up
+declines the 4096 window, which now stops the load). 4 concurrent fresh prompts: 4 x 80k = 320k
+tokens at a 327k pool ran clean (each 80k prefill ~20.7 s, served one after another); 4 x 89k at
+a 360k pool completed, but the later streams' DFlash2 capture context and one session open ran
+out of memory (those streams decoded without the drafter). Practical maximum: ~327k tokens
+total. Decode cohort at `CTX=262144` (512 tok, prompts_real): greedy C1/C2/C4 130/231/292,
+sampled 132/178/270; C4 A/B (131k 307, old memory layout 276) is within its run-to-run noise.
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |
