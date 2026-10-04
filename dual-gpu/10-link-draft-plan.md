@@ -140,7 +140,13 @@ Deterministic draft ms/step C1/C2/C4: 2.89/5.75/11.3 -> 2.88/4.7/8.6, mean_accep
 default mode C4 11.0 -> 7.5 ms (step 43.4 -> 38.2 ms). Section times at C4 (32 rows,
 `SPARKINFER_DFLASH_MULTI_TIMING`): embed+ctx 0.55, layers 6.59, head 0.83, merge 0.03, select
 0.28 ms; at C2 (16 rows) layers 3.44 ms -- linear in rows, so the NVFP4 W4A8 GEMV (dp4a) is
-compute-bound at these widths. Next lever: a tensor-core (int8 mma) form of that GEMV.
+compute-bound at these widths. Kernel sweep (standalone, the draft's shapes): (ROWS 4, 1 warp)
+beats the shipped (2, 2) by 10-28% at 8, 16 and 32 rows (more activation reuse per load); taken:
+deterministic draft ms C1/C2/C4 2.85/4.24/7.57. Two int8-mma (m16n8k16 s8, one MMA per NVFP4
+scale group, exact int sums) prototypes were correct but no faster (0.45 ms vs 0.50 at 32 rows,
+slower at 8): each warp walks K serially and is latency-bound, where the dp4a kernel has every
+lane on its own K block. A tensor-core form needs a pipelined shared-memory weight stage;
+estimated C4 draft ~3.5 ms (step -10%).
 
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 

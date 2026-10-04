@@ -1523,8 +1523,8 @@ __global__ void k_gemv_nvfp4_q81(const si_q81_blk* __restrict__ xq,
                 for (int b = 0; b < BATCH; b++) red[warp][r][b] = acc[r][b];
         }
         __syncthreads();
-        if (warp == 0 && lane < ROWS * BATCH) {
-            const int r = lane / BATCH, b = lane % BATCH;
+        for (int idx = threadIdx.x; idx < ROWS * BATCH; idx += KSPLIT * 32) {
+            const int r = idx / BATCH, b = idx % BATCH;
             if (r < nr && b < nb) {
                 float o = 0.f;
 #pragma unroll
@@ -1543,9 +1543,11 @@ bool launch_gemv_nvfp4_q81(const void* xq81, const void* W0, const void* W1, con
     const int total = N0 + N1 + N2;
     if (total <= 0 || rows <= 0 || (K & 31) || !xq81 || !W0) return false;
     if ((N1 && !W1) || (N2 && !W2)) return false;
-    // 2 weight rows a warp, 2 warps along K: measured best of (2,2), (2,4), (1,4), (1,2) at C4.
-    // ROWS * BATCH must stay <= 32 (the final reduction is one warp's lanes).
-    constexpr int ROWS = 2, KS = 2;
+    // 4 weight rows a block, one warp along K: each activation load feeds 4 rows' dp4a instead of
+    // 2. Measured on the draft's shapes (RTX 5060 Ti) against the former (2 rows, 2 warps):
+    // gate|up 8704x2 x 5120 at 8 / 16 rows 0.126 -> 0.113 / 0.254 -> 0.197 ms, down 5120 x 8704
+    // 0.061 -> 0.053 / 0.127 -> 0.092 ms; (4,2), (8,2) and 32-row batches were slower.
+    constexpr int ROWS = 4, KS = 1;
     const auto* xp = reinterpret_cast<const si_q81_blk*>(xq81);
     const size_t xrow = (size_t)(K / 32);
     const auto* w0 = (const unsigned char*)W0;

@@ -13,8 +13,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   session keeps its own KV slide, RoPE, attention and selector walk, and the candidates of all
   sessions cross the link in one exchange. Draft time per step: C2 5.75 -> 4.7 ms, C4 11.3 ->
   8.6 ms (deterministic), C4 11.0 -> 7.5 ms (default mode). Acceptance and outputs unchanged
-  (deterministic C4 outputs identical with `SPARKINFER_DFLASH_MULTI=0`). The remaining draft
-  time is the NVFP4 GEMV's dp4a arithmetic, which grows with the rows.
+  (deterministic C4 outputs identical with `SPARKINFER_DFLASH_MULTI=0`). The draft's NVFP4 W4A8
+  GEMV now takes 4 weight rows per block (was 2 rows x 2 warps): 10-28% faster per projection,
+  C4 draft 8.6 -> 7.6 ms, C2 4.7 -> 4.2 ms. The rest is the GEMV's dp4a arithmetic, which grows
+  with the rows (an int8-mma form measured slower so far: it was latency-bound).
 
 - **Prefix cache: host KV tier** (`SPARKINFER_PREFIX_CACHE_KV_HOST_MB`, default 16384). Cached
   prefixes keep a pinned host copy of their KV (copied in the background at insert, deduplicated
