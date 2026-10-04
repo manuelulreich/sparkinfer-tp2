@@ -142,6 +142,51 @@ int main() {
     }
     CHECK(kv.num_free_blocks() == kBlocks);                  // destructor released the last entry
 
+    // ---- host KV tier: an entry leaves the pool, and its KV comes back byte for byte ----
+    {
+        PrefixCache::Limits lim;
+        lim.max_kv_host_bytes = size_t(64) << 20;
+        PrefixCache cache(&kv, lim);
+        std::vector<int> base(200);
+        for (int i = 0; i < 200; i++) base[(size_t)i] = 1000 + i;
+        auto head = [&](int n) { return std::vector<int>(base.begin(), base.begin() + n); };
+        const size_t bb = kv.kv_bytes(kv.block_elems());               // one block of one slot
+        const size_t stride = kv.kv_bytes(kv.layer_stride_elems());    // between slots
+        auto at = [&](void* pool, int s, int b) { return static_cast<char*>(pool) + s * stride + (size_t)b * bb; };
+        auto fill = [&](int b, int v) {
+            for (int s = 0; s < kv.kv_slots(); s++) {
+                cudaMemset(at(kv.k_pool(), s, b), v + s, bb);
+                cudaMemset(at(kv.v_pool(), s, b), v + s + 64, bb);
+            }
+        };
+        auto holds = [&](int b, int v) {
+            std::vector<unsigned char> h(bb);
+            for (int s = 0; s < kv.kv_slots(); s++)
+                for (int p = 0; p < 2; p++) {
+                    cudaMemcpy(h.data(), at(p ? kv.v_pool() : kv.k_pool(), s, b), bb, cudaMemcpyDeviceToHost);
+                    for (unsigned char c : h) if (c != (unsigned char)(v + s + 64 * p)) return false;
+                }
+            return true;
+        };
+        CHECK(kv.allocate(20, 64));                          // 4 blocks
+        const std::vector<int> ids = kv.physical_block_ids(20);
+        for (int i = 0; i < 4; i++) fill(ids[(size_t)i], 10 * i + 1);
+        cache.insert(head(64), kv.retain_prefix_blocks(20, 4), {});
+        kv.free(20);
+        CHECK(kv.num_free_blocks() == kBlocks - 4);
+        CHECK(cache.evict_for(kBlocks));                     // leaves the pool, stays in host memory
+        CHECK(kv.num_free_blocks() == kBlocks);
+        CHECK(cache.stats().entries == 1 && cache.stats().host_entries == 1);
+        cudaMemset(kv.k_pool(), 0xEE, stride * kv.kv_slots());   // a restore that copied nothing shows
+        cudaMemset(kv.v_pool(), 0xEE, stride * kv.kv_slots());
+        const PrefixCache::Hit h = cache.lookup(base);
+        CHECK(h.tokens == 64 && h.blocks.size() == 4);
+        CHECK(cache.stats().restores == 1 && cache.stats().host_entries == 0);
+        for (int i = 0; i < 4; i++) CHECK(holds(h.blocks[(size_t)i], 10 * i + 1));
+        CHECK(kv.num_free_blocks() == kBlocks - 4);
+    }
+    CHECK(kv.num_free_blocks() == kBlocks);
+
     std::printf("prefix_cache_gpu_test: OK\n");
     return 0;
 }

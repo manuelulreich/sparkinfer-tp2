@@ -293,6 +293,8 @@ public:
         uint64_t lookups = 0, hits = 0, tokens_reused = 0, inserts = 0, evictions = 0;
         size_t entries = 0, host_bytes = 0;
         int blocks = 0;
+        size_t host_entries = 0, kv_host_bytes = 0;
+        uint64_t restores = 0, restored_blocks = 0;
     };
     PrefixCacheStats prefix_cache_stats() const;
 

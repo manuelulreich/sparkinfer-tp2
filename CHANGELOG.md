@@ -7,6 +7,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **Prefix cache: host KV tier** (`SPARKINFER_PREFIX_CACHE_KV_HOST_MB`, default 16384). Cached
+  prefixes keep a pinned host copy of their KV (copied in the background at insert, deduplicated
+  per block across a conversation's turns), so leaving the KV pool no longer drops them: a later
+  hit copies the KV back on both cards. A 45k-token conversation pushed out of the pool resumes in
+  0.29 s to first token instead of a 10.2 s prefill. Byte-exact (deterministic restored hit ==
+  pool hit). `SPARKINFER_PREFIX_CACHE=2` keeps the cache on under `SPARKINFER_DETERMINISTIC=1` for
+  such tests. Default entry cap 32 -> 64.
+
 - **tp=2 prefill: ~590 MiB more free per card** (`SPARKINFER_PREFILL_FP4_ONLY`,
   `SPARKINFER_ARENA_DUMP`). On the all-NVFP4 checkpoint the reserved prefill arena no longer
   takes the bf16/int8 fallback scratch no projection uses (1,257 -> 794 MB), the nvfp4 KV

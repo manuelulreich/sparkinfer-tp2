@@ -390,6 +390,30 @@ void KVCacheManager::release_blocks(const std::vector<int>& physical_ids) {
     for (int b : physical_ids) impl_->unref(b);
 }
 
+bool KVCacheManager::retain_blocks(const std::vector<int>& physical_ids) {
+    for (int b : physical_ids)
+        if (b < 0 || b >= impl_->total_blocks || impl_->refs_k[b] <= 0 || impl_->refs_v[b] <= 0)
+            return false;
+    for (int b : physical_ids) impl_->ref(b);
+    return true;
+}
+
+std::vector<int> KVCacheManager::allocate_blocks(int n) {
+    std::vector<int> out;
+    if (n <= 0 || impl_->win_on || (int)impl_->free_list.size() < n) return out;
+    out.reserve((size_t)n);
+    for (int i = 0; i < n; i++) {
+        const int b = impl_->free_list.back();
+        impl_->free_list.pop_back();
+        impl_->refs_k[b] = 1;
+        impl_->refs_v[b] = 1;
+        out.push_back(b);
+    }
+    return out;
+}
+
+size_t KVCacheManager::block_elems() const { return impl_->elems_per_block; }
+
 bool KVCacheManager::allocate_with_prefix(uint64_t seq_id, const std::vector<int>& prefix, int num_tokens) {
     if (prefix.empty()) return allocate(seq_id, num_tokens);
     // A windowed slice is a ring PRIVATE to one sequence, so another sequence's prefix blocks do

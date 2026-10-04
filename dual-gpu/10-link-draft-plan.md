@@ -114,6 +114,21 @@ Gate fix found on the way: since 71ca887 a server without a draft releases the Q
 a DSpark server keeps it, so the gate's "lossless" compared two different heads (4 of 7 prompts
 differed already at 9e4cc0d); the deterministic gate servers now both keep it.
 
+**Host KV tier for the prefix cache (2026-10-04, work package 2).** Entries copy their KV
+blocks to pinned host memory at insert (copy stream per card, async; host blocks keyed by a
+128-bit hash chained over every token up to the block's end, so one conversation's turns share
+them; chunks of 256 blocks mirror the pool layout, so a run of consecutive blocks is one 2-D copy
+per plane). Leaving the pool (pool share cap, `evict_for`) keeps the entry, host-resident; a
+lookup that lands on one allocates blocks on both ranks (mirrored ids checked), shares leading
+blocks a pool-resident entry still holds, copies the rest back and serves a normal hit. Pinning
+runs ahead on a thread (8 spare chunks; 13 ms per 38 MB chunk per card would otherwise stall
+decode under the device mutex). Measured, `CTX=131072` with a 131k pool: two 45k conversations,
+the first pushed to host; its next turn restores 2,813 blocks, TTFT 0.29 s vs 10.2 s prefill.
+10k: restore 0.18 s vs pool hit 0.20 s. Exactness: `SPARKINFER_DETERMINISTIC=1
+SPARKINFER_PREFIX_CACHE=2`, restored hit and pool hit give the same md5 and logprobs. Default-mode
+first-token logprobs vary by ~0.6 nat run to run on this test whatever the path (int8 wire), so
+they are no evidence either way. Unit test: prefix_cache_gpu_test covers a byte-level round trip.
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |

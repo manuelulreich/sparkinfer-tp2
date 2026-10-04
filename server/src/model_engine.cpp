@@ -821,12 +821,20 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         };
         const char* on = getenv("SPARKINFER_PREFIX_CACHE");
         const bool wanted = !(on && on[0] == '0');
-        if (wanted && sparkinfer::deterministic_mode()) {
+        // SPARKINFER_PREFIX_CACHE=2 keeps it on under SPARKINFER_DETERMINISTIC=1 (tests of the
+        // cache itself: a hit must then reproduce the same hit byte for byte).
+        if (wanted && sparkinfer::deterministic_mode() && !(on && on[0] == '2')) {
             fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_DETERMINISTIC=1 -- a "
                             "request's output may not depend on what earlier requests cached)\n");
         } else if (wanted) {
             sparkinfer::PrefixCache::Limits lim;
-            lim.max_entries = (size_t)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_ENTRIES", 32));
+            // Host KV tier: an entry's blocks are also kept in pinned host memory (copied when it
+            // is inserted, only blocks no other entry already copied), so leaving the pool costs
+            // nothing and a later hit copies them back instead of prefilling again.
+            lim.max_kv_host_bytes =
+                (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_KV_HOST_MB", 16384)) << 20;
+            lim.max_entries = (size_t)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_ENTRIES",
+                                                            lim.max_kv_host_bytes ? 64 : 32));
             lim.max_host_bytes = (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_MB", 8192)) << 20;
             lim.max_blocks = impl_->kv->num_total_blocks() / 2;
             impl_->prefix_cache_min_tokens =
@@ -834,9 +842,10 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             impl_->batch_engine->enable_prefix_cache(lim);
             impl_->prefix_cache_on = true;
             fprintf(stderr, "[sparkinfer-server] prefix cache: on (%zu entries, %zu MiB host, %d of %d "
-                            "KV blocks, checkpoints from %d tokens)\n",
+                            "KV blocks, checkpoints from %d tokens, host KV tier %zu MiB)\n",
                     lim.max_entries, lim.max_host_bytes >> 20, lim.max_blocks,
-                    impl_->kv->num_total_blocks(), impl_->prefix_cache_min_tokens);
+                    impl_->kv->num_total_blocks(), impl_->prefix_cache_min_tokens,
+                    lim.max_kv_host_bytes >> 20);
         } else {
             fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_PREFIX_CACHE=0)\n");
         }
@@ -1581,6 +1590,10 @@ ModelEngine::PrefixCacheStats ModelEngine::prefix_cache_stats() const {
     out.entries = s.entries;
     out.host_bytes = s.host_bytes;
     out.blocks = s.blocks;
+    out.host_entries = s.host_entries;
+    out.kv_host_bytes = s.kv_host_bytes;
+    out.restores = s.restores;
+    out.restored_blocks = s.restored_blocks;
     return out;
 }
 

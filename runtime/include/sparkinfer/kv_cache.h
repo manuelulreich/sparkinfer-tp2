@@ -174,6 +174,16 @@ public:
     std::vector<int> retain_prefix_blocks(uint64_t seq_id, int n_blocks);
     // Drop one reference from each block; any that reach zero go back to the pool.
     void release_blocks(const std::vector<int>& physical_ids);
+    // +1 on blocks that already have a holder (a second holder of a cached prefix's blocks).
+    // False, retaining nothing, if any of them is free.
+    bool retain_blocks(const std::vector<int>& physical_ids);
+    // Take n free blocks for a holder that is not a sequence (the prefix cache restoring a prefix
+    // from host memory): one reference each, in the order the pool hands them out, so a mirrored
+    // manager with the same history returns the same ids. Empty if fewer than n are free or the
+    // pool has windowed slices.
+    std::vector<int> allocate_blocks(int n);
+    // Elements of one block in one slot's sub-pool (block_size * kv heads here * head_dim).
+    size_t block_elems() const;
     // allocate() for a seq_id that has no blocks yet, whose first logical blocks ARE `prefix`
     // (shared, +1 each); only the remainder of num_tokens comes from the pool. False, changing
     // nothing, when seq_id already has blocks, a prefix block is not live, prefix is longer than

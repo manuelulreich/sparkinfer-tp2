@@ -540,6 +540,18 @@ Memory. Entries hold KV blocks (capped at half the pool) and snapshots in host R
 entries are evicted before it is refused. `/metrics` reports `sparkinfer_prefix_cache_*` hits,
 reused tokens, evictions, entries, blocks and host bytes.
 
+Host KV tier (`SPARKINFER_PREFIX_CACHE_KV_HOST_MB`, default 16384). Each entry's KV blocks are
+also copied to pinned host memory when it is inserted -- in the background, on a copy stream per
+card, and only blocks no other entry copied yet (the turns of one conversation share them). An
+entry that has to leave the pool (pool share, or a request that needs blocks) then stays cached in
+host memory, and a later request that starts with it gets its KV copied back instead of prefilled:
+a 45k-token conversation resumes in ~0.29 s to first token (10.2 s to prefill) on 2x RTX 5060 Ti
+(PCIe Gen3 x8). The copies are byte-exact: under `SPARKINFER_DETERMINISTIC=1` with
+`SPARKINFER_PREFIX_CACHE=2`, a restored hit and a hit still in the pool give identical outputs and
+logprobs. Host memory is pinned ahead in 38 MB chunks per card (up to ~600 MB pinned beyond what is
+in use). `/metrics`: `..._host_entries`, `..._kv_host_bytes`, `..._restores_total`,
+`..._restored_blocks_total`.
+
 A cached request prefills in two passes -- up to the checkpoint and after it -- instead of one. The
 second pass sits as close to the token-by-token reference as the single pass does (tail lengths
 15-4,111 tokens, same top-1 token throughout). Outputs still vary by the few tenths of a nat any two
@@ -568,8 +580,9 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_TOKENIZER_URL` | Qwen3.6-35B-A3B tokenizer | Override tokenizer download |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_FILE` | — | JSON `[id,...]` warmed via `cache_prefix` each request |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` | — | Comma-separated token ids (same as above) |
-| `SPARKINFER_PREFIX_CACHE` | `1` | Automatic prefix cache (see **Automatic prefix cache**). `0` disables; `SPARKINFER_DETERMINISTIC=1` also disables it. |
-| `SPARKINFER_PREFIX_CACHE_ENTRIES` | `32` | Most cached prefixes held at once; least-recently-used is evicted. |
+| `SPARKINFER_PREFIX_CACHE` | `1` | Automatic prefix cache (see **Automatic prefix cache**). `0` disables; `SPARKINFER_DETERMINISTIC=1` also disables it, unless this is `2` (for testing the cache itself). |
+| `SPARKINFER_PREFIX_CACHE_ENTRIES` | `64` (`32` without the host KV tier) | Most cached prefixes held at once, in the pool or in host memory; least-recently-used is evicted. |
+| `SPARKINFER_PREFIX_CACHE_KV_HOST_MB` | `16384` | Pinned host memory for the host KV tier (both cards together; ~18.7 KB per token on Qwen3.8-27B nvfp4 at `--tp 2`, so 16 GiB holds ~900k tokens). `0` turns the tier off: an entry leaving the pool is dropped. |
 | `SPARKINFER_PREFIX_CACHE_HOST_MB` | `8192` | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). |
 | `SPARKINFER_PREFIX_CACHE_MIN_TOKENS` | `1024` | Shortest prompt position a request checkpoints at. Shorter prompts still reuse cached prefixes but do not create one. |
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
