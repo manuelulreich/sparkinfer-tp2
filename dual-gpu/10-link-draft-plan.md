@@ -84,6 +84,19 @@ another, and the split partition is fixed by plain decode's (exactness), so 16 w
 attention reading 16 never-written P' columns (odd page x zero B: NaN for e4m3 garbage). Same
 prompt, 5 requests, 5 different first-token distributions; now 1. nvfp4 gates pass.
 
+**F status (2026-10-04).** Prefill profile, 20k prompt, `startup.sh` config: 4.99 s of kernels,
+3.6 s busy per card; the link moved 15.7 GB in 2.4 s (6.5 GB/s). Done: the last FFN-down chunk async
+(it was synchronous and exact, draining the queue first: 128 x ~3.3 ms waits), the out / o
+projections chunked with early all-reduce posts, 4 FFN chunks. 20k 5.9 -> 5.4 s, 60k 17.1 -> 15.9 s.
+Not the lever: memory (a smaller KV pool lets windows grow 4k -> 8k at the same speed), the prefix
+cache checkpoints (0.1-0.3 s). Left: ~0.9 s of link waits a 20k prefill, structural -- each layer's
+two all-reduces overlap only with the next chunk's row-wise work (F1, the micro-batch interleave).
+
+**R3 status: tried, no gain.** The DFlash2 candidate head restricted to token ids < K (rank 0 only):
+K = 65536 draft -0.38 ms but acceptance 3.70 -> 3.54 (greedy, 20k); K = 98304 -0.17 ms, 3.70 -> 3.68
+and 3.30 -> 3.26 at 60k. Net zero or worse. The conv projections in NVFP4 (not in the plan) are a
+small win: acceptance unchanged, draft -0.2 ms.
+
 ## D. Decode all-reduce (lossless first)
 
 - **D1. Fuse the receive with what follows** (lossless). After every all-reduce come the residual

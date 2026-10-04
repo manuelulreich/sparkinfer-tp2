@@ -991,13 +991,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     }
     // (dual-GPU B3/B4) tp: the all-reduce overlap works per FFN chunk, and a pass of up to a few
     // thousand tokens runs the FFN as ONE chunk, which leaves nothing to overlap. Split it into
-    // SPARKINFER_TP_FFN_CHUNKS (default 2; 2/3/4/6 measured equal at 1k-4k, ~3.5k tok/s, so the
-    // fewest weight re-reads wins) 128-aligned chunks. A pure function of N, so both ranks
+    // SPARKINFER_TP_FFN_CHUNKS (default 4: 2/3/4/6 measured equal at 1k-4k, ~3.5k tok/s; with the
+    // int8 wire at 20k/60k 4 beats 2 by 3 % -- the last chunk's all-reduce is what the next layer's
+    // front waits for, and a quarter of the rows crosses sooner than half) 128-aligned chunks. A pure function of N, so both ranks
     // agree, and only ever shrinks FC (less scratch, and ffn_alias stays valid).
     if (tp_active && N >= 1024) {
         static const int tp_chunks = [] {
             const char* e = getenv("SPARKINFER_TP_FFN_CHUNKS");
-            const int v = e ? atoi(e) : 2;
+            const int v = e ? atoi(e) : 4;
             const char* o = getenv("SPARKINFER_TP_AR_OVERLAP");
             return (o && o[0] == '0') ? 1 : (v < 1 ? 1 : v);
         }();
@@ -2420,6 +2421,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
         tail_pending = true;
     };
+    // (plan 10) The K-split out / o projection itself chunked like the tail: chunk c's rows are
+    // projected and their all-reduce posted before chunk c+1 is projected, so chunk 0 crosses the
+    // link while the rest of the projection runs instead of after all of it -- the FFN's first
+    // chunk otherwise waits a whole chunk's transfer with the card idle. Row-wise GEMMs on the
+    // same rows: bit-identical. `chunk_gemm(fo, fn)` projects rows [fo, fo + fn) into ao (false:
+    // declined, and `chunk_fallback` projects them on the converted path). Only with a chunked tail.
+    static const bool tp_out_chunk_env = [] {
+        const char* e = getenv("SPARKINFER_TP_OUT_CHUNK");
+        return !(e && e[0] == '0');
+    }();
+    auto tp_tail_proj_chunked = [&](auto&& chunk_gemm, auto&& chunk_fallback) -> bool {
+        if (!tp_tail_chunked || !tp_out_chunk_env) return false;
+        for (int fo = 0, i = 0; fo < N; fo += FC, ++i) {
+            const int fn = (N - fo < FC) ? (N - fo) : FC;
+            if (!chunk_gemm(fo, fn)) chunk_fallback(fo, fn);
+            tail_tickets[i] = tp_prefill_allreduce_bf16_async(ao + (size_t)fo * H, (size_t)fn * H);
+        }
+        tail_pending = true;
+        return true;
+    };
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         // A sliding-window layer reads and writes its own (possibly capped, ring-mapped) slice;
@@ -2721,8 +2742,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     const char* e = getenv("SPARKINFER_TP_GDN_NVFP4");
                     return !(e && e[0] == '0');
                 }();
-                const bool tp_out_fp4 = tp_gdn_out_fp4_on && gdn_nvfp4 && (gdn_fp4_mask & 2) &&
-                    w.gdn_out_fp4 && w.gdn_out_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
+                const bool out_fp4_arm = tp_gdn_out_fp4_on && gdn_nvfp4 && (gdn_fp4_mask & 2) &&
+                    w.gdn_out_fp4 && w.gdn_out_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws;
+                const bool out_chunked = tp_tail_proj_chunked(
+                    [&](int fo, int fn) {
+                        return out_fp4_arm && kernels::prefill_nvfp4_supported(fn, H, gdn_vl) &&
+                               kernels::launch_prefill_nvfp4_quant_a(tp_lnA + (size_t)fo * gdn_vl,
+                                                                     fp4_gdn_a, fp4_gdn_as, fn,
+                                                                     gdn_vl, st) &&
+                               kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                                  w.gdn_out_fp4, w.gdn_out_fp4_sf,
+                                                                  ao + (size_t)fo * H, fn, H, gdn_vl,
+                                                                  fp4_gdn_ws, st, w.gdn_out_fp4_alpha);
+                    },
+                    [&](int fo, int fn) {
+                        proj(tp_lnA + (size_t)fo * gdn_vl, w.ssm_out, w.ssm_out_type,
+                             ao + (size_t)fo * H, H, gdn_vl, fn);
+                    });
+                if (!out_chunked) {
+                const bool tp_out_fp4 = out_fp4_arm &&
                     kernels::prefill_nvfp4_supported(N, H, gdn_vl) &&
                     kernels::launch_prefill_nvfp4_quant_a(tp_lnA, fp4_gdn_a, fp4_gdn_as, N, gdn_vl, st) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
@@ -2731,6 +2769,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                        w.gdn_out_fp4_alpha);
                 if (!tp_out_fp4) proj(tp_lnA, w.ssm_out, w.ssm_out_type, ao, H, gdn_vl, N);
                 tp_tail_allreduce();
+                }
             } else {
                 if (gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
                     fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
@@ -3249,6 +3288,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 const int tp_ranks = c.linear_v_heads / s.gdn_window.v_count;
                 const int kw = (qdim % tp_ranks == 0) ? qdim / tp_ranks : 0;
                 const int k0 = (s.gdn_window.v_start / s.gdn_window.v_count) * kw;
+                bool o_chunked = false;
                 if (kw == 0) {
                     static bool tp_oj_degenerate_noted = false;
                     if (!tp_oj_degenerate_noted) {
@@ -3274,9 +3314,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                 (size_t)qdim * 2, (size_t)kw * 2, (size_t)N,
                                                 cudaMemcpyDeviceToDevice, st),
                          "pfb tp o_proj window");
+                    const bool wo_arm = attn_nvfp4 && (attn_fp4_mask & 2) && w.wo_fp4 &&
+                                        w.wo_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws;
+                    o_chunked = tp_tail_proj_chunked(
+                        [&](int fo, int fn) {
+                            return wo_arm &&
+                                   kernels::launch_prefill_nvfp4_quant_a(tp_att_win + (size_t)fo * kw,
+                                                                         fp4_attn_a, fp4_attn_as,
+                                                                         fn, kw, st) &&
+                                   kernels::launch_prefill_nvfp4_gemm(fp4_attn_a, fp4_attn_as,
+                                                                      w.wo_fp4, w.wo_fp4_sf,
+                                                                      ao + (size_t)fo * H, fn, H, kw,
+                                                                      fp4_attn_ws, st, w.wo_fp4_alpha);
+                        },
+                        [&](int fo, int fn) {
+                            proj_fused(tp_att_win + (size_t)fo * kw, w.wo, w.wo_type, w.wo_rs,
+                                       ao + (size_t)fo * H, H, kw, fn);
+                        });
                     bool wo_fp4_tp = false;
-                    if (attn_nvfp4 && (attn_fp4_mask & 2) &&
-                        w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a && fp4_attn_as && fp4_attn_ws &&
+                    if (!o_chunked && wo_arm &&
                         kernels::launch_prefill_nvfp4_quant_a(tp_att_win, fp4_attn_a, fp4_attn_as,
                                                               N, kw, st)) {
                         // Non-residual form only: the residual add runs on the summed buffer, after
@@ -3286,11 +3342,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                                         ao, N, H, kw, fp4_attn_ws,
                                                                         st, w.wo_fp4_alpha);
                     }
-                    if (!wo_fp4_tp)
+                    if (!o_chunked && !wo_fp4_tp)
                         proj_fused(tp_att_win, w.wo, w.wo_type, w.wo_rs, ao, H, kw);
                 }
                 attn_fused = false;
-                tp_tail_allreduce();
+                if (!o_chunked) tp_tail_allreduce();
             } else if (wo_fp4_q38) {
                 attn_fused = wo_fp4_resid;
             } else if (c.muse_glimmer) {
@@ -3512,6 +3568,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
                 front_tickets.assign(front_pipe ? (size_t)((N + FC - 1) / FC) : 0, -1);
             }
+            bool down_async = false;   // the down all-reduces all went async; join after the loop
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
@@ -3801,12 +3858,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             const char* e = getenv("SPARKINFER_TP_AR_OVERLAP");
                             return !(e && e[0] == '0');
                         }();
+                        // The last chunk goes async too and the loop's end joins it (plan 10): the
+                        // synchronous form first drains every queued chunk and then sends this one
+                        // on the exact path -- 2x the bytes of the wire codec when that is on -- with
+                        // the compute stream idle throughout. Same op, so bit-identical without the
+                        // wire; with it, this chunk is coded like the others.
                         if (front_pipe)
                             front_tickets[(size_t)(fo / FC)] =
                                 tp_prefill_allreduce_bf16_async(ao + (size_t)fo * H, (size_t)fn * H);
-                        else if (ar_overlap && fo + fn < N)
+                        else if (ar_overlap) {
                             tp_prefill_allreduce_bf16_async(ao + (size_t)fo * H, (size_t)fn * H);
-                        else
+                            down_async = true;
+                        } else
                             tp_prefill_allreduce_bf16(ao + (size_t)fo * H, (size_t)fn * H);
                     } else {
                     if (!ffn_grouped && !h_ready) {
@@ -3867,6 +3930,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
             }
             tail_pending = false;   // every chunk consumed its tail rows (B4)
+            if (down_async) tp_prefill_allreduce_join();   // ao complete on st from here
             if (c.muse_glimmer) {
                 // Sandwich norm (post-FFN): x = h + RMSNorm(ao) * post_ffn_norm (decode
                 // qwen35.cpp:1329). h is the post-attn residual stream; ao holds the raw FFN output.

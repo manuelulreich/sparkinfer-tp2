@@ -205,6 +205,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 prefill: less of the link exposed.** Three changes, each bit-identical on the exact
+  link (byte-identical greedy output on 20k and 60k prompts):
+  - the layer's last FFN-down chunk is posted asynchronously like the others and joined after
+    the loop, instead of a synchronous all-reduce that first drained the queue and then sent the
+    chunk on the exact path (twice the int8 wire's bytes) with the card idle;
+  - the K-split GDN out / attention o projection runs per FFN chunk and posts each chunk's
+    all-reduce at once, so chunk 0 crosses while the rest is projected (`SPARKINFER_TP_OUT_CHUNK=0`
+    restores the single GEMM);
+  - 4 FFN chunks by default (`SPARKINFER_TP_FFN_CHUNKS`, was 2).
+  `startup.sh` configuration (nvfp4 KV, int8 wire, DFlash2): 20k-token prompt 5.9 -> 5.4 s, 60k
+  17.1 -> 15.9 s. The DFlash2 conv projections now run as NVFP4 (acceptance unchanged over 1.5k
+  greedy tokens at 20k and 600 at 60k, draft -0.2 ms; `SPARKINFER_DFLASH2_CONV_NVFP4=0` keeps bf16).
+
 - **tp=2 nvfp4 verify attention reads the KV once per session.** A verify with nvfp4 KV ran the
   single-row split kernel once per row (8 reads of the whole KV for a DFlash2 block).
   `fa_split_gqa_mma_nvfp4_rows_kernel` serves up to 8 rows of one session in a CTA, each (row,

@@ -2091,7 +2091,7 @@ bool DFlashDraftModel::load(const std::string& dir) {
                 cv.proj = s.upload(*p);
                 static const bool conv_nv = [] {
                     const char* e = getenv("SPARKINFER_DFLASH2_CONV_NVFP4");
-                    return e && e[0] == '1';
+                    return !(e && e[0] == '0');
                 }();
                 if (conv_nv && s.nv_on) {
                     cv.proj_nv = s.quant_nvfp4_payload(cv.proj, nc, H);
