@@ -215,6 +215,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2: one lm_head (NVFP4), ~340 MB more free per card; and a KV pool sized on its own.**
+  (1) With a DFlash2 draft or none, the Q4_K head copy is released after load and every head row
+  is scored from the NVFP4 head: the tensor-core GEMM for verify rows as before, and for one-row
+  decode, the prefill's seed token and deterministic verify a new f32-output NVFP4 GEMV (the
+  int8-activation dp4a rows kernel, one kernel for every row count, so decode and verify agree).
+  tp2 gates pass with nvfp4 KV (determinism, batching, DFlash2 lossless 7/7); teacher-forced
+  perplexity on the eval corpus 4.468 -> 4.459 (4963 tokens); first-token top-1 agrees with the
+  Q4_K head on 7/8 prompts. `SPARKINFER_HEAD_NVFP4_ONLY=0` keeps both heads (a DSpark draft
+  always does). (2) `SPARKINFER_KV_POOL_TOKENS` sizes the shared KV pool independently of
+  `--ctx`, which stays the per-request maximum, so concurrent streams can hold more in total.
 - **1.2 GB more free on each card: the token embedding table in pinned host memory.** The bf16
   table (half the vocabulary per card at tp=2, 1.27 GB) was read a few rows a step; it is now one
   mapped host table shared by both ranks (and read whole by the DFlash2 drafter, which drops its

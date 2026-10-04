@@ -674,6 +674,8 @@ struct DFlashDraftModel::Impl {
     std::unordered_map<int, bf16*> embed_hi_cache;
     const void* lm_head = nullptr;
     int lm_head_type = 0;
+    signed char* head_nv_xq = nullptr;   // NVFP4-payload head (kLmHeadNvfp4Type): int8 rows
+    float* head_nv_xs = nullptr;         // ...and their per-16 scales
     int vocab = 0;
     int hidden = 0;
     bf16* lm_head_bf16 = nullptr;  // eager dequant+transpose cache for the batched LM-head GEMM
@@ -1466,13 +1468,23 @@ struct DFlashDraftModel::Impl {
         bool ok = lm_head && Vh > 0 && depth >= 1 && m <= BW;
         if (ok) {
             bool done = ((m + 7) & ~7) <= cfg.block_size && head_fp4(xn, m, logits, Vh, st);
-            if (!done && head_q8 && (lm_head_type == 12 || lm_head_type == 14)) {
+            if (!done && lm_head_type == kLmHeadNvfp4Type) {
+                if (!head_nv_xq) head_nv_xq = alloc<signed char>((size_t)cfg.block_size * H);
+                if (!head_nv_xs) head_nv_xs = alloc<float>((size_t)cfg.block_size * (H / 16));
+                if (head_nv_xq && head_nv_xs && m <= cfg.block_size) {
+                    kernels::launch_gemv_nvfp4_quant_x(xn, head_nv_xq, head_nv_xs, m, H, st);
+                    done = kernels::launch_gemv_nvfp4_rows_dp4a_f32(head_nv_xq, head_nv_xs, lm_head,
+                                                                    logits, m, Vh, H, st);
+                }
+                if (!done) ok = false;
+            }
+            if (!done && ok && head_q8 && (lm_head_type == 12 || lm_head_type == 14)) {
                 kernels::launch_quantize_q8_1_rows(xn, head_q8, H, m, H, st);
                 done = lm_head_type == 12
                     ? kernels::launch_gemv_q4k_dp4a_multirow_f32(head_q8, lm_head, logits, Vh, H, m, st)
                     : kernels::launch_gemv_q6k_dp4a_multirow_f32(head_q8, lm_head, logits, Vh, H, m, st);
             }
-            for (int r = 1; !done && r <= depth; r++) {
+            for (int r = 1; !done && ok && r <= depth; r++) {
                 if (lm_head_type)
                     kernels::launch_gemv_q_f32(xn + (size_t)r * H, lm_head, lm_head_type,
                                                logits + (size_t)r * Vh, Vh, H, st);

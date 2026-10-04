@@ -646,6 +646,12 @@ public:
     // the seed's logprob is only wanted when the request asked for logprobs.
     // Hand back the NVFP4 LM-head operand (see Qwen35Weights::lm_head_fp4). Idempotent.
     void release_lm_head_fp4();
+    // (tp, plan 10 memory audit) Drop the Q4_K lm_head and score every head row from the NVFP4
+    // head's own payload (lm_head_type becomes kLmHeadNvfp4Type): ~340 MB back on each card.
+    // can_* checks without changing anything, so both ranks can agree first. Call with this
+    // rank's device current, before any request; not for a DSpark draft (it reads the Q4_K head).
+    bool can_release_lm_head_q4k() const;
+    bool release_lm_head_q4k();
     int prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob = false,
                         int pos0 = 0);
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):

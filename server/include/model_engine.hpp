@@ -275,6 +275,10 @@ public:
     // group path speculates at any context (sliding draft KV, windowed attention), while a lone
     // request on one card needs prompt + max_tokens within it. Call after load().
     bool load_draft(const std::string& dir, std::string& err);
+    // (tp=2) After the draft (if any) is in: drop the Q4_K lm_head copy on both cards and score
+    // every head row from the NVFP4 head (~340 MB per card) -- unless a DSpark draft reads it.
+    // SPARKINFER_HEAD_NVFP4_ONLY=0 keeps both. No-op at tp=1.
+    void release_unused_head();
     bool speculative() const;
     struct SpeculativeStats {
         bool enabled = false;

@@ -41,6 +41,17 @@ namespace sparkinfer_server {
 
 namespace {
 
+// The KV pool's size in tokens, shared by every running and cached sequence. Defaults to --ctx
+// (the per-request maximum); SPARKINFER_KV_POOL_TOKENS sizes it on its own, so several streams can
+// hold more in total than one request may (or less, to leave room for prefill). Never below 4096.
+size_t kv_pool_tokens(int max_seq) {
+    static const long long env = [] {
+        const char* e = getenv("SPARKINFER_KV_POOL_TOKENS");
+        return e ? atoll(e) : 0LL;
+    }();
+    return env > 0 ? (size_t)std::max<long long>(env, 4096) : (size_t)max_seq;
+}
+
 // SPARKINFER_MEM_LOG=1: each card's used device memory at the load milestones below, with the
 // change since the previous mark (the memory audit of plan 10).
 void mem_mark(const char* what) {
@@ -509,7 +520,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         : impl_->cfg.n_kv_heads;
     if (plan.tp > 1) { kvc.kv_head_start = 0; kvc.kv_head_count = kvh_rank; }
     const size_t epb = (size_t)16 * kvh_rank * impl_->cfg.head_dim;
-    const size_t blocks = (size_t)impl_->cfg.max_seq / 16 + 8;
+    const size_t blocks = kv_pool_tokens(impl_->cfg.max_seq) / 16 + 8;
     // pool_bytes is a bf16-DENOMINATED BUDGET, not an allocation: KVCacheManager derives
     // total_blocks = pool_bytes / (n_slots * 2 * bf16_bytes_per_block) and then mallocs at the
     // real element width (int8 just mallocs less). So the `* 2` here is the bf16 element size and
@@ -684,7 +695,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             kc.kv_head_start = kv_start;
             kc.kv_head_count = kv_count;
             const size_t epb_r = (size_t)16 * (size_t)kv_count * (size_t)impl_->cfg.head_dim;
-            const size_t blocks_r = (size_t)impl_->cfg.max_seq / 16 + 8;
+            const size_t blocks_r = kv_pool_tokens(impl_->cfg.max_seq) / 16 + 8;
             impl_->tp_kvs.emplace_back(std::make_unique<sparkinfer::KVCacheManager>(
                 kc, (size_t)kvL * 2 * epb_r * 2 * blocks_r));
             // This rank's GDN v-head state window: [vfull*r/R, vfull*(r+1)/R).
@@ -1317,6 +1328,39 @@ int ModelEngine::free_kv_blocks() const {
 int ModelEngine::max_queue_depth() const {
     std::lock_guard<std::mutex> lock(mu_);
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
+}
+
+void ModelEngine::release_unused_head() {
+    static const bool on = [] { const char* e = getenv("SPARKINFER_HEAD_NVFP4_ONLY"); return !(e && e[0] == '0'); }();
+    if (!on || !impl_->model || impl_->tp_models.empty()) return;
+    if (impl_->draft && !impl_->draft->config().dflash2) return;   // DSpark scores the Q4_K head
+    sparkinfer::Qwen35Model* r0 = impl_->model.get();
+    sparkinfer::Qwen35Model* r1 = impl_->tp_models[0].get();
+    const int d0 = r0->tp_rank_view().device, d1 = r1->tp_rank_view().device;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    // Both ranks or neither: each scores its own vocab half, and a half on another kernel would
+    // still sum to a valid row but no longer the one the other configuration produces.
+    bool ok0 = false, ok1 = false;
+    cudaSetDevice(d0);
+    ok0 = r0->can_release_lm_head_q4k();
+    cudaSetDevice(d1);
+    ok1 = r1->can_release_lm_head_q4k();
+    if (ok0 && ok1) {
+        cudaSetDevice(d0);
+        ok0 = r0->release_lm_head_q4k();
+        cudaSetDevice(d1);
+        ok1 = r1->release_lm_head_q4k();
+    }
+    cudaSetDevice(cur);
+    if (ok0 && ok1) {
+        fprintf(stderr, "[sparkinfer-server] lm_head: NVFP4 only, Q4_K copy released on both cards "
+                        "(SPARKINFER_HEAD_NVFP4_ONLY=0 keeps it)\n");
+        mem_mark("Q4_K lm_head released");
+    } else if (ok0 != ok1) {
+        fprintf(stderr, "[sparkinfer-server] lm_head: release failed on one card only -- the two "
+                        "cards now score with different head kernels\n");
+    }
 }
 
 bool ModelEngine::load_draft(const std::string& dir, std::string& err) {

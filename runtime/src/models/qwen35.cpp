@@ -752,6 +752,10 @@ struct Qwen35Model::Impl {
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     const void* embed_host_full = nullptr;   // see embed_host_table()
+    // NVFP4-payload head (lm_head_type == kLmHeadNvfp4Type, see release_lm_head_q4k): the rows'
+    // int8 activations and per-16 scales for launch_gemv_nvfp4_rows_dp4a_f32.
+    signed char* head_nv_xq = nullptr;
+    float* head_nv_xs = nullptr;
     // GGUF fused-expert decode scratch (allocated by load_gguf)
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     // Decode-side NVFP4 FFN scratch (the default path; SPARKINFER_QWEN38_DECODE_NVFP4=0 opts out):
@@ -3610,7 +3614,12 @@ int Qwen35Model::forward_token_tp(int token_id, int position, bool sample, float
 
     cu(cudaMemsetAsync(s.logits, 0, (size_t)c.vocab * sizeof(float), st), "tp logits zero");
     // lm_head N-window GEMV into the arena half (mirror of the tp=1 arm chain, out=arena half).
-    if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
+    if (s.w.lm_head_type == kLmHeadNvfp4Type) {
+        kernels::launch_gemv_nvfp4_quant_x(s.xn, s.head_nv_xq, s.head_nv_xs, 1, H, st);
+        kernels::launch_gemv_nvfp4_rows_dp4a_f32(s.head_nv_xq, s.head_nv_xs, s.w.lm_head, logits_h,
+                                                 1, Vr, H, st);
+    }
+    else if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
         kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
         kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, logits_h, Vr, H, st);
     }
@@ -4594,6 +4603,12 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
             kernels::launch_prefill_nvfp4_gemm_f32(s.vr_tc_a, s.vr_tc_as, s.w.lm_head_fp4,
                                                    s.w.lm_head_fp4_sf, s.vr_lh, mp, Vr, H,
                                                    s.vr_tc_ws, st, s.w.lm_head_fp4_alpha);
+    }
+    if (!head_done && s.w.lm_head_type == kLmHeadNvfp4Type) {
+        // The same kernel as the one-row decode head: a row scores identically in both.
+        kernels::launch_gemv_nvfp4_quant_x(s.vr_xn, s.head_nv_xq, s.head_nv_xs, n, H, st);
+        head_done = kernels::launch_gemv_nvfp4_rows_dp4a_f32(s.head_nv_xq, s.head_nv_xs, s.w.lm_head,
+                                                             s.vr_lh, n, Vr, H, st);
     }
     if (!head_done && head_q4k) {
         kernels::launch_quantize_q8_1_rows(s.vr_xn, s.vr_q81, H, n, H, st);
@@ -6525,7 +6540,39 @@ static bool release_bonsai_shadow(Impl& s) {
     return true;
 }
 
+bool Qwen35Model::can_release_lm_head_q4k() const {
+    const Impl& s = *p_;
+    return s.w.lm_head_type == kLmHeadNvfp4Type ||
+           (s.tp_link && s.lm_head_fp4_payload && s.w.lm_head_fp4 && s.w.lm_head_fp4_sf &&
+            s.w.lm_head && s.cfg.hidden % 16 == 0 && s.cfg.vocab / 2 >= 4096 &&
+            std::find(s.owned.begin(), s.owned.end(), s.w.lm_head) != s.owned.end());
+}
+
+bool Qwen35Model::release_lm_head_q4k() {
+    Impl& s = *p_;
+    if (s.w.lm_head_type == kLmHeadNvfp4Type) return true;
+    if (!can_release_lm_head_q4k()) return false;
+    const size_t H = (size_t)s.cfg.hidden;
+    if (cudaMalloc(&s.head_nv_xq, (size_t)kTpVerifyRows * H) != cudaSuccess ||
+        cudaMalloc(&s.head_nv_xs, (size_t)kTpVerifyRows * (H / 16) * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        if (s.head_nv_xq) cudaFree(s.head_nv_xq);
+        s.head_nv_xq = nullptr;
+        s.head_nv_xs = nullptr;
+        return false;
+    }
+    s.owned.push_back(s.head_nv_xq);
+    s.owned.push_back(s.head_nv_xs);
+    auto it = std::find(s.owned.begin(), s.owned.end(), s.w.lm_head);
+    cudaFree(*it);
+    s.owned.erase(it);
+    s.w.lm_head = s.lm_head_fp4_payload;
+    s.w.lm_head_type = kLmHeadNvfp4Type;
+    return true;
+}
+
 void Qwen35Model::release_lm_head_fp4() {
+    if (p_->w.lm_head_type == kLmHeadNvfp4Type) return;   // it is the only head now
     Impl& s = *p_;
     if (!s.lm_head_fp4_payload && !s.lm_head_fp4_sf_buf) return;
     if (s.dflash_draft) s.dflash_draft->set_head_fp4(nullptr, nullptr, 1.f);

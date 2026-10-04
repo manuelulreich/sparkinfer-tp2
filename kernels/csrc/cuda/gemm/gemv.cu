@@ -1391,6 +1391,44 @@ SI_NVFP4_DP4A_INST1(2, 8) SI_NVFP4_DP4A_INST1(4, 8) SI_NVFP4_DP4A_INST1(8, 8)
 #undef SI_NVFP4_DP4A_INST1
 #endif
 
+// f32 output (the NVFP4 lm_head's logits): S = 2 (the head is N >= 4096), NR by row count as the
+// bf16 launcher picks it at its default, so every row count runs the same reduction association.
+template <int R>
+static void gemv_nvfp4_rows_dp4a_f32_launch(const signed char* xq, const float* xs, const void* W,
+                                            float* y, int N, int K, cudaStream_t stream) {
+    constexpr int S = 2, RPB = GEMV_WPB / S;
+    if (R == 1 || R == 3) {
+        gemv_nvfp4_rows_dp4a_kernel<float, S, R, 1>
+            <<<(N + RPB - 1) / RPB, GEMV_WPB * 32, 0, stream>>>(xq, xs, W, y, N, K);
+    } else {
+        gemv_nvfp4_rows_dp4a_kernel<float, S, R, 2>
+            <<<(N + RPB * 2 - 1) / (RPB * 2), GEMV_WPB * 32, 0, stream>>>(xq, xs, W, y, N, K);
+    }
+}
+
+bool launch_gemv_nvfp4_rows_dp4a_f32(const void* xq, const void* xs, const void* W, float* y,
+                                     int M, int N, int K, cudaStream_t stream) {
+    if (!xq || !xs || !W || !y || M < 1 || N < 4096 || K < 1 || (K & 15)) return false;
+    const size_t ng = (size_t)(K >> 4);
+    for (int r0 = 0; r0 < M; r0 += 8) {
+        const int m = (M - r0) < 8 ? (M - r0) : 8;
+        const auto* xp = reinterpret_cast<const signed char*>(xq) + (size_t)r0 * K;
+        const auto* sp = reinterpret_cast<const float*>(xs) + (size_t)r0 * ng;
+        float* yp = y + (size_t)r0 * N;
+        switch (m) {
+            case 1: gemv_nvfp4_rows_dp4a_f32_launch<1>(xp, sp, W, yp, N, K, stream); break;
+            case 2: gemv_nvfp4_rows_dp4a_f32_launch<2>(xp, sp, W, yp, N, K, stream); break;
+            case 3: gemv_nvfp4_rows_dp4a_f32_launch<3>(xp, sp, W, yp, N, K, stream); break;
+            case 4: gemv_nvfp4_rows_dp4a_f32_launch<4>(xp, sp, W, yp, N, K, stream); break;
+            case 5: gemv_nvfp4_rows_dp4a_f32_launch<5>(xp, sp, W, yp, N, K, stream); break;
+            case 6: gemv_nvfp4_rows_dp4a_f32_launch<6>(xp, sp, W, yp, N, K, stream); break;
+            case 7: gemv_nvfp4_rows_dp4a_f32_launch<7>(xp, sp, W, yp, N, K, stream); break;
+            default: gemv_nvfp4_rows_dp4a_f32_launch<8>(xp, sp, W, yp, N, K, stream); break;
+        }
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 #ifndef _MSC_VER
 #define SI_NVFP4_ROWS_INST(S_, R_) \
 template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1, 0>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \

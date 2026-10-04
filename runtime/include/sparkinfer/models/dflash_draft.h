@@ -82,6 +82,11 @@ struct DFlashDraftConfig {
     int max_proposals() const { return dflash2 ? block_size - 1 : block_size; }
 };
 
+// lm_head type code for a head held only as an SI_NVFP4 payload ([header | e4m3 group scales |
+// packed e2m1], the tp=2 target's NVFP4 head once its Q4_K copy is released): scored with
+// kernels::launch_gemv_nvfp4_rows_dp4a_f32 where the tensor-core head does not apply.
+constexpr int kLmHeadNvfp4Type = 1000;
+
 class DFlashDraftModel {
 public:
     explicit DFlashDraftModel(const DFlashDraftConfig& cfg);

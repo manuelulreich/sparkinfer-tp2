@@ -36,6 +36,7 @@
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/models/dflash_kernels.h"
+#include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/kv_ops.h"
 
 #include <cuda_runtime.h>
@@ -4702,7 +4703,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // this BIT-EXACT vs the in-kernel path -- same Q8_1 values, same dp4a -- and it drops the
         // per-block re-quantization of the same 6656-value activation, which at vocab-many rows is the
         // larger half of what that one launch reads after the weights themselves.
-        if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
+        if (s.w.lm_head_type == kLmHeadNvfp4Type) {
+            // The NVFP4-payload head (tp, Q4_K copy released): the decode head's own kernel, so
+            // the seed token is scored as every later decode step scores its row.
+            static void* nv_xq[8] = {};
+            static void* nv_xs[8] = {};
+            int dev = 0;
+            pf_cu(cudaGetDevice(&dev), "head device");
+            if (dev < 8 && !nv_xq[dev]) {
+                pf_cu(cudaMalloc(&nv_xq[dev], (size_t)H), "head xq");
+                pf_cu(cudaMalloc(&nv_xs[dev], (size_t)(H / 16) * sizeof(float)), "head xs");
+            }
+            kernels::launch_gemv_nvfp4_quant_x(xn_last, nv_xq[dev], nv_xs[dev], 1, H, st);
+            kernels::launch_gemv_nvfp4_rows_dp4a_f32(nv_xq[dev], nv_xs[dev], s.w.lm_head,
+                                                     s.logits, 1, head_rows, H, st);
+        } else if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
             kernels::launch_quantize_q8_1(xn_last, lm_q8, lm_ad, lm_as, H, st);
             kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, head_rows, H, st);
         } else if (s.w.lm_head_type == kPtq1GgmlType && s.bonsai_rot && s.bonsai_sign_hidden) {

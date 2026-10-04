@@ -131,6 +131,11 @@ void launch_gemv_nvfp4_quant_x(const void* x, void* xq, void* xs, int M, int K,
                                cudaStream_t stream);
 bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
                                  int M, int N, int K, cudaStream_t stream);
+// The same rows kernel with f32 output (an NVFP4 lm_head's logits); any M (8 rows at a time),
+// N >= 4096. Every row count runs the same per-row reduction, so one-row decode and an M-row
+// verify score a row identically.
+bool launch_gemv_nvfp4_rows_dp4a_f32(const void* xq, const void* xs, const void* W, float* y,
+                                     int M, int N, int K, cudaStream_t stream);
 // Paired form: one grid over two same-shaped NVFP4 matrices sharing one activation (the FFN's
 // gate/up pair). Returns false when the shape would let a CTA straddle the boundary; the caller
 // then issues the two single launches.

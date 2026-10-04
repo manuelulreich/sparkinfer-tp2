@@ -1136,6 +1136,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    engine.release_unused_head();
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
