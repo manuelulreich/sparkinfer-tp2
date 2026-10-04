@@ -7,6 +7,22 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2 nvfp4 prefill attention in key chunks** (`SPARKINFER_PREFILL_ATTN_CHUNK`, default 32768).
+  The e4m3 attention runs the history a chunk at a time with its online-softmax state carried
+  in f32 between launches (chunk bounds on the 256-key groups, so every group computes what the
+  single launch computes: bit-identical, checked at 9k/20k/45k tokens with chunks of 4k/16k/32k).
+  The e4m3 history plane and the V repack plane hold one chunk: prefill reservation at
+  `CTX=262144` 1,554 -> 1,266 MiB per card; 20k / 60k prefill unchanged (3.7 / 13.9 s).
+
+### Fixed
+
+- **nvfp4 prefill attention read unwritten plane rows.** The rows past the history in its last
+  16-token page were never written by the nvfp4 -> e4m3 conversion, and the smaller attention
+  tiers feed them to the PV mma with a zero P' (an e4m3 NaN code times zero is NaN; other
+  leftovers moved the result too): the tail pass of a prompt whose length is not a multiple of
+  16 depended on what the buffer held before, so outputs could differ between processes or
+  plane sizes. They are now written as zero codes with a zero scale.
+
 - **tp=2 DFlash2: batched drafting across sessions** (`SPARKINFER_DFLASH_MULTI`, default on).
   Concurrent sessions draft in one pass: embedding, context projection, every layer's
   projections and convolutions and the head run once over all sessions' rows (up to 32), each

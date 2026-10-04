@@ -246,7 +246,11 @@ bool launch_prefill_attn_int8_paged(
 // windowed prefill can take it with its arena, where the ranks agree. false = it does not fit.
 // kv_fmt picks the plane: fp8 on the e4m3 attention needs none, nvfp4 an e4m3 plane (half the
 // bf16 one); otherwise the bf16 plane.
+// nvfp4 past one attention chunk (SPARKINFER_PREFILL_ATTN_CHUNK): the plane holds a chunk, and
+// n_tokens / n_q_heads (> 0) size the carried softmax state of a pass of that many queries.
 bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size,
-                         int kv_fmt = 3);
+                         int kv_fmt = 3, int n_tokens = 0, int n_q_heads = 0);
+// Keys per chunk of the nvfp4 e4m3 attention (0: whole history per launch).
+int prefill_attn_chunk_keys();
 
 }} // namespace sparkinfer::kernels

@@ -54,6 +54,15 @@ bool launch_prefill_attn_mma_f8(
 // otherwise grown on demand as the history grows and then held. The tier keeps its numerics
 // without the plane (paged loads), so false only means it will be tried again per pass.
 bool prefill_attn_f8_vpack_reserve(int total_tokens, int n_kv_heads, int head_dim);
+// Restricts the next launch_prefill_attn_mma_f8 calls on this thread to keys [lo, hi) (multiples
+// of 256 apart from hi = the end), carrying the online-softmax state through `state` (f32,
+// prefill_attn_chunk_state_floats of it): flags 1 = read it first, 2 = write it instead of the
+// output. (0, INT_MAX, null, 0) restores whole-history launches. Bit-identical to one launch.
+void prefill_attn_f8_set_chunk(int lo, int hi, float* state, int flags);
+// f32 state of a chunked pass of n_tokens queries over n_q_heads heads (head_dim 256).
+inline size_t prefill_attn_chunk_state_floats(int n_tokens, int n_q_heads) {
+    return (size_t)((n_tokens + 15) / 16) * (size_t)n_q_heads * (4096 + 32);
+}
 
 // BF16-KV twin, full causal, hd256 GQA. The int8 entry above cannot serve a bf16 KV pool, and the
 // bf16 pool is what the DSpark harness runs (dspark_tau_check pins int8_kv=false), so without this

@@ -23,6 +23,9 @@
 #include "sparkinfer/kernels/kv_quant.cuh"
 #include "sparkinfer/kernels/scratch_epoch.h"
 #include "sparkinfer/kernels/prefill_attn_mma.h"
+#include <algorithm>
+#include <climits>
+#include <cstddef>
 #include "sparkinfer/kernels/prefill_attn_window.h"
 #include "sparkinfer/kernels/prefill_gdn_chunk.h"
 #include "sparkinfer/kernels/prefill_gemm_skinny.h"
@@ -2248,6 +2251,9 @@ thread_local void*  g_kvdq = nullptr;
 thread_local size_t g_kvdq_bytes = 0;
 thread_local int*   g_kvdq_ident = nullptr;
 thread_local int    g_kvdq_ident_n = 0;
+// The chunked e4m3 attention's online-softmax state (prefill_attn_chunk_state_floats).
+thread_local float* g_kvdq_state = nullptr;
+thread_local size_t g_kvdq_state_n = 0;
 
 template <int FMT>
 __global__ void pf_kv_dequant_kernel(const void* __restrict__ k_pool, const void* __restrict__ v_pool,
@@ -2280,9 +2286,20 @@ __global__ void pf_kv_nvfp4_to_e4m3_kernel(const void* __restrict__ k_pool, cons
                                            const int* __restrict__ block_table,
                                            unsigned char* __restrict__ kd, unsigned char* __restrict__ vd,
                                            __half* __restrict__ kds, __half* __restrict__ vds,
-                                           int n_kv_heads, int block_size) {
+                                           int n_kv_heads, int block_size, int n_valid) {
     constexpr int HD = 256;
     const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x, d = lane * 8;
+    if (t >= n_valid) {
+        // Rows past the history in its last page. The attention masks them, but the smaller
+        // tiers still feed their V bytes to the PV mma with a zero P', and an e4m3 NaN code times
+        // zero is NaN: leftover bytes here made the output depend on what the buffer held before
+        // (different from one process, or one plane size, to the next). Zero codes, zero scale.
+        const size_t drow = (size_t)t * n_kv_heads + h;
+        *reinterpret_cast<uint2*>(kd + drow * HD + d) = make_uint2(0u, 0u);
+        *reinterpret_cast<uint2*>(vd + drow * HD + d) = make_uint2(0u, 0u);
+        if (lane == 0) { kds[drow] = __float2half(0.f); vds[drow] = __float2half(0.f); }
+        return;
+    }
     const int phys = block_table[t / block_size];
     const size_t srow = ((size_t)phys * block_size + t % block_size) * n_kv_heads + h;
     const size_t drow = (size_t)t * n_kv_heads + h;
@@ -2333,13 +2350,44 @@ static bool kvq_f8_path(int head_dim) {
     return major * 10 + minor >= 89;
 }
 
+// Keys per chunk of the nvfp4 e4m3 attention (SPARKINFER_PREFILL_ATTN_CHUNK, default 32768, a
+// multiple of 256; 0 = the whole history in one launch). A longer history is converted and
+// attended a chunk at a time with the softmax state carried in f32 (bit-identical), so the e4m3
+// plane and the V repack plane hold one chunk instead of the whole context.
+static int kvq_chunk_keys() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_CHUNK");
+        const int c = e ? atoi(e) : 32768;
+        return c <= 0 ? 0 : std::max(256, c / 256 * 256);
+    }();
+    return v;
+}
+
+int prefill_attn_chunk_keys() { return kvq_chunk_keys(); }
+
+// The chunk state for n_tokens queries over n_q_heads (null: no memory).
+static float* kvq_state(int n_tokens, int n_q_heads) {
+    const size_t n = prefill_attn_chunk_state_floats(n_tokens, n_q_heads);
+    if (n > g_kvdq_state_n) {
+        if (g_kvdq_state) { cudaFree(g_kvdq_state); g_kvdq_state = nullptr; g_kvdq_state_n = 0; note_prefill_scratch_moved(); }
+        if (cudaMalloc(&g_kvdq_state, n * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError(); g_kvdq_state = nullptr; return nullptr;
+        }
+        g_kvdq_state_n = n;
+    }
+    return g_kvdq_state;
+}
+
 // Grow the thread's dequant plane + identity table to cover `total` tokens of history.
 // e4m3: one byte per element plus the two fp16 scale rows, instead of two bf16 bytes.
+// plane_tokens (e4m3 only, 0 = total): the rows the plane holds, a chunk of a longer history.
 static bool kvq_ensure(int total, int n_kv_heads, int head_dim, int block_size, cudaStream_t stream,
-                       bool e4m3 = false) {
+                       bool e4m3 = false, int plane_tokens = 0) {
     const int n_blk = (total + block_size - 1) / block_size;
-    const size_t plane = (size_t)n_blk * block_size * n_kv_heads * head_dim;   // elements
-    const size_t rows  = (size_t)n_blk * block_size * n_kv_heads;
+    const int p_blk = (plane_tokens > 0 && plane_tokens < total)
+                    ? (plane_tokens + block_size - 1) / block_size : n_blk;
+    const size_t plane = (size_t)(e4m3 ? p_blk : n_blk) * block_size * n_kv_heads * head_dim;
+    const size_t rows  = (size_t)(e4m3 ? p_blk : n_blk) * block_size * n_kv_heads;
     const size_t bytes = e4m3 ? 2 * plane + 2 * rows * sizeof(__half)
                               : 2 * plane * sizeof(__nv_bfloat16);
     if (bytes > g_kvdq_bytes) {
@@ -2359,15 +2407,21 @@ static bool kvq_ensure(int total, int n_kv_heads, int head_dim, int block_size, 
     return true;
 }
 
-bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size, int kv_fmt) {
+bool prefill_kvq_reserve(int total_tokens, int n_kv_heads, int head_dim, int block_size, int kv_fmt,
+                         int n_tokens, int n_q_heads) {
     if (total_tokens <= 0 || n_kv_heads <= 0 || head_dim <= 0 || block_size <= 0) return true;
     // fp8 on the e4m3 attention reads the pool itself: no plane to reserve.
     const bool f8 = kvq_f8_path(head_dim);
     if (f8 && kv_fmt == KVQ_FP8) return true;
+    // nvfp4 on the e4m3 attention past one chunk: a chunk's plane and the carried state.
+    const int chunk = (f8 && kv_fmt == KVQ_NVFP4) ? kvq_chunk_keys() : 0;
+    if (chunk > 0 && total_tokens > chunk && n_tokens > 0 && n_q_heads > 0 &&
+        !kvq_state(n_tokens, n_q_heads))
+        return false;
     // The identity table is filled on the legacy stream; the pass's stream orders after it
     // through the synchronous cudaMalloc/cudaFree semantics of the arena that follows.
     const bool ok = kvq_ensure(total_tokens, n_kv_heads, head_dim, block_size, nullptr,
-                               f8 && kv_fmt == KVQ_NVFP4);
+                               f8 && kv_fmt == KVQ_NVFP4, chunk);
     if (ok) cudaStreamSynchronize(nullptr);
     return ok;
 }
@@ -2390,7 +2444,43 @@ static bool prefill_attn_kvq_dequant(
                                        n_tokens, n_q_heads, n_kv_heads, head_dim, block_size,
                                        max_blocks_per_seq, scale, 0, stream, q_pos0))
             return true;
-        if (kv_fmt == KVQ_NVFP4 && block_size == 16 &&
+        const int chunk = kvq_chunk_keys();
+        if (kv_fmt == KVQ_NVFP4 && block_size == 16 && chunk > 0 && total > chunk &&
+            kvq_ensure(total, n_kv_heads, head_dim, block_size, stream, true, chunk)) {
+            // A chunk at a time: convert its rows, attend them, carry the softmax state on. The
+            // plane holds the chunk's rows from its start, so the pointers handed to the
+            // attention are offset back by that start and it indexes by sequence position.
+            float* st = kvq_state(n_tokens, n_q_heads);
+            if (st) {
+                cudaGetLastError();
+                const size_t cplane = (size_t)chunk * n_kv_heads * head_dim;
+                unsigned char* kd8 = reinterpret_cast<unsigned char*>(g_kvdq);
+                unsigned char* vd8 = kd8 + cplane;
+                __half* kds = reinterpret_cast<__half*>(vd8 + cplane);
+                __half* vds = kds + (size_t)chunk * n_kv_heads;
+                bool ok = true;
+                for (int c0 = 0; ok && c0 < total; c0 += chunk) {
+                    const int c1 = std::min(total, c0 + chunk);
+                    const int c1p = std::min(c0 + chunk, (c1 + block_size - 1) / block_size * block_size);
+                    pf_kv_nvfp4_to_e4m3_kernel<<<dim3(c1p - c0, n_kv_heads), 32, 0, stream>>>(
+                        k_pool, v_pool, reinterpret_cast<const __half*>(k_scale),
+                        reinterpret_cast<const __half*>(v_scale), block_table + c0 / block_size,
+                        kd8, vd8, kds, vds, n_kv_heads, block_size, c1 - c0);
+                    const ptrdiff_t rofs = (ptrdiff_t)c0 * n_kv_heads;
+                    prefill_attn_f8_set_chunk(c0, c1 == total ? INT_MAX : c1, st,
+                                              (c0 > 0 ? 1 : 0) | (c1 < total ? 2 : 0));
+                    ok = cudaPeekAtLastError() == cudaSuccess &&
+                         launch_prefill_attn_mma_f8(q, kd8 - rofs * head_dim, vd8 - rofs * head_dim,
+                                                    kds - rofs, vds - rofs, g_kvdq_ident, attn,
+                                                    n_tokens, n_q_heads, n_kv_heads, head_dim,
+                                                    block_size, n_blk, scale, 0, stream, q_pos0);
+                }
+                prefill_attn_f8_set_chunk(0, INT_MAX, nullptr, 0);
+                if (ok) return true;
+                cudaGetLastError();
+            }
+        }
+        if (kv_fmt == KVQ_NVFP4 && block_size == 16 && (chunk == 0 || total <= chunk) &&
             kvq_ensure(total, n_kv_heads, head_dim, block_size, stream, true)) {
             cudaGetLastError();
             const size_t rows = (size_t)n_blk * block_size * n_kv_heads;
@@ -2398,10 +2488,10 @@ static bool prefill_attn_kvq_dequant(
             unsigned char* vd8 = kd8 + plane;
             __half* kds = reinterpret_cast<__half*>(vd8 + plane);
             __half* vds = kds + rows;
-            pf_kv_nvfp4_to_e4m3_kernel<<<dim3(total, n_kv_heads), 32, 0, stream>>>(
+            pf_kv_nvfp4_to_e4m3_kernel<<<dim3(n_blk * block_size, n_kv_heads), 32, 0, stream>>>(
                 k_pool, v_pool, reinterpret_cast<const __half*>(k_scale),
                 reinterpret_cast<const __half*>(v_scale), block_table, kd8, vd8, kds, vds,
-                n_kv_heads, block_size);
+                n_kv_heads, block_size, total);
             if (cudaPeekAtLastError() == cudaSuccess &&
                 launch_prefill_attn_mma_f8(q, kd8, vd8, kds, vds, g_kvdq_ident, attn, n_tokens,
                                            n_q_heads, n_kv_heads, head_dim, block_size, n_blk,

@@ -49,6 +49,9 @@
 #include <mma.h>
 #include <type_traits>
 
+#include <algorithm>
+#include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
@@ -425,7 +428,12 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
     int block_size, int max_blocks_per_seq, float scale, int win_blocks, int qld, int pld, int q_pos0,
-    const signed char* __restrict__ vT) {
+    const signed char* __restrict__ vT, int kr_lo, int kr_hi, float* __restrict__ cst, int cflags) {
+    // Key chunk (see PfAttnChunk): only keys [kr_lo, kr_hi) are attended in this launch; with
+    // cflags & 1 the online-softmax state (the f32 output accumulators, row max and denominator)
+    // is read from cst first, with cflags & 2 it is written back there instead of normalized
+    // into attn. kr_lo/kr_hi are multiples of the key group, so every group and every per-group
+    // value is what the single launch computes. Defaults (0, INT_MAX, null, 0): one launch.
     // q_pos0 is where this pass's queries START in the sequence. It was implicitly 0 while
     // prefill always ingested [0, N) in a single pass; carrying it lets a long prompt be
     // ingested in windows. Queries and outputs stay addressed by the LOCAL row, while the
@@ -560,7 +568,25 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                     : (F8 ? pf_code<true>(qv[e] / d) : (signed char)(int)roundf(qv[e] / d));
         }
     }
-    if (tid < RQH * BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
+    // Chunk state: per block, the RQH*DPW*8 accumulators of each thread (thread-minor, so the
+    // copy coalesces), then the row max and denominator of each (head, row).
+    constexpr int NOFR = RQH * DPW * 8;
+    float* cst_b = cst ? cst + (size_t)(blockIdx.y * gridDim.x + blockIdx.x) *
+                               ((size_t)NOFR * blockDim.x + 2 * RQH * BM)
+                       : nullptr;
+    if (cst_b && (cflags & 1)) {
+        #pragma unroll
+        for (int h = 0; h < RQH; h++)
+            #pragma unroll
+            for (int dd = 0; dd < DPW; dd++)
+                #pragma unroll
+                for (int e = 0; e < 8; e++)
+                    ofr[h][dd][e] = cst_b[(size_t)((h * DPW + dd) * 8 + e) * blockDim.x + tid];
+        if (tid < RQH * BM) {
+            s_m[tid] = cst_b[(size_t)NOFR * blockDim.x + tid];
+            s_l[tid] = cst_b[(size_t)NOFR * blockDim.x + RQH * BM + tid];
+        }
+    } else if (tid < RQH * BM) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
     __syncthreads();
 
     // ldmatrix.x4 lane->address mapping for the m16n8k32 A operand: the four 8x8 b16 matrices are
@@ -598,8 +624,8 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     // bearing: without it ptxas peels the two-iteration loop straight back into two bodies.
     #pragma unroll 1
     for (int rr_ = (split_sink ? 0 : 1); rr_ < 2; rr_++) {
-        const int lo = (rr_ == 0) ? 0 : (SINK ? (split_sink ? blk_rs : 0) : blk_rs);
-        const int hi = (rr_ == 0) ? BLKSZ : (last_q + 1);
+        const int lo = max(kr_lo, (rr_ == 0) ? 0 : (SINK ? (split_sink ? blk_rs : 0) : blk_rs));
+        const int hi = min(kr_hi, (rr_ == 0) ? BLKSZ : (last_q + 1));
         for (int k0 = lo; k0 < hi; k0 += GN) {
             const int nk   = min(GN, hi - k0);
             const int gblk = (nk + 15) / 16;
@@ -1108,6 +1134,22 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
         }
     }
 
+    if (cst_b && (cflags & 2)) {
+        // Not the last chunk: hand the state on, unnormalized.
+        #pragma unroll
+        for (int h = 0; h < RQH; h++)
+            #pragma unroll
+            for (int dd = 0; dd < DPW; dd++)
+                #pragma unroll
+                for (int e = 0; e < 8; e++)
+                    cst_b[(size_t)((h * DPW + dd) * 8 + e) * blockDim.x + tid] = ofr[h][dd][e];
+        __syncthreads();
+        if (tid < RQH * BM) {
+            cst_b[(size_t)NOFR * blockDim.x + tid] = s_m[tid];
+            cst_b[(size_t)NOFR * blockDim.x + RQH * BM + tid] = s_l[tid];
+        }
+        return;
+    }
     // ---- epilogue: one head at a time through the shared s_o landing zone ----
     #pragma unroll
     for (int h = 0; h < RQH; h++) {
@@ -1168,6 +1210,9 @@ namespace {
 // Per thread = per tensor-parallel rank (each rank prefills on its own thread and device).
 thread_local void*  g_vpack = nullptr;
 thread_local size_t g_vpack_bytes = 0;
+// The key chunk the next launches attend (prefill_attn_f8_set_chunk; this translation unit only).
+struct PfAttnChunk { int lo = 0, hi = INT_MAX; float* st = nullptr; int flags = 0; };
+thread_local PfAttnChunk g_chunk;
 
 bool vpack_reserve(size_t bytes) {
     if (bytes <= g_vpack_bytes) return true;
@@ -1212,14 +1257,19 @@ bool vpack_on() {
 const signed char* vpack_build(const signed char* v_pool, const int* block_table,
                                int n_blk, int n_kv_heads, int head_dim, cudaStream_t stream) {
     if (!vpack_on() || n_blk <= 0 || head_dim <= 0) return nullptr;
-    const size_t bytes = (size_t)n_blk * n_kv_heads * head_dim * 16;
-    if (!vpack_reserve(bytes)) return nullptr;
-    pf_v_pack_kernel<<<dim3(n_blk, n_kv_heads), head_dim, 0, stream>>>(
-        v_pool, block_table, reinterpret_cast<signed char*>(g_vpack), n_kv_heads, head_dim);
+    // A key chunk packs only its own blocks; the plane is then addressed from the chunk's first
+    // block (the returned pointer is offset back by it, so the kernel indexes by logical block).
+    const int lb0 = g_chunk.lo / 16;
+    const int lb1 = std::min(n_blk, g_chunk.hi == INT_MAX ? n_blk : (g_chunk.hi + 15) / 16);
+    if (lb1 <= lb0) return nullptr;
+    const size_t per_blk = (size_t)n_kv_heads * head_dim * 16;
+    if (!vpack_reserve((size_t)(lb1 - lb0) * per_blk)) return nullptr;
+    pf_v_pack_kernel<<<dim3(lb1 - lb0, n_kv_heads), head_dim, 0, stream>>>(
+        v_pool, block_table + lb0, reinterpret_cast<signed char*>(g_vpack), n_kv_heads, head_dim);
     // A rejected launch would leave the plane holding the PREVIOUS pass's V, which is silently
     // wrong attention rather than a slow one -- so a failure here falls back, it does not proceed.
     if (cudaPeekAtLastError() != cudaSuccess) { cudaGetLastError(); return nullptr; }
-    return reinterpret_cast<const signed char*>(g_vpack);
+    return reinterpret_cast<const signed char*>(g_vpack) - (ptrdiff_t)lb0 * (ptrdiff_t)per_blk;
 }
 }  // namespace
 
@@ -1286,7 +1336,8 @@ static bool launch_attn_gqa(const void* q, const signed char* k_pool, const sign
         reinterpret_cast<const __nv_bfloat16*>(q), k_pool, v_pool,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale),
         block_table, reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
-        block_size, max_blocks_per_seq, scale, win_blocks, qld, pld, q_pos0, vT);
+        block_size, max_blocks_per_seq, scale, win_blocks, qld, pld, q_pos0, vT,
+        g_chunk.lo, g_chunk.hi, g_chunk.st, g_chunk.flags);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
     // rather than get — so a pre-existing sticky error is not silently cleared here.
     const bool ok = cudaPeekAtLastError() == cudaSuccess;
@@ -1657,6 +1708,12 @@ bool launch_prefill_attn_mma_f8(
                                         v_scale, block_table, attn, n_tokens, n_q_heads,
                                         n_kv_heads, head_dim, block_size, max_blocks_per_seq,
                                         scale, win_blocks, stream, q_pos0);
+}
+void prefill_attn_f8_set_chunk(int lo, int hi, float* state, int flags) {
+    g_chunk.lo = lo;
+    g_chunk.hi = hi;
+    g_chunk.st = state;
+    g_chunk.flags = flags;
 }
 bool prefill_attn_f8_vpack_reserve(int total_tokens, int n_kv_heads, int head_dim) {
     if (!vpack_on() || total_tokens <= 0 || n_kv_heads <= 0 || head_dim <= 0) return true;

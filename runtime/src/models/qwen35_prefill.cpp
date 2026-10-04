@@ -1146,12 +1146,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                            wide % kvq_ranks == 0 && kvdim % kvq_ranks == 0)
         ? c.n_kv_heads / kvq_ranks : c.n_kv_heads;
     const int kvq_tokens = reserved ? std::max(pos0 + N, c.max_seq) : pos0 + N;
+    // Past one attention chunk the planes hold a chunk, plus the carried softmax state of this
+    // pass's queries (kernels::prefill_attn_chunk_keys).
+    const int kvq_qheads = (kvq_heads != c.n_kv_heads) ? c.n_q_heads / kvq_ranks : c.n_q_heads;
     if (a.ok && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer &&
         !kernels::prefill_kvq_reserve(kvq_tokens, kvq_heads, c.head_dim, s.kv->block_size(),
-                                      (int)s.kv->kv_dtype()))
+                                      (int)s.kv->kv_dtype(), N, kvq_qheads))
         a.ok = false;
-    if (a.ok && reserved && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer)
-        kernels::prefill_attn_f8_vpack_reserve(kvq_tokens, kvq_heads, c.head_dim);
+    if (a.ok && reserved && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer) {
+        const int ck = kernels::prefill_attn_chunk_keys();
+        kernels::prefill_attn_f8_vpack_reserve(ck > 0 && s.kv->kv_dtype() == KV_NVFP4
+                                                   ? std::min(kvq_tokens, ck) : kvq_tokens,
+                                               kvq_heads, c.head_dim);
+    }
     // Headroom: the arena used to take the card down to a few MB, and whatever the pass or the
     // engine allocated next -- a session's state, the draft's capture rows, a CUDA stream --
     // failed on that card alone, mid-pass (at tp=2 the ranks' collectives then no longer pair

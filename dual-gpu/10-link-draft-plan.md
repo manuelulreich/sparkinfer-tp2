@@ -148,6 +148,26 @@ slower at 8): each warp walks K serially and is latency-bound, where the dp4a ke
 lane on its own K block. A tensor-core form needs a pipelined shared-memory weight stage;
 estimated C4 draft ~3.5 ms (step -10%).
 
+**Prefill attention at long context (2026-10-04, work package 4).** nsys, fresh 60k prompt at
+`CTX=262144`, per card: 14.05 s span, attention (pf_attn_mma_gqa_kernel, 256 calls) 4.80 s =
+35%, NVFP4 GEMMs 4.68 s, GDN scan 0.75 s; the nvfp4 -> e4m3 conversion is under 0.13 s.
+Standalone (scratchpad pfa/bench.cu, 4096 queries, 12 q / 2 kv heads): 96 TFLOP/s at a 28k
+history, 87 at 57k, about 40-45% of the block-scaled e4m3 peak; every tier knob is already at
+its best (six-head tier off -32%, narrow K -10%, no V repack -10%, no smem pad -52%). A faster
+kernel needs a new design (the kernel is issue/latency bound per the plan-08 notes), not tuning.
+Reading nvfp4 directly (subagent analysis): K could be converted in registers bit-identically,
+V needs either a gather the kernel cannot afford (+20%) or shared memory it does not have, so
+the memory goal is met by chunking instead: the history is converted and attended 32k keys at
+a time with the online-softmax state (f32 accumulators, row max, denominator) carried through
+global memory between launches; chunk bounds on the 256-key groups keep every group's values
+identical (bench: 0 of 12.6M outputs differ at chunk 4096, all tiers). Plane + V repack 402 ->
+~100 MB at 262k (incl. 51 MB state), reservation 1,554 -> 1,266 MiB, speed unchanged.
+Found on the way: the plane's rows past the history in the last page were never written, and
+the small tiers (here the 43-token tail pass) multiply them by a zero P': a NaN byte there
+changes 26% of the outputs (bench). Outputs of a prompt whose length is not a multiple of 16
+depended on leftover buffer contents -- a likely source of the "first request computes
+differently" note. Fixed by writing zero rows.
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |
