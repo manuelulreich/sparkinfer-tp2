@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <ctime>
 #include "model_engine.hpp"
+#include "sparkinfer/stream_reserve.h"
 #include "tp_plan.hpp"      // the tensor-parallel plan (g_tp/g_devices) model_engine.cpp reads
 #include "video_input.hpp"   // video_decoder_available() for /v1/models input_modalities
 #include "sparkinfer/kernels/deterministic.h"
@@ -1157,6 +1158,14 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    {
+        std::string serr;
+        if (!engine.reserve_stream_slots(serr)) {
+            fprintf(stderr, "[sparkinfer-server] %s -- lower SPARKINFER_KV_POOL_TOKENS (or --ctx) or "
+                            "SPARKINFER_STREAM_SLOTS\n", serr.c_str());
+            return 1;
+        }
+    }
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
@@ -1408,6 +1417,26 @@ int main(int argc, char** argv) {
                     "degradation invariant, all three fall back to the same recompute path)\n"
                     "# TYPE sparkinfer_lmcache_lookup_misses_total counter\n"
                  << "sparkinfer_lmcache_lookup_misses_total " << lmc.lookup_misses << "\n";
+        }
+        {
+            int ndev = 0;
+            cudaGetDeviceCount(&ndev);
+            bool head = false;
+            for (int d = 0; d < ndev; d++) {
+                const auto sr = sparkinfer::stream_reserve_stats(d);
+                if (!sr.bytes) continue;
+                if (!head) {
+                    head = true;
+                    body << "# HELP sparkinfer_stream_reserve_bytes Device memory reserved at load for per-stream buffers (SPARKINFER_STREAM_SLOTS)\n"
+                            "# TYPE sparkinfer_stream_reserve_bytes gauge\n"
+                            "# HELP sparkinfer_stream_reserve_used_bytes Part of it in use / most ever in use / per-stream allocations it could not hold\n"
+                            "# TYPE sparkinfer_stream_reserve_used_bytes gauge\n";
+                }
+                body << "sparkinfer_stream_reserve_bytes{device=\"" << d << "\"} " << sr.bytes << "\n"
+                     << "sparkinfer_stream_reserve_used_bytes{device=\"" << d << "\"} " << sr.used << "\n"
+                     << "sparkinfer_stream_reserve_high_water_bytes{device=\"" << d << "\"} " << sr.high_water << "\n"
+                     << "sparkinfer_stream_reserve_fallbacks_total{device=\"" << d << "\"} " << sr.fallbacks << "\n";
+            }
         }
         const auto pc = engine.prefix_cache_stats();
         if (pc.enabled) {

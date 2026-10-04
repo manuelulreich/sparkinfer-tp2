@@ -168,6 +168,19 @@ changes 26% of the outputs (bench). Outputs of a prompt whose length is not a mu
 depended on leftover buffer contents -- a likely source of the "first request computes
 differently" note. Fixed by writing zero rows.
 
+**Stream slots (2026-10-04, work package 5).** Per-stream allocations (session state in
+open_session, the drafter's kv_state_create, dflash_cap_alloc) go through a per-card first-fit
+sub-allocator over memory taken at load (`stream_reserve.h`, sr_malloc / sr_free, cudaMalloc
+fallback). Measured high water: exactly 98.6 MiB per stream and card (1 stream 103.4 MB, 4
+streams 413.4 MB); outside it a stream adds 52-90 MiB of shared scratch. Default 4 slots x 100
+MiB + 192 MiB headroom. Resizing the KV pool after load to fill the rest automatically was
+considered and dropped: the per-sequence block-table stride equals the pool size, graphs and
+lazily sized buffers capture both, and a VMM-backed pool would waste up to 2 MB per slice and
+pool in mapping granules; the load log prints the pool tokens the remaining memory would hold
+instead. Capacity at `CTX=262144` now: pool 425,984 tokens loads with 4 slots and 500 MiB spare
+(~460k max); 4 x 100k concurrent prompts ran with no allocation outside the reserve (earlier
+today 4 x 89k at a 360k pool lost the drafter).
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |

@@ -1,4 +1,5 @@
 #include "model_engine.hpp"
+#include "sparkinfer/stream_reserve.h"
 #include "sparkinfer/kernels/deterministic.h"
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/device_health.h"
@@ -1338,6 +1339,73 @@ int ModelEngine::free_kv_blocks() const {
 int ModelEngine::max_queue_depth() const {
     std::lock_guard<std::mutex> lock(mu_);
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
+}
+
+bool ModelEngine::reserve_stream_slots(std::string& err) {
+    // Stream slots (sparkinfer/stream_reserve.h): the per-stream buffers of this many concurrent
+    // requests -- recurrent state and sampling arrays, the drafter's per-session KV and capture
+    // rows -- come out of memory taken here, so they cannot be crowded out later. Default 4 at
+    // --tp 2 (0 elsewhere); fewer slots leave that memory to a larger KV pool. A stream past the
+    // reserved ones still allocates from what is free, as before.
+    if (!impl_->model) return true;
+    const int tp = 1 + (int)impl_->tp_models.size();
+    auto env_ll = [](const char* n, long long d) { const char* e = getenv(n); return e ? atoll(e) : d; };
+    const int slots = (int)std::max(0LL, env_ll("SPARKINFER_STREAM_SLOTS", tp > 1 ? 4 : 0));
+    if (slots == 0) return true;
+    // Per card, one stream at --tp 2 on Qwen3.8-27B with DFlash2: 98.6 MiB measured (recurrent
+    // and conv state, sampling arrays, the drafter's session KV and capture rows); the rest a
+    // stream touches (decode/verify scratch, ~50-90 MiB at 1-4 streams) is shared and comes out
+    // of the headroom.
+    const size_t slot = (size_t)std::max(1LL, env_ll("SPARKINFER_STREAM_SLOT_MB", 100)) << 20;
+    const size_t headroom = (size_t)std::max(0LL, env_ll("SPARKINFER_STREAM_HEADROOM_MB", 192)) << 20;
+    std::vector<int> devs = {impl_->model->tp_rank_view().device};
+    for (auto& m : impl_->tp_models) devs.push_back(m->tp_rank_view().device);
+    int cur = 0;
+    cudaGetDevice(&cur);
+    // KV pool bytes per token on a card, to say what the memory left over would buy.
+    double kv_tok = 0.0;
+    if (impl_->kv && impl_->kv->num_total_blocks() > 0) {
+        const auto& kv = *impl_->kv;
+        const double per_blk = (double)kv.kv_slots() *
+            (2.0 * kv.kv_bytes(kv.block_elems()) +
+             (kv.quant_kv() ? 2.0 * 2.0 * kv.scale_layer_stride_elems() / kv.num_total_blocks() : 0.0));
+        kv_tok = per_blk / kv.block_size();
+    }
+    std::string line;
+    char buf[160];
+    for (int d : devs) {
+        if (!sparkinfer::stream_reserve_init(d, (size_t)slots * slot)) {
+            cudaSetDevice(cur);
+            snprintf(buf, sizeof(buf), "%d stream slots (%zu MiB) do not fit on device %d", slots,
+                     ((size_t)slots * slot) >> 20, d);
+            err = buf;
+            return false;
+        }
+        size_t fb = 0, tb = 0;
+        cudaSetDevice(d);
+        cudaMemGetInfo(&fb, &tb);
+        if (fb < headroom) {
+            cudaSetDevice(cur);
+            snprintf(buf, sizeof(buf), "%d stream slots leave device %d %zu MiB free, under the "
+                     "%zu MiB headroom", slots, d, fb >> 20, headroom >> 20);
+            err = buf;
+            return false;
+        }
+        const size_t spare = fb - headroom;
+        snprintf(buf, sizeof(buf), " dev%d %zu MiB free (%zu MiB past the headroom%s", d, fb >> 20,
+                 spare >> 20, kv_tok > 0 ? ", ~" : ")");
+        line += buf;
+        if (kv_tok > 0) {
+            snprintf(buf, sizeof(buf), "%zu more KV pool tokens)", (size_t)(spare / kv_tok) / 16 * 16);
+            line += buf;
+        }
+    }
+    cudaSetDevice(cur);
+    fprintf(stderr, "[sparkinfer-server] stream slots: %d reserved, %zu MiB per card "
+                    "(SPARKINFER_STREAM_SLOTS / _SLOT_MB);%s\n",
+            slots, ((size_t)slots * slot) >> 20, line.c_str());
+    mem_mark("stream slots reserved");
+    return true;
 }
 
 void ModelEngine::release_unused_head() {

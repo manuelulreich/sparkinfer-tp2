@@ -282,6 +282,8 @@ public:
     // (tp=2) With SPARKINFER_PREFILL_RESERVE=1: one warm-up prefill of two windows, so the
     // prefill scratch is taken at load and every later pass reuses it. false = it did not fit.
     bool reserve_prefill(std::string& err);
+    // Takes SPARKINFER_STREAM_SLOTS streams' per-stream memory now (default 4 at --tp 2).
+    bool reserve_stream_slots(std::string& err);
     bool speculative() const;
     struct SpeculativeStats {
         bool enabled = false;

@@ -5,6 +5,7 @@
 #include <atomic>
 #include "sparkinfer/models/dflash_kernels.h"
 #include "sparkinfer/models/qwen35.h"   // tp_allreduce_bf16_on, tp_run_with_peer (split draft)
+#include "sparkinfer/stream_reserve.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
@@ -1717,8 +1718,8 @@ DFlashDraftModel::~DFlashDraftModel() {
     p_->tp_peer = nullptr;   // the peer is its own object, destroyed on its own
     if (!p_->kv_states.empty()) p_->select(-1);
     for (auto& st : p_->kv_states) {
-        for (bf16* b : st.k) cudaFree(b);
-        for (bf16* b : st.v) cudaFree(b);
+        for (bf16* b : st.k) sr_free(b);
+        for (bf16* b : st.v) sr_free(b);
     }
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
@@ -1999,15 +2000,16 @@ int DFlashDraftModel::kv_state_create_local(int capacity) {
     for (int L = 0; L < s.cfg.n_layers && ok; L++) {
         void* k = nullptr;
         void* v = nullptr;
-        ok = cudaMalloc(&k, (size_t)capacity * kvdim * sizeof(bf16)) == cudaSuccess;
+        // Per-session: out of the stream reserve while it has room (stream_reserve.h).
+        ok = sr_malloc(&k, (size_t)capacity * kvdim * sizeof(bf16)) == cudaSuccess;
         if (ok) st.k.push_back((bf16*)k);
-        ok = ok && cudaMalloc(&v, (size_t)capacity * kvdim * sizeof(bf16)) == cudaSuccess;
+        ok = ok && sr_malloc(&v, (size_t)capacity * kvdim * sizeof(bf16)) == cudaSuccess;
         if (ok) st.v.push_back((bf16*)v);
     }
     if (!ok) {
         cudaGetLastError();
-        for (bf16* b : st.k) cudaFree(b);
-        for (bf16* b : st.v) cudaFree(b);
+        for (bf16* b : st.k) sr_free(b);
+        for (bf16* b : st.v) sr_free(b);
         return -1;
     }
     st.live = true;
@@ -2039,8 +2041,8 @@ void DFlashDraftModel::kv_state_free_local(int id) {
     cudaStreamSynchronize(s.stream);
     if (s.tp_stream) cudaStreamSynchronize(s.tp_stream);
     Impl::KvState& st = s.kv_states[id];
-    for (bf16* b : st.k) cudaFree(b);
-    for (bf16* b : st.v) cudaFree(b);
+    for (bf16* b : st.k) sr_free(b);
+    for (bf16* b : st.v) sr_free(b);
     st = Impl::KvState{};
 }
 

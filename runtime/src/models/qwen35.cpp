@@ -20,6 +20,7 @@
 
 #include "sparkinfer/pinned_pool.h"
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/stream_reserve.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
 #include <condition_variable>
@@ -1549,8 +1550,8 @@ Qwen35Model::~Qwen35Model() {
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
-        if (kv.second.lin_state) cudaFree(kv.second.lin_state);
-        if (kv.second.lin_conv_state) cudaFree(kv.second.lin_conv_state);
+        sr_free(kv.second.lin_state);
+        sr_free(kv.second.lin_conv_state);
     }
     if (p_->packed_host_states) cudaFreeHost(p_->packed_host_states);
     if (p_->packed_host_convs) cudaFreeHost(p_->packed_host_convs);
@@ -6960,8 +6961,18 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // lifecycle via ContinuousBatchEngine::finish_job), so a one-time zero here is sufficient
         // -- unlike session 0, which is reused across many DIFFERENT requests and needs an explicit
         // per-request reset (see reset_penalty_counts()).
-        buf.penalty_counts = s.alloc<int>(s.cfg.vocab);
-        buf.logit_bias = s.alloc<float>(s.cfg.vocab);
+        // Per-stream buffers come out of the stream reserve (stream_reserve.h) while it has room.
+        auto salloc = [](size_t bytes) -> void* {
+            void* p = nullptr;
+            if (sr_malloc(&p, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                fprintf(stderr, "[qwen35] session state: out of memory (%zu bytes)\n", bytes);
+                return nullptr;
+            }
+            return p;
+        };
+        buf.penalty_counts = static_cast<int*>(salloc((size_t)s.cfg.vocab * sizeof(int)));
+        buf.logit_bias = static_cast<float*>(salloc((size_t)s.cfg.vocab * sizeof(float)));
         alloc_ok = buf.penalty_counts != nullptr && buf.logit_bias != nullptr;
         // Per-session recurrent state, and it is not small: n_layers * v_heads * head_dim^2 floats
         // is 109 MB on Muse Glimmer's 52 layers. That model declares `hybrid` but has no GDN layer
@@ -6970,17 +6981,17 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // few hundred MB of headroom. Ask whether the stack has the layers, not whether it has the
         // flag.
         if (needs_linear_state(s.cfg)) {
-            buf.lin_state = s.alloc<float>((size_t)gdn_state_slots(s.cfg) * gdn_v_local() *
-                                           s.cfg.linear_head_dim * s.cfg.linear_head_dim);
-            buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
-                                               (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim);
+            buf.lin_state = static_cast<float*>(salloc((size_t)gdn_state_slots(s.cfg) * gdn_v_local() *
+                                           s.cfg.linear_head_dim * s.cfg.linear_head_dim * sizeof(float)));
+            buf.lin_conv_state = static_cast<bf16*>(salloc((size_t)s.cfg.n_layers *
+                                               (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim * sizeof(bf16)));
             alloc_ok = alloc_ok && buf.lin_state && buf.lin_conv_state;
         }
         if (alloc_ok) break;
-        if (buf.penalty_counts) cudaFree(buf.penalty_counts);
-        if (buf.logit_bias) cudaFree(buf.logit_bias);
-        if (buf.lin_state) cudaFree(buf.lin_state);
-        if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
+        sr_free(buf.penalty_counts);
+        sr_free(buf.logit_bias);
+        sr_free(buf.lin_state);
+        sr_free(buf.lin_conv_state);
         buf = SessionBuffers{};
         // The decode shadow is a cache of weights decode can also read folded: a request that
         // cannot get its state takes the shadow's VRAM, once, rather than failing.
@@ -6994,10 +7005,10 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // now" (retry later) apart from "device is out of memory" (permanent until restart).
         if (alloc_failed) *alloc_failed = true;
         s.kv->free(seq_id);
-        if (buf.penalty_counts) cudaFree(buf.penalty_counts);
-        if (buf.logit_bias) cudaFree(buf.logit_bias);
-        if (buf.lin_state) cudaFree(buf.lin_state);
-        if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
+        sr_free(buf.penalty_counts);
+        sr_free(buf.logit_bias);
+        sr_free(buf.lin_state);
+        sr_free(buf.lin_conv_state);
         return 0;
     }
     // Explicit zero, not relying on alloc<T>'s (plain cudaMalloc) zeroing guarantee -- unlike
@@ -7207,15 +7218,15 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
         // the free was always skipped. Every hybrid-model (Muse Glimmer, Qwen3.6) request via the
         // server leaked its full lin_state/lin_conv_state allocation, permanently, confirmed live
         // as a fixed ~108 MiB/request leak independent of token count (#779).
-        if (it->second.lin_state) cudaFree(it->second.lin_state);
-        if (it->second.lin_conv_state) cudaFree(it->second.lin_conv_state);
+        sr_free(it->second.lin_state);
+        sr_free(it->second.lin_conv_state);
         // Unconditional, every model -- mirrors the lin_state/lin_conv_state free above exactly.
         // The seq_id == 0 guard at the top of this function already protects
         // penalty_counts_default from ever being freed here, same aliasing-safety story as #779.
-        if (it->second.penalty_counts) cudaFree(it->second.penalty_counts);
+        sr_free(it->second.penalty_counts);
         // Unconditional, every model -- mirrors penalty_counts's free exactly, same aliasing-safety
         // story (the seq_id == 0 guard above already protects logit_bias_default).
-        if (it->second.logit_bias) cudaFree(it->second.logit_bias);
+        sr_free(it->second.logit_bias);
         s.sessions.erase(it);
     }
     if (s.active_seq_id == seq_id) activate_session(0);
@@ -7743,14 +7754,14 @@ bool Qwen35Model::dflash_capture_split() const {
 void* Qwen35Model::dflash_cap_alloc(size_t bytes) {
     Impl& s = *p_;
     void* p = nullptr;
-    if (cudaMalloc(&p, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    if (sr_malloc(&p, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
     if (!dflash_capture_split()) return p;
     Qwen35Model* peer = s.tp_peers[1];
     void* q = nullptr;
     tp_run_with_peer(peer->tp_rank_view().device, [&] {
-        if (cudaMalloc(&q, bytes) != cudaSuccess) { cudaGetLastError(); q = nullptr; }
+        if (sr_malloc(&q, bytes) != cudaSuccess) { cudaGetLastError(); q = nullptr; }
     }, nullptr);
-    if (!q) { cudaFree(p); return nullptr; }
+    if (!q) { sr_free(p); return nullptr; }
     std::lock_guard<std::mutex> lk(s.cap_alias_mu);
     s.cap_alias.push_back({static_cast<const char*>(p), bytes, static_cast<char*>(q)});
     return p;
@@ -7770,8 +7781,8 @@ void Qwen35Model::dflash_cap_free(void* p) {
             }
     }
     if (q && s.tp_peers.size() == 2 && s.tp_peers[1])
-        tp_run_with_peer(s.tp_peers[1]->tp_rank_view().device, [&] { cudaFree(q); }, nullptr);
-    cudaFree(p);
+        tp_run_with_peer(s.tp_peers[1]->tp_rank_view().device, [&] { sr_free(q); }, nullptr);
+    sr_free(p);
 }
 
 const void* Qwen35Model::dflash_cap_peer(const void* p) const {

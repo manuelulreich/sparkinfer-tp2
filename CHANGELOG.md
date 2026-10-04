@@ -7,6 +7,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **Stream slots reserved at load** (`SPARKINFER_STREAM_SLOTS`, default 4 at `--tp 2`;
+  `SPARKINFER_STREAM_SLOT_MB` 100, `SPARKINFER_STREAM_HEADROOM_MB` 192). The per-stream buffers of
+  that many concurrent requests (recurrent state, sampling arrays, the drafter's session KV and
+  capture rows: 98.6 MiB per stream and card) come out of a reserve taken after the prefill
+  scratch, so a large KV pool can no longer starve later streams (they used to lose the drafter);
+  a pool that leaves no room for the slots stops the load. The log says how many more KV pool
+  tokens the remaining memory holds, and fewer slots leave more for the pool. At `CTX=262144`:
+  `SPARKINFER_KV_POOL_TOKENS=425984` loads with 4 slots and 500 MiB free past them (~35k more
+  tokens possible); 4 x 100k-token prompts ran concurrently with no allocation outside the reserve.
+
 - **tp=2 nvfp4 prefill attention in key chunks** (`SPARKINFER_PREFILL_ATTN_CHUNK`, default 32768).
   The e4m3 attention runs the history a chunk at a time with its online-softmax state carried
   in f32 between launches (chunk bounds on the 256-key groups, so every group computes what the
