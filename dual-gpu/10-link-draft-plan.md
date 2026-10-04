@@ -28,6 +28,20 @@ the wide prefill attention tier for small resumed passes; the pinned snapshot po
 projections in NVFP4. Measured and dropped: the decode 8-bit wire, more KV splits, a restricted
 draft head, 4-row verify attention groups.
 
+Concurrency baseline (2026-10-04, after plan 10; `startup.sh`, HyperQwen's `prompts_real.jsonl`,
+512 tokens, 8 requests a level, `bench/scripts/simple_bench.py --cohort`; sum of per-request decode
+rates in tok/s):
+
+| | C1 | C2 | C4 |
+|---|---:|---:|---:|
+| now, sampled (`--sampled`, opencode's settings) | 132.1 | 183.1 | 307.9 |
+| now, greedy | 141.5 | 238.1 | 331.8 |
+| HyperQwen, sampled | 110 | 191 | 306 |
+| plan 07 (DSpark, int8 KV), sampled | 95.8 | 174 | 265 |
+
+Per request C2 -> C4 drops 92 -> 77 tok/s (sampled): DFlash2 drafts one session after another, so
+batched drafting is the C4 lever; sampled C2 trails greedy C2 (183 vs 238) on acceptance.
+
 Left, each worth a few percent at most and each a kernel or scheduling project: the prefill F8
 attention over a long history (~5x off its compute bound for small resumed passes); the verify
 attention at long context (latency-bound key groups, 4.8 ms a step at 60k); the prefill
