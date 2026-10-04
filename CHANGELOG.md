@@ -205,6 +205,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **tp=2 verify: the out / o / down all-reduces overlap their GEMM.** Each H-wide projection of
+  the tensor-core verify whose output is all-reduced runs in two column halves; the first half's
+  all-reduce (flag kernel, on a high-priority side stream) crosses the link while the second half
+  is computed, and the post-mixer / post-FFN add + RMSNorm reads the two halves in place. Verify
+  at 20k 24.8 -> 24.1 ms, at 60k 27.5 -> 26.8 ms (~+2.3 % decode). The half-width GEMM splits K
+  differently, so the sums round differently from the single GEMM -- as the tensor-core verify
+  already does against plain decode; deterministic mode, which keeps the verify exact, does not
+  take this path. `SPARKINFER_TP_VERIFY_AR_SPLIT=0` restores the single GEMM.
+
 - **tp=2 prefill: less of the link exposed.** Three changes, each bit-identical on the exact
   link (byte-identical greedy output on 20k and 60k prompts):
   - the layer's last FFN-down chunk is posted asynchronously like the others and joined after

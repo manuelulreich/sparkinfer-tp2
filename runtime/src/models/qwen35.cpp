@@ -3957,6 +3957,42 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, fp4, sf, out, mp, N, K,
                                                   s.vr_tc_ws, st, alpha);
     };
+    // (plan 10, D2) An H-wide projection whose output is all-reduced, in two column halves: each
+    // half's all-reduce runs on the side stream (flag kernel) as soon as the half is out, so the
+    // first crosses the link while the second is computed. The halves land as [mp][H/2] twice in
+    // vr_ar (add_rmsnorm2_split reads them); joined before returning. The A operand must already
+    // be quantized (vr_tc_a, mp rows, K). Not bit-identical to the single GEMM (the half-width
+    // GEMM splits K differently), which the tensor-core verify is not against plain decode
+    // either; deterministic mode never takes the tensor-core verify. Both ranks decide alike.
+    // SPARKINFER_TP_VERIFY_AR_SPLIT=0: one GEMM, one synchronous all-reduce.
+    static const bool ar_split_env = [] {
+        const char* e = getenv("SPARKINFER_TP_VERIFY_AR_SPLIT");
+        return !(e && e[0] == '0');
+    }();
+    const int hh = H / 2;
+    auto split_gemm_ar = [&](const void* fp4, const void* sf, float alpha, int K) -> bool {
+        if (!ar_split_env || hh % 128 || !kernels::prefill_nvfp4_supported(mp, hh, K)) return false;
+        const char* wb = static_cast<const char*>(fp4);
+        const char* sb = static_cast<const char*>(sf);
+        bf16* lo = s.vr_ar;
+        bf16* hi = s.vr_ar + (size_t)mp * hh;
+        if (!kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, wb, sb, lo, mp, hh, K,
+                                                s.vr_tc_ws, st, alpha))
+            return false;
+        tp_prefill_allreduce_bf16_async(lo, (size_t)n * hh);
+        if (!kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, wb + (size_t)hh * K / 2,
+                                                sb + kernels::prefill_nvfp4_scale_bytes_b(hh, K),
+                                                hi, mp, hh, K, s.vr_tc_ws, st, alpha))
+            cu(cudaErrorInvalidValue, "tp verify split projection");
+        tp_prefill_allreduce_bf16_async(hi, (size_t)n * hh);
+        tp_prefill_allreduce_join();
+        return true;
+    };
+    auto proj_tc_split = [&](const void* fp4, const void* sf, float alpha, const bf16* in, int K) {
+        return tc && ar_split_env && fp4 && sf &&
+               kernels::launch_prefill_nvfp4_quant_a(in, s.vr_tc_a, s.vr_tc_as, mp, K, st) &&
+               split_gemm_ar(fp4, sf, alpha, K);
+    };
 
     // Entry: ids / positions / seq_lens, the GDN snapshot, and the embedding (vocab-window gather
     // + all-reduce == the decode entry's owner-row exchange).
@@ -4309,6 +4345,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
+        bool mix_split = false;   // the mixer projection went out as two split all-reduces (D2)
         if (is_linear_layer(c, L)) {
             bf16* rec = s.vr_rec_qkv + (size_t)L * R * wq;
             if (!proj_tc(w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf, w.gdn_qkv_fp4_alpha, s.vr_xn, H, rec, wq))
@@ -4346,7 +4383,9 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
             }
             kernels::launch_qwen36_gated_norm(s.vr_gdn, s.vr_z, w.ssm_norm, s.vr_ln, n * vloc, lhd,
                                               c.rms_eps, st);
-            if (!proj_tc(w.gdn_out_fp4, w.gdn_out_fp4_sf, w.gdn_out_fp4_alpha, s.vr_ln, Kw, s.vr_ar, H))
+            mix_split = proj_tc_split(w.gdn_out_fp4, w.gdn_out_fp4_sf, w.gdn_out_fp4_alpha, s.vr_ln, Kw);
+            if (!mix_split &&
+                !proj_tc(w.gdn_out_fp4, w.gdn_out_fp4_sf, w.gdn_out_fp4_alpha, s.vr_ln, Kw, s.vr_ar, H))
                 proj_rows(w.ssm_out, w.ssm_out_type, s.vr_ln, Kw, s.vr_ar, H);
         } else {
             if (w.q_has_gate) {
@@ -4436,27 +4475,38 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
             }
             if (w.q_has_gate)
                 kernels::launch_qwen36_mul_sigmoid(s.vr_attn, s.vr_g, n * qdim_l, st);
-            if (!proj_tc(w.wo_fp4, w.wo_fp4_sf, w.wo_fp4_alpha, s.vr_attn, qdim_l, s.vr_ar, H))
+            mix_split = proj_tc_split(w.wo_fp4, w.wo_fp4_sf, w.wo_fp4_alpha, s.vr_attn, qdim_l);
+            if (!mix_split &&
+                !proj_tc(w.wo_fp4, w.wo_fp4_sf, w.wo_fp4_alpha, s.vr_attn, qdim_l, s.vr_ar, H))
                 proj_rows(w.wo, w.wo_type, s.vr_attn, qdim_l, s.vr_ar, H);
         }
         // AR-A + tail1, as forward_token_tp.
-        tp_prefill_allreduce_bf16(s.vr_ar, (size_t)n * H);
-        kernels::launch_add_rmsnorm2(s.vr_x, s.vr_ar, w.post_attn_norm, s.vr_h, s.vr_hn, n, H,
-                                     c.rms_eps, st);
+        if (mix_split) {
+            kernels::launch_add_rmsnorm2_split(s.vr_x, s.vr_ar, s.vr_ar + (size_t)mp * hh, hh,
+                                               w.post_attn_norm, s.vr_h, s.vr_hn, n, H, c.rms_eps, st);
+        } else {
+            tp_prefill_allreduce_bf16(s.vr_ar, (size_t)n * H);
+            kernels::launch_add_rmsnorm2(s.vr_x, s.vr_ar, w.post_attn_norm, s.vr_h, s.vr_hn, n, H,
+                                         c.rms_eps, st);
+        }
         // FFN (dense NVFP4, the decode arm with M = n), AR-B, tail2.
         bf16* fg = s.vr_ffn;
         bf16* fu = s.vr_ffn + (size_t)R * fl;
         bf16* fh = s.vr_ffn + (size_t)2 * R * fl;
-        const bool ffn_tc = tc && w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf &&
+        const bool ffn_tc_front = tc && w.gate_fp4 && w.gate_fp4_sf && w.up_fp4 && w.up_fp4_sf &&
             w.down_fp4 && w.down_fp4_sf &&
             kernels::launch_prefill_nvfp4_quant_a(s.vr_hn, s.vr_tc_a, s.vr_tc_as, mp, H, st) &&
             kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, w.gate_fp4, w.gate_fp4_sf,
                                                fg, mp, fl, H, s.vr_tc_ws, st, w.gate_fp4_alpha) &&
             kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, w.up_fp4, w.up_fp4_sf,
                                                fu, mp, fl, H, s.vr_tc_ws, st, w.up_fp4_alpha) &&
-            kernels::launch_prefill_nvfp4_swiglu_quant_a(fg, fu, s.vr_tc_a, s.vr_tc_as, mp, fl, st) &&
-            kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, w.down_fp4, w.down_fp4_sf,
-                                               s.vr_ar, mp, H, fl, s.vr_tc_ws, st, w.down_fp4_alpha);
+            kernels::launch_prefill_nvfp4_swiglu_quant_a(fg, fu, s.vr_tc_a, s.vr_tc_as, mp, fl, st);
+        const bool down_split = ffn_tc_front && split_gemm_ar(w.down_fp4, w.down_fp4_sf,
+                                                             w.down_fp4_alpha, fl);
+        const bool ffn_tc = ffn_tc_front &&
+            (down_split ||
+             kernels::launch_prefill_nvfp4_gemm(s.vr_tc_a, s.vr_tc_as, w.down_fp4, w.down_fp4_sf,
+                                                s.vr_ar, mp, H, fl, s.vr_tc_ws, st, w.down_fp4_alpha));
         if (ffn_tc) {
         } else if (kernels::qwen38_nvfp4_dp4a()) {
             kernels::launch_gemv_nvfp4_quant_x(s.vr_hn, s.vr_nq, s.vr_ns, n, H, st);
@@ -4483,9 +4533,14 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                 kernels::launch_gemv_nvfp4(hr, w.down_nv, s.vr_ar + (size_t)r * H, H, fl, st);
             }
         }
-        tp_prefill_allreduce_bf16(s.vr_ar, (size_t)n * H);
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        kernels::launch_add_rmsnorm2(s.vr_h, s.vr_ar, nextnorm, s.vr_x, s.vr_xn, n, H, c.rms_eps, st);
+        if (down_split) {
+            kernels::launch_add_rmsnorm2_split(s.vr_h, s.vr_ar, s.vr_ar + (size_t)mp * hh, hh, nextnorm,
+                                               s.vr_x, s.vr_xn, n, H, c.rms_eps, st);
+        } else {
+            tp_prefill_allreduce_bf16(s.vr_ar, (size_t)n * H);
+            kernels::launch_add_rmsnorm2(s.vr_h, s.vr_ar, nextnorm, s.vr_x, s.vr_xn, n, H, c.rms_eps, st);
+        }
         // DSpark capture of this layer's output rows: on the leader, or on both ranks with a split
         // capture (each its own columns, into its own twin of the leader's destination).
         if (cap_here && seg && seg_capture)
@@ -5428,8 +5483,12 @@ bool tp_prefill_ar_side_prepare() {
     // Created by the rank's own thread, on its own (current) device; all or nothing.
     cudaStream_t side = nullptr, red = nullptr;
     cudaEvent_t ready = nullptr, done[TpArSide::kRing] = {};
-    bool ok = cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking) == cudaSuccess &&
-              cudaStreamCreateWithFlags(&red, cudaStreamNonBlocking) == cudaSuccess &&
+    // Highest priority: a verify's row all-reduce (one flag-kernel block) is posted here to run
+    // beside the GEMM producing the rest of its layer, and must get an SM as soon as one frees.
+    int prio_lo = 0, prio_hi = 0;
+    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    bool ok = cudaStreamCreateWithPriority(&side, cudaStreamNonBlocking, prio_hi) == cudaSuccess &&
+              cudaStreamCreateWithPriority(&red, cudaStreamNonBlocking, prio_hi) == cudaSuccess &&
               cudaEventCreateWithFlags(&ready, cudaEventDisableTiming) == cudaSuccess;
     for (cudaEvent_t& e : done)
         ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
@@ -5457,7 +5516,9 @@ int tp_prefill_allreduce_bf16_async(void* in_out, size_t elems) {
         cu(cudaErrorMemoryAllocation, "tp ar side stream");
     cu(cudaEventRecord(sd.ready, g_tp_prefill_stream[r]), "tp ar ready record");
     cu(cudaStreamWaitEvent(sd.side, sd.ready, 0), "tp ar side wait");
-    const bool pipe = tp_ar_pipe_on() && sd.red;
+    // Small ops (a verify's rows) take the flag all-reduce on the side stream: the copy-engine
+    // pipeline is for prefill chunks of megabytes.
+    const bool pipe = tp_ar_pipe_on() && sd.red && elems * sizeof(bf16) > detail::kFlagMaxBytes;
     // Pipelined: this op lands in scratch half (seq & 1), which op seq-2 read in its reduce on
     // `red`; the copy may not overwrite it before that reduce has run.
     if (pipe && sd.pending && sd.seq >= 2)

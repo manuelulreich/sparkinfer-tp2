@@ -18,6 +18,12 @@ void launch_add_rmsnorm(const void* x_bf16, const void* residual_bf16,
 void launch_add_rmsnorm2(const void* x_bf16, const void* residual_bf16, const void* weight_bf16,
                          void* out_sum_bf16, void* out_norm_bf16,
                          int rows, int cols, float eps, cudaStream_t stream = nullptr);
+// launch_add_rmsnorm2 with the residual split by columns: [rows][half] at residual_lo, then
+// [rows][half] at residual_hi (half % 8 == 0, cols == 2 * half). Same values.
+void launch_add_rmsnorm2_split(const void* x_bf16, const void* residual_lo, const void* residual_hi,
+                               int half, const void* weight_bf16, void* out_sum_bf16,
+                               void* out_norm_bf16, int rows, int cols, float eps,
+                               cudaStream_t stream = nullptr);
 
 // add_rmsnorm2 that additionally emits a Q8_1 quantization of out_norm (si_block_q8_1),
 // so the downstream int8 GEMV skips its own quantize node. rows==1, cols % 256 == 0.

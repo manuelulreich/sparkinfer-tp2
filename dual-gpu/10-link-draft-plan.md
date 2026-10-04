@@ -97,6 +97,14 @@ K = 65536 draft -0.38 ms but acceptance 3.70 -> 3.54 (greedy, 20k); K = 98304 -0
 and 3.30 -> 3.26 at 60k. Net zero or worse. The conv projections in NVFP4 (not in the plan) are a
 small win: acceptance unchanged, draft -0.2 ms.
 
+**D2 status: done (2026-10-04).** The verify's down, GDN-out and attention-o projections run in
+two column halves with the first half's flag all-reduce on a high-priority side stream (small
+async all-reduces now take the flag kernel there instead of the copy-engine pipeline). Verify
+-0.66 ms at 20k, -0.71 ms at 60k. Not bit-identical to the single GEMM (the half-width GEMM's K
+split differs); only the tensor-core verify takes it, which was not exact against plain decode
+anyway. Also tried: more KV splits under tp (64 / 128): no gain -- the nvfp4 rows kernel is bound
+by per-SM work, not by the split's serial key groups.
+
 ## D. Decode all-reduce (lossless first)
 
 - **D1. Fuse the receive with what follows** (lossless). After every all-reduce come the residual

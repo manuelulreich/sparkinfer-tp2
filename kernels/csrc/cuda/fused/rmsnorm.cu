@@ -113,12 +113,17 @@ template __global__ void rmsnorm_kernel<1>(const __nv_bfloat16*, const __nv_bflo
 //   sum = x + residual;  norm = (sum / rms(sum)) * weight
 // One kernel replaces a residual_add + a rmsnorm (and keeps `sum` for the next
 // residual), cutting the per-layer norm/residual kernel count from 4 to 2.
+// residual_hi != nullptr: the residual is split by columns into two row-major halves of `half`
+// columns each ([rows][half] at residual, then [rows][half] at residual_hi) -- the two halves of
+// a projection that went out in two all-reduces. Same arithmetic, element for element.
 __global__ void add_rmsnorm2_kernel(const __nv_bfloat16* __restrict__ x,
                                     const __nv_bfloat16* __restrict__ residual,
                                     const __nv_bfloat16* __restrict__ weight,
                                     __nv_bfloat16* __restrict__ out_sum,
                                     __nv_bfloat16* __restrict__ out_norm,
-                                    int rows, int cols, float eps) {
+                                    int rows, int cols, float eps,
+                                    const __nv_bfloat16* __restrict__ residual_hi = nullptr,
+                                    int half = 0) {
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
@@ -128,11 +133,15 @@ __global__ void add_rmsnorm2_kernel(const __nv_bfloat16* __restrict__ x,
     const int tail  = npack << 3;  // first scalar column (handles cols % 8 != 0)
     const uint4* x4 = reinterpret_cast<const uint4*>(x + base);
     const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
+    const uint4* r4lo = reinterpret_cast<const uint4*>(residual + (size_t)row * half);
+    const uint4* r4hi = reinterpret_cast<const uint4*>(residual_hi + (size_t)row * half);
     uint4* osum4 = reinterpret_cast<uint4*>(out_sum + base);
 
     float ss = 0.f;
     for (int p = threadIdx.x; p < npack; p += blockDim.x) {
-        float xv[8], rv[8]; rn_unpack8(__ldg(x4 + p), xv); rn_unpack8(__ldg(r4 + p), rv);
+        float xv[8], rv[8]; rn_unpack8(__ldg(x4 + p), xv);
+        if (residual_hi) rn_unpack8(__ldg(8 * p < half ? r4lo + p : r4hi + (p - half / 8)), rv);
+        else rn_unpack8(__ldg(r4 + p), rv);
         float sv[8];
         #pragma unroll
         for (int j = 0; j < 8; j++) sv[j] = xv[j] + rv[j];
@@ -954,6 +963,18 @@ void launch_add_rmsnorm2(const void* x, const void* residual, const void* weight
         reinterpret_cast<const __nv_bfloat16*>(weight),
         reinterpret_cast<__nv_bfloat16*>(out_sum),
         reinterpret_cast<__nv_bfloat16*>(out_norm), rows, cols, eps);
+}
+
+void launch_add_rmsnorm2_split(const void* x, const void* residual_lo, const void* residual_hi,
+                               int half, const void* weight, void* out_sum, void* out_norm,
+                               int rows, int cols, float eps, cudaStream_t stream) {
+    add_rmsnorm2_kernel<<<rows, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const __nv_bfloat16*>(residual_lo),
+        reinterpret_cast<const __nv_bfloat16*>(weight),
+        reinterpret_cast<__nv_bfloat16*>(out_sum),
+        reinterpret_cast<__nv_bfloat16*>(out_norm), rows, cols, eps,
+        reinterpret_cast<const __nv_bfloat16*>(residual_hi), half);
 }
 
 // add_rmsnorm2 that also emits Q8_1(out_norm). Requires rows==1 and cols%256==0 (decode
