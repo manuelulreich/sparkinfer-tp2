@@ -6,6 +6,35 @@ Configuration: `startup.sh` (nvfp4 KV, DFlash2, `--ctx 131072`, int8 prefill wir
 session. Every lossless item keeps the speculative output equal to ordinary decode (checked as in
 plan 09: `SPARKINFER_KV_DTYPE=int8 EXACT_LINK=1 SPARKINFER_DETERMINISTIC=1 CTX=32768`).
 
+## Status (2026-10-04)
+
+`startup.sh` configuration, sampled (opencode's settings), exact mode unless noted:
+
+| | before plan 10 | now |
+|---|---:|---:|
+| decode, opencode final answer (~20k context) | ~100 tok/s | 115-123 tok/s (rejection mode 122-124) |
+| decode, 60k context | 91-95 tok/s | ~100-110 tok/s (rejection mode 105) |
+| step at 20k: draft / verify | 4.6 / 26.7 ms | 3.1 / 24.1 ms |
+| prefill, fresh 20k / 60k prompt | 5.9 / 17.1 s | 5.4 / 15.9 s |
+| agent turn, ~2k-token delta over 19k | 0.8 s to first token | 0.7 s |
+| opencode "Explain this repo to me." | 42.5 s | 33.7 s (HyperQwen 53 s) |
+| tp2 gates with nvfp4 KV | 3 of 7 prompts not lossless | determinism, batching, lossless pass |
+
+Done, in order of effect: the NVFP4 head kept at tp=2; linear-time streaming; the cluster top-k;
+the e4m3 prefill attention's uninitialized P' (nvfp4/fp8 determinism and losslessness); the
+nvfp4 verify attention per session; the verify all-reduces overlapping their GEMMs; opt-in
+rejection sampling; the prefill link overlap (async last chunk, chunked projections, 4 chunks);
+the wide prefill attention tier for small resumed passes; the pinned snapshot pool; DFlash2 conv
+projections in NVFP4. Measured and dropped: the decode 8-bit wire, more KV splits, a restricted
+draft head, 4-row verify attention groups.
+
+Left, each worth a few percent at most and each a kernel or scheduling project: the prefill F8
+attention over a long history (~5x off its compute bound for small resumed passes); the verify
+attention at long context (latency-bound key groups, 4.8 ms a step at 60k); the prefill
+micro-batch interleave (~0.9 s of link waits a 20k prefill); fusing the GDN commit into the next
+verify; DFlash2 batched drafting for concurrent sessions; first-request determinism (prefill
+windows follow free memory).
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |
