@@ -7,6 +7,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2 DFlash2: batched drafting across sessions** (`SPARKINFER_DFLASH_MULTI`, default on).
+  Concurrent sessions draft in one pass: embedding, context projection, every layer's
+  projections and convolutions and the head run once over all sessions' rows (up to 32), each
+  session keeps its own KV slide, RoPE, attention and selector walk, and the candidates of all
+  sessions cross the link in one exchange. Draft time per step: C2 5.75 -> 4.7 ms, C4 11.3 ->
+  8.6 ms (deterministic), C4 11.0 -> 7.5 ms (default mode). Acceptance and outputs unchanged
+  (deterministic C4 outputs identical with `SPARKINFER_DFLASH_MULTI=0`). The remaining draft
+  time is the NVFP4 GEMV's dp4a arithmetic, which grows with the rows.
+
 - **Prefix cache: host KV tier** (`SPARKINFER_PREFIX_CACHE_KV_HOST_MB`, default 16384). Cached
   prefixes keep a pinned host copy of their KV (copied in the background at insert, deduplicated
   per block across a conversation's turns), so leaving the KV pool no longer drops them: a later

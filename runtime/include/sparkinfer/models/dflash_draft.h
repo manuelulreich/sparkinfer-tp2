@@ -273,6 +273,10 @@ private:
                             float* out_confidence, int target_hidden_start);
     bool forward_blocks_body(int n, const DraftSeg* seg, int proposals, cudaStream_t stream,
                              int mode);
+    // DFlash2's batched pass (this rank's share), after the plan accepted the sessions.
+    bool forward_blocks_d2(int n, const DraftSeg* seg, int depth, int proposals,
+                           cudaStream_t stream, const std::vector<int>& past,
+                           const std::vector<int>& ctx_off, int ctx_total);
     int kv_state_create_local(int capacity);
     bool kv_snapshot_local(int lo, int hi, KvSnapshot& out);
     bool kv_start_at_local(int from, int seq_len, const KvSnapshot* snap);

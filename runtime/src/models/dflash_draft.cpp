@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -1420,20 +1421,26 @@ struct DFlashDraftModel::Impl {
 
     // A convolution's coefficients for `rows` rows of x (rows: an instantiated batched-GEMV
     // width) into d2_coef, and its first side on x into d2_cv.
-    void d2_prepare(const D2Conv& cv, const bf16* x, int rows, int block, cudaStream_t st) {
+    // coef / out: the batched pass's own scratch (null: d2_coef / d2_cv).
+    void d2_prepare(const D2Conv& cv, const bf16* x, int rows, int block, cudaStream_t st,
+                    bf16* coef = nullptr, bf16* out = nullptr) {
         const int H = cfg.hidden, nc = 2 * cfg.conv_taps * (H / cfg.conv_group);
+        if (!coef) coef = d2_coef;
+        if (!out) out = d2_cv;
         if (cv.proj_nv)
-            nv_proj(x, nullptr, rows, H, cv.proj_nv, d2_coef, nc, nullptr, nullptr, 0, nullptr,
+            nv_proj(x, nullptr, rows, H, cv.proj_nv, coef, nc, nullptr, nullptr, 0, nullptr,
                     nullptr, 0, st);
         else
-            dflash_kernels::launch_gemv_batched16(x, cv.proj, d2_coef, nc, H, st, rows);
-        dflash_kernels::launch_dflash2_conv(x, d2_coef, cv.base, d2_cv, rows, block, H,
+            dflash_kernels::launch_gemv_batched16(x, cv.proj, coef, nc, H, st, rows);
+        dflash_kernels::launch_dflash2_conv(x, coef, cv.base, out, rows, block, H,
                                             cfg.conv_group, cfg.conv_taps, 0, st);
     }
     // Its second side on x (the wrapped attention's or MLP's output) into d2_cv.
-    void d2_finish(const D2Conv& cv, const bf16* x, int rows, int block, cudaStream_t st) {
-        dflash_kernels::launch_dflash2_conv(x, d2_coef, cv.base, d2_cv, rows, block, cfg.hidden,
-                                            cfg.conv_group, cfg.conv_taps, 1, st);
+    void d2_finish(const D2Conv& cv, const bf16* x, int rows, int block, cudaStream_t st,
+                   bf16* coef = nullptr, bf16* out = nullptr) {
+        dflash_kernels::launch_dflash2_conv(x, coef ? coef : d2_coef, cv.base, out ? out : d2_cv,
+                                            rows, block, cfg.hidden, cfg.conv_group,
+                                            cfg.conv_taps, 1, st);
     }
 
     // The proposals of one block from the final hidden rows in xn (BW rows): the head's top
@@ -1447,21 +1454,143 @@ struct DFlashDraftModel::Impl {
     // rejection sampling against those scores) only lowers that.
     //
     // At tp=2 both ranks call this at the same point: it ends in a host exchange.
+    // Rank 1 scores the target head's half on its own card: take its current form.
+    void d2_head_bind() {
+        if (cfg.tp_rank == 0) return;
+        const DFlashDraftModel::HeadRef h = d2_head_src ? d2_head_src() : DFlashDraftModel::HeadRef{};
+        lm_head = h.lm_head;
+        lm_head_type = h.lm_head_type;
+        vocab = d2_head_rows;
+        hidden = cfg.hidden;
+        hf_w = h.fp4_w;
+        hf_sf = h.fp4_sf;
+        hf_alpha = h.fp4_alpha;
+    }
+
+    // ---- DFlash2 across sessions (forward_blocks) ----
+    // Up to kMultiRows block rows and kMultiCtx new context rows in one pass. The m_* buffers are
+    // DSpark's batched scratch, sized here for DFlash2 (which never takes multi_alloc), plus the
+    // convolution, candidate and selector scratch of all rows. Taken on first use, on both cards.
+    static constexpr int kMultiCtx = 64;
+    bool d2m_ready = false, d2m_failed = false;
+    bf16 *d2m_coef = nullptr, *d2m_cv = nullptr, *d2m_hp = nullptr;
+    float *d2m_tk_v = nullptr, *d2m_h_tk_v = nullptr, *d2m_q_p = nullptr;
+    int *d2m_tk_i = nullptr, *d2m_h_tk_i = nullptr, *d2m_q_i = nullptr;
+    bool d2_multi_alloc() {
+        if (d2m_ready || d2m_failed) return d2m_ready;
+        d2_head_bind();
+        const int R = kMultiRows, RC = kMultiCtx, TK = dflash_kernels::kRowsTopkMax;
+        const int H = cfg.hidden, I = cfg.intermediate, Vh = vocab;
+        const int qdim = cfg.n_q_heads * cfg.head_dim, kvdim = cfg.n_kv_heads * cfg.head_dim;
+        const int nc = 2 * cfg.conv_taps * (H / cfg.conv_group);
+        bool ok = nv_on && nv_fc && Vh > 0 && head_fp4_ready(Vh);
+        for (int L = 0; ok && L < cfg.n_layers; L++)
+            ok = d2_attn[L].proj_nv && d2_mlp[L].proj_nv;
+        std::vector<void*> got;
+        auto a = [&](size_t bytes) -> void* {
+            void* p = nullptr;
+            if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
+            got.push_back(p);
+            return p;
+        };
+        const size_t rh = (size_t)R * H * sizeof(bf16);
+        m_noise = (bf16*)a(rh); m_x = (bf16*)a(rh); m_xn = (bf16*)a(rh); m_h = (bf16*)a(rh);
+        m_hn = (bf16*)a(rh); m_ao = (bf16*)a(rh); m_down = (bf16*)a(rh);
+        m_tp = (bf16*)a((size_t)RC * H * sizeof(bf16));
+        m_q = (bf16*)a((size_t)R * qdim * sizeof(bf16));
+        m_attn = (bf16*)a((size_t)R * qdim * sizeof(bf16));
+        m_gate = (bf16*)a((size_t)R * I * sizeof(bf16));
+        m_up = (bf16*)a((size_t)R * I * sizeof(bf16));
+        m_knew = (bf16*)a((size_t)R * kvdim * sizeof(bf16));
+        m_vnew = (bf16*)a((size_t)R * kvdim * sizeof(bf16));
+        m_kctx = (bf16*)a((size_t)RC * kvdim * sizeof(bf16));
+        m_vctx = (bf16*)a((size_t)RC * kvdim * sizeof(bf16));
+        m_th = (bf16*)a((size_t)RC * fc_k * sizeof(bf16));
+        m_logits = (float*)a((size_t)R * Vh * sizeof(float));
+        m_d_ids = (int*)a((size_t)2 * R * sizeof(int));
+        m_d_out = (int*)a((size_t)2 * R * sizeof(int));
+        d2m_coef = (bf16*)a((size_t)R * nc * sizeof(bf16));
+        d2m_cv = (bf16*)a(rh);
+        d2m_tk_v = (float*)a((size_t)R * TK * sizeof(float));
+        d2m_tk_i = (int*)a((size_t)R * TK * sizeof(int));
+        if (cfg.tp_rank == 0) {
+            d2m_hp = (bf16*)a((size_t)R * cfg.selector_rank * sizeof(bf16));
+            d2m_q_p = (float*)a((size_t)R * dflash_kernels::kDraftQTab * sizeof(float));
+            d2m_q_i = (int*)a((size_t)R * dflash_kernels::kDraftQTab * sizeof(int));
+        }
+        std::vector<void*> host;
+        auto hb = [&](size_t bytes) -> void* {
+            void* p = nullptr;
+            if (!ok || cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess) { ok = false; return nullptr; }
+            host.push_back(p);
+            return p;
+        };
+        m_h_ids = (int*)hb((size_t)2 * R * sizeof(int));
+        m_h_out = (int*)hb((size_t)2 * R * sizeof(int));
+        d2m_h_tk_v = (float*)hb((size_t)R * TK * sizeof(float));
+        d2m_h_tk_i = (int*)hb((size_t)R * TK * sizeof(int));
+        if (!ok) {
+            cudaGetLastError();
+            for (void* p : got) cudaFree(p);
+            for (void* p : host) cudaFreeHost(p);
+            m_h_ids = m_h_out = nullptr;
+            d2m_failed = true;
+            return false;
+        }
+        for (void* p : got) owned.push_back(p);
+        d2m_ready = true;
+        return true;
+    }
+    // Whether these sessions can take the batched pass: steady-state blocks (the new context
+    // rows end where the block starts, no truncated capture) whose rows all fit, every
+    // projection on the NVFP4 GEMV, and no context row a window would skip. A session's cache
+    // may slide (forward_blocks_d2 slides it as forward_block would); one that would overflow
+    // anyway goes one by one, where the same check fails loudly. Does not allocate.
+    bool multi_plan_d2(int n, const DFlashDraftModel::DraftSeg* seg, int depth, int keep,
+                       std::vector<int>& past, std::vector<int>& ctx_off, int& ctx_total) {
+        static const bool multi_env = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_MULTI"); return !(e && e[0] == '0');
+        }();
+        static const int kFullWindowEnv = []{ const char* e = getenv("SPARKINFER_DFLASH_FULL_WINDOW");
+                                              return e ? atoi(e) : -1; }();
+        const auto& c = cfg;
+        const int BW = width_for(depth);
+        bool ok = multi_env && d2m_ready && n >= 2 && n * BW <= kMultiRows &&
+                  n * depth <= kMultiRows && BW == 8 && kFullWindowEnv < 0 && c.sliding_window > 0;
+        for (int L = 0; ok && L < c.n_layers; L++) {
+            const auto& w = layers[L];
+            ok = w.nv_wq && w.nv_wk && w.nv_wv && w.nv_wo && w.nv_gate && w.nv_up && w.nv_down;
+        }
+        ctx_total = 0;
+        for (int j = 0; ok && j < n; j++) {
+            const DFlashDraftModel::DraftSeg& g = seg[j];
+            ok = g.state >= 0 && g.state < (int)kv_states.size() && kv_states[g.state].live &&
+                 g.ctx_len >= 1 && g.ctx_len <= 16 && g.target_hidden_start == 0 &&
+                 g.target_hidden && g.ids && g.out_argmax;
+            if (!ok) break;
+            for (int i = 0; i < j; i++) ok = ok && seg[i].state != g.state;
+            const bool cur = g.state == kv_cur;
+            const int pj = cur ? seq_len : kv_states[g.state].seq_len;
+            const int base = cur ? kv_base : kv_states[g.state].base;
+            const int cap = cur ? kv_cap : kv_states[g.state].cap;
+            past[j] = pj;
+            ctx_off[j] = ctx_total;
+            ctx_total += g.ctx_len;
+            int sb = base;
+            if (pj - base + g.ctx_len + BW > cap) sb = std::max(base, g.pos0 - keep);
+            const int lo = dflash_kernels::attn_gqa_kv_lo(BW, pj + g.ctx_len + BW, c.n_q_heads,
+                                                          c.n_kv_heads, c.head_dim, g.pos0, 0,
+                                                          c.sliding_window);
+            ok = ok && pj >= base && pj + g.ctx_len == g.pos0 && pj + g.ctx_len + BW - sb <= cap &&
+                 lo <= pj;
+        }
+        return ok && ctx_total <= kMultiCtx;
+    }
+
     bool d2_head(int BW, int depth, int* out_argmax, cudaStream_t st) {
         const int H = cfg.hidden, K = cfg.selector_top_k, TK = dflash_kernels::kRowsTopkMax;
         const bool lead = cfg.tp_rank == 0;
-        if (!lead) {
-            // Rank 1 scores the target head's half on its own card.
-            const DFlashDraftModel::HeadRef h = d2_head_src ? d2_head_src()
-                                                            : DFlashDraftModel::HeadRef{};
-            lm_head = h.lm_head;
-            lm_head_type = h.lm_head_type;
-            vocab = d2_head_rows;
-            hidden = H;
-            hf_w = h.fp4_w;
-            hf_sf = h.fp4_sf;
-            hf_alpha = h.fp4_alpha;
-        }
+        d2_head_bind();
         const int Vh = vocab;                        // this card's head rows
         const int lo = lead ? 0 : cfg.vocab - Vh;    // the vocab id of the first
         // Rows 0..depth: the tensor-core head computes 8-row tiles anyway, and row 0 starts them.
@@ -3620,8 +3749,28 @@ bool DFlashDraftModel::forward_blocks(int n, const DraftSeg* seg, int proposals,
         if (!seg[j].ids || !seg[j].out_argmax) return false;
     std::vector<int> past(n), ctx_off(n);
     int ctx_total = 0;
-    const int mode = (s.multi_plan(n, seg, proposals, past, ctx_off, ctx_total) && s.m_ready &&
-                      s.tp_peer->p_->m_ready) ? 1 : 0;
+    int mode;
+    if (s.cfg.dflash2) {
+        // The batched pass's scratch, on both cards at once (a rank that could not take it
+        // mid-step would leave the other waiting in a link op).
+        if (n >= 2 && !s.d2m_ready && !s.d2m_failed) {
+            bool a = false, b = false;
+            tp_run_with_peer(s.tp_peer_dev, [&] { b = s.tp_peer->p_->d2_multi_alloc(); },
+                             [&] { a = s.d2_multi_alloc(); });
+            if (!a || !b) {
+                s.d2m_failed = true;
+                fprintf(stderr, "[dflash] DFlash2 batched drafting off (scratch or head not "
+                                "available); sessions draft one by one\n");
+            }
+        }
+        const int depth = std::min(s.cfg.max_proposals(),
+                                   proposals > 0 ? std::min(proposals, 15) : 5);
+        mode = (!s.d2m_failed && s.tp_peer->p_->d2m_ready &&
+                s.multi_plan_d2(n, seg, depth, kv_slide_keep(), past, ctx_off, ctx_total)) ? 1 : 0;
+    } else {
+        mode = (s.multi_plan(n, seg, proposals, past, ctx_off, ctx_total) && s.m_ready &&
+                s.tp_peer->p_->m_ready) ? 1 : 0;
+    }
     bool ok = false, peer_ok = false;
     // fc split: rank 1 projects its own half of each session's capture (see Impl::fc_split).
     std::vector<DraftSeg> peer_seg;
@@ -3656,6 +3805,26 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
         }
         return true;
     };
+    if (c.dflash2) {
+        const int d2depth = std::min(c.max_proposals(), proposals > 0 ? std::min(proposals, 15) : 5);
+        std::vector<int> past(n), ctx_off(n);
+        int ctx_total = 0;
+        bool ok = mode == 1;
+        if (mode < 0) {
+            ok = n >= 2 && s.d2_multi_alloc() &&
+                 s.multi_plan_d2(n, seg, d2depth, kv_slide_keep(), past, ctx_off, ctx_total);
+        } else if (ok) {
+            // The leader's choice; its plan covered these sessions' states, which are mirrored.
+            for (int j = 0; j < n; j++) {
+                const int id = seg[j].state;
+                past[j] = id == s.kv_cur ? s.seq_len : s.kv_states[id].seq_len;
+                ctx_off[j] = ctx_total;
+                ctx_total += seg[j].ctx_len;
+            }
+        }
+        if (!ok) return one_by_one();
+        return forward_blocks_d2(n, seg, d2depth, proposals, stream, past, ctx_off, ctx_total);
+    }
     static const int kDraftVocab = []{
         const char* e = getenv("SPARKINFER_DFLASH_DRAFT_VOCAB"); return e ? atoi(e) : 65536;
     }();
@@ -3924,6 +4093,295 @@ bool DFlashDraftModel::forward_blocks_body(int n, const DraftSeg* seg, int propo
         for (int r = 1; r <= depth; r++) seg[j].out_argmax[r] = s.m_h_out[j * (B + 1) + r];
         int& len = sl(seg[j].state);
         len = std::min(seg[j].pos0, past[j] + seg[j].ctx_len + BW);
+    }
+    return true;
+}
+
+// DFlash2, several sessions in one pass: the embedding, the context projection, every layer's
+// projections and convolutions, and the head run once over all sessions' rows; each session's
+// cache slide, context K/V append, RoPE and attention run on its own KV state, and its selector
+// walk on its own candidates. Per row this is the arithmetic forward_block_body does (the
+// GEMVs and the head tile rows independently), with one link op per sum and one host exchange
+// for all sessions instead of one per session.
+bool DFlashDraftModel::forward_blocks_d2(int n, const DraftSeg* seg, int depth, int proposals,
+                                         cudaStream_t stream, const std::vector<int>& past,
+                                         const std::vector<int>& ctx_off, int ctx_total) {
+    Impl& s = *p_;
+    const auto& c = s.cfg;
+    const bool lead = c.tp_rank == 0;
+    const bool split = s.tp_split;
+    cudaStream_t st = s.tp_stream ? s.tp_stream : (stream ? stream : s.stream);
+    const int H = c.hidden, I = c.intermediate, B = c.block_size;
+    const int qdim = c.n_q_heads * c.head_dim, kvdim = c.n_kv_heads * c.head_dim, d = c.head_dim;
+    const float scale = 1.f / sqrtf((float)d);
+    const int BW = s.width_for(depth);
+    const int rows = n * BW;
+    const int TK = dflash_kernels::kRowsTopkMax;
+    // SPARKINFER_DFLASH_MULTI_TIMING=1: synchronised section times on rank 0 (debug; the syncs
+    // themselves cost a little), printed every 64 passes.
+    static const bool kTime = getenv("SPARKINFER_DFLASH_MULTI_TIMING") != nullptr;
+    static double t_acc[8] = {0};
+    static long t_n = 0;
+    auto t_last = std::chrono::steady_clock::now();
+    auto tick = [&](int i) {
+        if (!kTime || !lead) return;
+        cudaStreamSynchronize(st);
+        const auto now = std::chrono::steady_clock::now();
+        t_acc[i] += std::chrono::duration<double, std::milli>(now - t_last).count();
+        t_last = now;
+    };
+    {
+        static long taken = 0;
+        if (lead && getenv("SPARKINFER_DFLASH_MULTI_DEBUG") && (++taken & (taken - 1)) == 0)
+            fprintf(stderr, "[dflash] DFlash2 batched x%ld (n=%d rows=%d ctx=%d)\n", taken, n, rows,
+                    ctx_total);
+    }
+    // Every session's state in its slot, so each is addressed the same way below.
+    if (!s.select(-1)) return false;
+
+    // Slide each session's cache as forward_block_body would (the plan checked it fits after).
+    const int keep = kv_slide_keep();
+    std::vector<int> kv_rel(n);
+    for (int j = 0; j < n; j++) {
+        Impl::KvState& k = s.kv_states[seg[j].state];
+        const int pj = past[j], cl = seg[j].ctx_len;
+        int sb = k.base;
+        if (pj - k.base + cl + BW > k.cap) {
+            sb = std::max(k.base, seg[j].pos0 - keep);
+            k.ctx_lo = std::max(k.ctx_lo, sb);
+        }
+        if (sb > k.base) {
+            const int shift = sb - k.base;
+            const int kept = std::max(0, pj - sb);
+            const size_t row = (size_t)kvdim * sizeof(bf16);
+            for (int L = 0; L < c.n_layers; L++)
+                for (int off = 0; off < kept; off += shift) {
+                    const int r = std::min(shift, kept - off);
+                    cu(cudaMemcpyAsync(k.k[L] + (size_t)off * kvdim, k.k[L] + (size_t)(shift + off) * kvdim,
+                                       r * row, cudaMemcpyDeviceToDevice, st), "kv slide k");
+                    cu(cudaMemcpyAsync(k.v[L] + (size_t)off * kvdim, k.v[L] + (size_t)(shift + off) * kvdim,
+                                       r * row, cudaMemcpyDeviceToDevice, st), "kv slide v");
+                }
+            k.base = sb;
+        }
+        k.valid_lo = std::max(k.valid_lo, k.base);
+        kv_rel[j] = pj - k.base;
+    }
+
+    // Block ids and their embedding.
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < BW; i++) s.m_h_ids[j * BW + i] = seg[j].ids[i];
+    cu(cudaMemcpyAsync(s.m_d_ids, s.m_h_ids, (size_t)rows * sizeof(int), cudaMemcpyHostToDevice, st),
+       "d2 multi ids");
+    if (!lead) {
+        cu(cudaMemsetAsync(s.m_noise, 0, (size_t)rows * H * sizeof(bf16), st), "split noise zero");
+    } else if (s.embed_rows > 0) {
+        kernels::launch_embedding_vocab_window(s.m_d_ids, s.embed, s.m_noise, rows, H, 0,
+                                               s.embed_rows, st);
+        int dev = 0;
+        cu(cudaGetDevice(&dev), "embed split device");
+        for (int r = 0; r < rows; r++) {
+            const int id = s.m_h_ids[r];
+            if (id < s.embed_rows) continue;
+            const bf16* src = static_cast<const bf16*>(s.embed_hi) + (size_t)(id - s.embed_rows) * H;
+            bf16* dst = s.m_noise + (size_t)r * H;
+            auto it = s.embed_hi_cache.find(id);
+            if (it == s.embed_hi_cache.end() && s.embed_hi_cache.size() < 4096) {
+                bf16* row = s.alloc<bf16>((size_t)H);
+                if (row) {
+                    cu(cudaMemcpyPeer(row, dev, src, s.embed_hi_dev, (size_t)H * sizeof(bf16)),
+                       "embed split fetch");
+                    it = s.embed_hi_cache.emplace(id, row).first;
+                }
+            }
+            if (it != s.embed_hi_cache.end())
+                cu(cudaMemcpyAsync(dst, it->second, (size_t)H * sizeof(bf16),
+                                   cudaMemcpyDeviceToDevice, st), "embed split row");
+            else
+                cu(cudaMemcpyPeerAsync(dst, dev, src, s.embed_hi_dev, (size_t)H * sizeof(bf16), st),
+                   "embed split peer row");
+        }
+    } else {
+        kernels::launch_embedding(s.m_d_ids, s.embed, s.m_noise, rows, H, st);
+    }
+    if (lead && c.embed_scale != 1.f)
+        dflash_kernels::launch_scale_bf16(s.m_noise, (long)rows * H, c.embed_scale, st);
+    if (split) tp_allreduce_bf16_on(s.m_noise, (size_t)rows * H, st);
+
+    // The sessions' new context rows, concatenated, through fc + hidden_norm (the order
+    // forward_block_body uses: fc split -> sum -> norm; fc on rank 0 -> norm -> to rank 1).
+    if (!lead && !s.fc_split) {
+        cu(cudaMemsetAsync(s.m_tp, 0, (size_t)ctx_total * H * sizeof(bf16), st), "split ctx zero");
+        tp_allreduce_bf16_on(s.m_tp, (size_t)ctx_total * H, st);
+    } else {
+        const int fk = s.fc_k;
+        for (int j = 0; j < n; j++) {
+            bf16* dst = s.m_th + (size_t)ctx_off[j] * fk;
+            const size_t bytes = (size_t)seg[j].ctx_len * fk * sizeof(bf16);
+            if (seg[j].target_hidden)
+                cu(cudaMemcpyAsync(dst, seg[j].target_hidden, bytes, cudaMemcpyDeviceToDevice, st),
+                   "d2 multi ctx gather");
+            else
+                cu(cudaMemsetAsync(dst, 0, bytes, st), "d2 multi ctx half zero");
+        }
+        s.nv_proj(s.m_th, nullptr, ctx_total, fk, s.nv_fc, s.m_tp, H, nullptr, nullptr, 0, nullptr,
+                  nullptr, 0, st);
+        if (s.fc_split) tp_allreduce_bf16_on(s.m_tp, (size_t)ctx_total * H, st);
+        dflash_kernels::launch_rms(s.m_tp, s.hidden_norm, s.m_tp, ctx_total, H, c.rms_eps, st);
+        if (split && !s.fc_split) tp_allreduce_bf16_on(s.m_tp, (size_t)ctx_total * H, st);
+    }
+    cu(cudaMemcpyAsync(s.m_x, s.m_noise, (size_t)rows * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+       "d2 multi noise->x");
+    tick(0);
+
+    static const int kForceCausal = []{
+        const char* e = getenv("SPARKINFER_DFLASH_FORCE_CAUSAL"); return (e && e[0] == '1') ? 1 : 0;
+    }();
+    const bool causal = kForceCausal || c.is_causal == 1;
+    const int window = c.sliding_window;   // every DFlash2 layer (forward_block_body: kFullWindow)
+    for (int L = 0; L < c.n_layers; L++) {
+        const auto& w = s.layers[L];
+        if (L == 0) dflash_kernels::launch_rms(s.m_x, w.input_norm, s.m_xn, rows, H, c.rms_eps, st);
+        s.d2_prepare(s.d2_attn[L], s.m_xn, rows, BW, st, s.d2m_coef, s.d2m_cv);
+        s.nv_proj(s.d2m_cv, nullptr, rows, H, w.nv_wq, s.m_q, qdim, w.nv_wk, s.m_knew, kvdim,
+                  w.nv_wv, s.m_vnew, kvdim, st);
+        s.nv_proj(s.m_tp, nullptr, ctx_total, H, w.nv_wk, s.m_kctx, kvdim, w.nv_wv, s.m_vctx, kvdim,
+                  nullptr, nullptr, 0, st);
+        for (int j = 0; j < n; j++) {
+            const DraftSeg& g = seg[j];
+            Impl::KvState& k = s.kv_states[g.state];
+            bf16* kd = k.k[L] + (size_t)kv_rel[j] * kvdim;
+            bf16* vd = k.v[L] + (size_t)kv_rel[j] * kvdim;
+            const size_t cb = (size_t)g.ctx_len * kvdim * sizeof(bf16);
+            const size_t nb = (size_t)BW * kvdim * sizeof(bf16);
+            cu(cudaMemcpyAsync(kd, s.m_kctx + (size_t)ctx_off[j] * kvdim, cb, cudaMemcpyDeviceToDevice, st), "d2 kctx");
+            cu(cudaMemcpyAsync(vd, s.m_vctx + (size_t)ctx_off[j] * kvdim, cb, cudaMemcpyDeviceToDevice, st), "d2 vctx");
+            cu(cudaMemcpyAsync(kd + (size_t)g.ctx_len * kvdim, s.m_knew + (size_t)j * BW * kvdim, nb,
+                               cudaMemcpyDeviceToDevice, st), "d2 knew");
+            cu(cudaMemcpyAsync(vd + (size_t)g.ctx_len * kvdim, s.m_vnew + (size_t)j * BW * kvdim, nb,
+                               cudaMemcpyDeviceToDevice, st), "d2 vnew");
+            bf16* qj = s.m_q + (size_t)j * BW * qdim;
+            const int new_len = g.ctx_len + BW;
+            if (c.rope_normal) {
+                dflash_kernels::launch_rms_heads_rope_normal(qj, w.q_norm, BW, c.n_q_heads, d,
+                                                             c.rms_eps, g.pos0, c.rope_theta, st);
+                dflash_kernels::launch_rms_heads_rope_normal(kd, w.k_norm, new_len, c.n_kv_heads, d,
+                                                             c.rms_eps, g.pos0 - g.ctx_len,
+                                                             c.rope_theta, st);
+            } else {
+                dflash_kernels::launch_rms_heads_rope(qj, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
+                                                     g.pos0, c.rope_theta, st,
+                                                     s.d_yarn_inv_freq, s.yarn_att_scale);
+                dflash_kernels::launch_rms_heads_rope(kd, w.k_norm, new_len, c.n_kv_heads, d,
+                                                     c.rms_eps, g.pos0 - g.ctx_len, c.rope_theta, st,
+                                                     s.d_yarn_inv_freq, s.yarn_att_scale);
+            }
+            dflash_kernels::launch_attn_gqa(qj, k.k[L], k.v[L], s.m_attn + (size_t)j * BW * qdim,
+                                            BW, kv_rel[j] + new_len, c.n_q_heads, c.n_kv_heads, d,
+                                            g.pos0, /*k_pos0_cache=*/k.base, window, causal, scale,
+                                            st, s.fa_m, s.fa_l, s.fa_acc);
+        }
+        s.nv_proj(s.m_attn, nullptr, rows, qdim, w.nv_wo, s.m_ao, H, nullptr, nullptr, 0, nullptr,
+                  nullptr, 0, st);
+        if (split) tp_allreduce_bf16_on(s.m_ao, (size_t)rows * H, st);
+        s.d2_finish(s.d2_attn[L], s.m_ao, rows, BW, st, s.d2m_coef, s.d2m_cv);
+        dflash_kernels::launch_add_rms(s.m_x, s.d2m_cv, s.m_h, w.post_norm, s.m_hn, rows, H,
+                                       c.rms_eps, st, nullptr);
+        s.d2_prepare(s.d2_mlp[L], s.m_hn, rows, BW, st, s.d2m_coef, s.d2m_cv);
+        s.nv_proj(s.d2m_cv, nullptr, rows, H, w.nv_gate, s.m_gate, I, w.nv_up, s.m_up, I, nullptr,
+                  nullptr, 0, st);
+        dflash_kernels::launch_swiglu(s.m_gate, s.m_up, s.m_gate, rows * I, st);
+        s.nv_proj(s.m_gate, nullptr, rows, I, w.nv_down, s.m_down, H, nullptr, nullptr, 0, nullptr,
+                  nullptr, 0, st);
+        if (split) tp_allreduce_bf16_on(s.m_down, (size_t)rows * H, st);
+        s.d2_finish(s.d2_mlp[L], s.m_down, rows, BW, st, s.d2m_coef, s.d2m_cv);
+        const bf16* next_norm = (L + 1 < c.n_layers) ? s.layers[L + 1].input_norm : s.final_norm;
+        dflash_kernels::launch_add_rms(s.m_h, s.d2m_cv, s.m_x, next_norm, s.m_xn, rows, H,
+                                       c.rms_eps, st, nullptr);
+    }
+    tick(1);
+    for (int j = 0; j < n; j++) {
+        Impl::KvState& k = s.kv_states[seg[j].state];
+        k.seq_len = std::min(seg[j].pos0 < 0 ? 0 : seg[j].pos0, past[j] + seg[j].ctx_len + BW);
+    }
+
+    // Head: this card's vocab half over every row, each session's top candidates for its rows
+    // 1..depth, one cross-card merge for all of them.
+    s.d2_head_bind();
+    const int Vh = s.vocab;
+    const int K = c.selector_top_k;
+    const int hr = n * depth;
+    bool ok = s.lm_head && Vh > 0 && s.head_fp4(s.m_xn, rows, s.m_logits, Vh, st);
+    if (ok)
+        for (int j = 0; j < n; j++)
+            dflash_kernels::launch_rows_topk(s.m_logits + (size_t)(j * BW + 1) * Vh, depth, Vh, K,
+                                             s.d2m_tk_v + (size_t)j * depth * TK,
+                                             s.d2m_tk_i + (size_t)j * depth * TK, st);
+    tick(2);
+    if (split) {
+        const size_t nt = (size_t)hr * TK;
+        if (ok) {
+            cu(cudaMemcpyAsync(s.d2m_h_tk_v, s.d2m_tk_v, nt * sizeof(float), cudaMemcpyDeviceToHost, st),
+               "d2 multi candidates");
+            cu(cudaMemcpyAsync(s.d2m_h_tk_i, s.d2m_tk_i, nt * sizeof(int), cudaMemcpyDeviceToHost, st),
+               "d2 multi candidate ids");
+        }
+        if (cudaStreamSynchronize(st) != cudaSuccess) ok = false;
+        if (!ok)
+            for (size_t i = 0; i < nt; i++) { s.d2m_h_tk_v[i] = -INFINITY; s.d2m_h_tk_i[i] = INT_MAX; }
+        std::vector<float> mv(nt);
+        std::vector<int> mi(nt);
+        const int lo = lead ? 0 : c.vocab - Vh;
+        tp_exchange_topk(s.d2m_h_tk_v, s.d2m_h_tk_i, hr, lead ? Vh : lo, mv.data(), mi.data());
+        if (!lead) return true;
+        ok = mi[0] != INT_MAX;
+        if (!ok) return false;
+        std::memcpy(s.d2m_h_tk_v, mv.data(), nt * sizeof(float));
+        std::memcpy(s.d2m_h_tk_i, mi.data(), nt * sizeof(int));
+        cu(cudaMemcpyAsync(s.d2m_tk_v, s.d2m_h_tk_v, nt * sizeof(float), cudaMemcpyHostToDevice, st),
+           "d2 multi merged candidates");
+        cu(cudaMemcpyAsync(s.d2m_tk_i, s.d2m_h_tk_i, nt * sizeof(int), cudaMemcpyHostToDevice, st),
+           "d2 multi merged candidate ids");
+    }
+    tick(3);
+    if (!ok || !lead) return ok;
+    // The selector, per session: its hidden projection and its walk from its own anchor.
+    const int R = c.selector_rank;
+    constexpr int QT = dflash_kernels::kDraftQTab;
+    for (int j = 0; j < n; j++) {
+        const DraftWalk& wk = seg[j].walk;
+        dflash_kernels::launch_gemv_batched16(s.m_xn + (size_t)j * BW * H, s.d2_hproj,
+                                              s.d2m_hp + (size_t)j * BW * R, R, H, st, BW);
+        const bool want_q = wk.temperature > 0.f && wk.q_p && wk.q_ids;
+        float* qp = s.d2m_q_p + (size_t)j * depth * QT;
+        int* qi = s.d2m_q_i + (size_t)j * depth * QT;
+        dflash_kernels::launch_dflash2_select(s.d2m_tk_i + (size_t)j * depth * TK,
+                                              s.d2m_tk_v + (size_t)j * depth * TK, TK,
+                                              s.d2m_hp + (size_t)(j * BW + 1) * R, R,
+                                              s.m_d_ids + (size_t)j * BW, s.d2_pred, s.d2_succ,
+                                              c.vocab, R, K, depth, c.output_multiplier,
+                                              c.logit_softcap, s.m_d_out + (size_t)j * (B + 1) + 1,
+                                              st, wk.temperature, wk.top_k, wk.top_p, wk.seed,
+                                              wk.step0, want_q ? qp : nullptr, want_q ? qi : nullptr);
+        if (want_q) {
+            cu(cudaMemcpyAsync(wk.q_p, qp, (size_t)depth * QT * sizeof(float), cudaMemcpyDeviceToHost,
+                               st), "d2 multi q");
+            cu(cudaMemcpyAsync(wk.q_ids, qi, (size_t)depth * QT * sizeof(int), cudaMemcpyDeviceToHost,
+                               st), "d2 multi q ids");
+        }
+    }
+    cu(cudaMemcpyAsync(s.m_h_out, s.m_d_out, (size_t)n * (B + 1) * sizeof(int),
+                       cudaMemcpyDeviceToHost, st), "d2 multi proposals");
+    if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+    tick(4);
+    if (kTime && ++t_n % 64 == 0)
+        fprintf(stderr, "[dflash] d2 batched ms/pass (n=%d): embed+ctx %.2f layers %.2f head %.2f "
+                        "merge %.2f select %.2f\n", n, t_acc[0] / t_n, t_acc[1] / t_n,
+                t_acc[2] / t_n, t_acc[3] / t_n, t_acc[4] / t_n);
+    for (int j = 0; j < n; j++) {
+        for (int t = 1; t <= depth; t++) seg[j].out_argmax[t] = s.m_h_out[j * (B + 1) + t];
+        for (int t = depth + 1; t <= std::min(proposals, c.block_size); t++)
+            seg[j].out_argmax[t] = c.mask_token_id;
     }
     return true;
 }

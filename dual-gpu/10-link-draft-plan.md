@@ -129,6 +129,19 @@ SPARKINFER_PREFIX_CACHE=2`, restored hit and pool hit give the same md5 and logp
 first-token logprobs vary by ~0.6 nat run to run on this test whatever the path (int8 wire), so
 they are no evidence either way. Unit test: prefix_cache_gpu_test covers a byte-level round trip.
 
+**Batched DFlash2 drafting (2026-10-04, work package 3).** `forward_blocks` had a batched pass
+for DSpark only; DFlash2 drafted each session separately (12 all-reduces and 2 host syncs per
+session). New `forward_blocks_d2`: one embedding / fc / per-layer conv + projection / head pass
+over n x 8 rows, per-session slide + context K/V append + RoPE + attention on the session's own
+KV state, candidates of all sessions in one top-k exchange, selector walk per session. Plan
+(`multi_plan_d2`): n >= 2, <= 32 rows, steady state (context rows end at the block, <= 16 per
+session, <= 64 total), no window trim. Scratch ~31 MB per card, taken on first use on both cards.
+Deterministic draft ms/step C1/C2/C4: 2.89/5.75/11.3 -> 2.88/4.7/8.6, mean_accept unchanged;
+default mode C4 11.0 -> 7.5 ms (step 43.4 -> 38.2 ms). Section times at C4 (32 rows,
+`SPARKINFER_DFLASH_MULTI_TIMING`): embed+ctx 0.55, layers 6.59, head 0.83, merge 0.03, select
+0.28 ms; at C2 (16 rows) layers 3.44 ms -- linear in rows, so the NVFP4 W4A8 GEMV (dp4a) is
+compute-bound at these widths. Next lever: a tensor-core (int8 mma) form of that GEMV.
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |
