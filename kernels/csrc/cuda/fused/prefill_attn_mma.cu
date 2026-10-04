@@ -1529,8 +1529,22 @@ static bool prefill_attn_mma_tiers(
     // Gated on the KV SPAN, not on n_tokens: a windowed long-prompt pass ingests 16,384 tokens at
     // a time, so n_tokens alone cannot tell a 16k prompt from the tenth window of a 256k one.
     // 4k prefill and both cross-model guards at short context stay on the RQH=3 tile they had.
+    // Minimum query rows for the six-head tier below (past its span floor). A resumed pass over a
+    // long history -- an agent turn's few-thousand-token delta, split further at prefix-cache
+    // checkpoints -- is mostly under 2048 rows, and on the RQH=2 tier each 16-row query tile
+    // streams the whole history out of L2 three times as often. Measured on an opencode turn's
+    // ~2k-token deltas over 19-21k: first token 0.8 -> 0.7 s at 1024; at 256 a 7k delta lost
+    // (1.7 -> 2.3 s: the V pack plane is rebuilt over the whole history every pass).
+    // SPARKINFER_PREFILL_ATTN_WIDE_MINN=2048 restores the previous floor.
+    static const int wide_minn = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_WIDE_MINN");
+        const int v = e ? atoi(e) : 1024;
+        return v < 1 ? 1 : v;
+    }();
+    const long span = (long)q_pos0 + n_tokens;
+    const int minn6 = wide_minn;
     if (gqa_rqh >= 3 && gqa % 6 == 0 && wide_minkeys > 0 &&
-        (long)q_pos0 + n_tokens >= wide_minkeys && n_tokens >= 2048 && gqa_gb >= 16) {
+        span >= wide_minkeys && n_tokens >= minn6 && gqa_gb >= 16) {
         // Every key this pass reads lives below q_pos0 + n_tokens, so that is the plane.
         const int n_blk = (q_pos0 + n_tokens + 15) / 16;
         const signed char* vt =

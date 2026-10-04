@@ -18,6 +18,7 @@
 // so the ordering the math depends on is still a single chain -- but anything added here has to
 // respect those forks, and anything captured into the decode graph has to capture them too.
 
+#include "sparkinfer/pinned_pool.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
@@ -7039,10 +7040,9 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
                             s.linear_qkvdim * sizeof(bf16);
-    void* host = nullptr;
-    if (cudaHostAlloc(&host, st_bytes + cv_bytes, cudaHostAllocDefault) != cudaSuccess || !host)
-        return false;
-    std::shared_ptr<void> owned(host, [](void* p) { cudaFreeHost(p); });
+    std::shared_ptr<void> owned = pinned_pool_get(st_bytes + cv_bytes);
+    if (!owned) return false;
+    void* host = owned.get();
     // Prefill may still have work queued on any of the model's streams; the state is final only
     // once all of it has run.
     cudaDeviceSynchronize();

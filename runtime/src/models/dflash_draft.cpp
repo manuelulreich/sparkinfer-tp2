@@ -1,4 +1,5 @@
 // DFlash draft runtime: safetensors load + GGUF load + block-parallel forward.
+#include "sparkinfer/pinned_pool.h"
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
@@ -1743,12 +1744,9 @@ bool DFlashDraftModel::kv_snapshot_local(int lo, int hi, KvSnapshot& out) {
     const size_t kvdim = (size_t)s.cfg.n_kv_heads * s.cfg.head_dim;
     const size_t rows = (size_t)(hi - lo), plane = rows * kvdim * sizeof(bf16);
     const size_t bytes = plane * 2 * s.cfg.n_layers;
-    void* host = nullptr;
-    if (cudaHostAlloc(&host, bytes, cudaHostAllocDefault) != cudaSuccess || !host) {
-        cudaGetLastError();
-        return false;
-    }
-    std::shared_ptr<void> owned(host, [](void* p) { cudaFreeHost(p); });
+    std::shared_ptr<void> owned = pinned_pool_get(bytes);
+    if (!owned) return false;
+    void* host = owned.get();
     cudaStream_t st = s.tp_stream ? s.tp_stream : s.stream;
     if (s.tp_stream) cudaStreamSynchronize(s.stream);
     const size_t off = (size_t)(lo - s.kv_base) * kvdim;

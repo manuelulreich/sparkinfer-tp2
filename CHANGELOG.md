@@ -215,6 +215,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **Agent turns: faster prefill of small deltas over a long history.** (1) The six-head prefill
+  attention tier now takes passes from 1024 query rows (was 2048) once the span passes its 16k
+  floor: an agent turn's 1-2k-token delta, split further at prefix-cache checkpoints, ran the
+  two-head tier, whose 16-row query tiles each streamed the whole history out of L2 three times as
+  often (opencode turn, ~2k new tokens over 19k: attention 272 -> 193 ms;
+  `SPARKINFER_PREFILL_ATTN_WIDE_MINN` sets the floor). (2) The prefix cache's snapshots (recurrent
+  state, draft KV) take pinned buffers from a pool that a background thread keeps ahead of use,
+  instead of a 15-35 ms cudaHostAlloc each on the critical path (~50 ms a turn). Such a turn's
+  prefill span 768 -> 680 ms.
+
 - **tp=2 verify: the out / o / down all-reduces overlap their GEMM.** Each H-wide projection of
   the tensor-core verify whose output is all-reduced runs in two column halves; the first half's
   all-reduce (flag kernel, on a high-priority side stream) crosses the link while the second half
