@@ -67,6 +67,23 @@ Found and fixed first (not in the plan above): the NVFP4 head release, the top-k
 quadratic streaming. Step at 20k 31.3 -> 28.7 ms, 100 -> 114-117 tok/s. The grammar masks cost
 0.17 ms a step; the host merge of the draft candidates 8 us (R1 is worth little).
 
+**D3 status: tried, net loss, reverted (2026-10-04).** The 8-bit wire inside the flag kernel
+(`SPARKINFER_TP_AR_WIRE_DECODE`): verify 25.1 -> 24.5 ms, but acceptance fell 3.2-3.3 -> 2.9-3.1
+tokens a step (the lossy sums move the target away from what the drafter predicts), 112-116 ->
+102-109 tok/s. The link moves only ~9 us of a ~20 us decode all-reduce; the two cards start it
+within ~1 us of each other (no skew), so the rest is fence + flag latency and the reduce.
+
+**L1 status: done differently (2026-10-04).** The verify's nvfp4 attention ran the single-row
+kernel per row (8 KV reads per call). `fa_split_gqa_mma_nvfp4_rows_kernel` serves a session's rows
+in one CTA (bit-identical, checked in place); 60k verify 28.8 -> 27.5 ms, 20k -0.3 ms. Still
+latency-bound (125 us a call at 20k against ~26 us of KV bytes): a split's groups run one after
+another, and the split partition is fixed by plain decode's (exactness), so 16 warps a CTA or
+4-row groups measured no better.
+
+**L2 status: fixed (2026-10-04).** The nvfp4/fp8 losslessness gap was the e4m3 prefill
+attention reading 16 never-written P' columns (odd page x zero B: NaN for e4m3 garbage). Same
+prompt, 5 requests, 5 different first-token distributions; now 1. nvfp4 gates pass.
+
 ## D. Decode all-reduce (lossless first)
 
 - **D1. Fuse the receive with what follows** (lossless). After every all-reduce come the residual

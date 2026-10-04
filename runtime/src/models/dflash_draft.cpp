@@ -709,7 +709,7 @@ struct DFlashDraftModel::Impl {
     // DFlash2 (cfg.dflash2). Per layer, the attention's and the MLP's grouped convolution:
     // base [2, taps, H] and kernel_projection [2 * taps * H / group, H], bf16, whole on every rank
     // (the convolution runs on the full hidden state, which both ranks hold).
-    struct D2Conv { bf16* base = nullptr; bf16* proj = nullptr; };
+    struct D2Conv { bf16* base = nullptr; bf16* proj = nullptr; void* proj_nv = nullptr; };
     std::vector<D2Conv> d2_attn, d2_mlp;
     // Candidate selector (rank 0): hidden_projection [rank, H], codebooks [vocab, rank].
     bf16* d2_hproj = nullptr;
@@ -1416,7 +1416,11 @@ struct DFlashDraftModel::Impl {
     // width) into d2_coef, and its first side on x into d2_cv.
     void d2_prepare(const D2Conv& cv, const bf16* x, int rows, int block, cudaStream_t st) {
         const int H = cfg.hidden, nc = 2 * cfg.conv_taps * (H / cfg.conv_group);
-        dflash_kernels::launch_gemv_batched16(x, cv.proj, d2_coef, nc, H, st, rows);
+        if (cv.proj_nv)
+            nv_proj(x, nullptr, rows, H, cv.proj_nv, d2_coef, nc, nullptr, nullptr, 0, nullptr,
+                    nullptr, 0, st);
+        else
+            dflash_kernels::launch_gemv_batched16(x, cv.proj, d2_coef, nc, H, st, rows);
         dflash_kernels::launch_dflash2_conv(x, d2_coef, cv.base, d2_cv, rows, block, H,
                                             cfg.conv_group, cfg.conv_taps, 0, st);
     }
@@ -2085,6 +2089,14 @@ bool DFlashDraftModel::load(const std::string& dir) {
                 }
                 cv.base = s.upload(*b);
                 cv.proj = s.upload(*p);
+                static const bool conv_nv = [] {
+                    const char* e = getenv("SPARKINFER_DFLASH2_CONV_NVFP4");
+                    return e && e[0] == '1';
+                }();
+                if (conv_nv && s.nv_on) {
+                    cv.proj_nv = s.quant_nvfp4_payload(cv.proj, nc, H);
+                    if (cv.proj_nv) cv.proj = nullptr;
+                }
                 return true;
             };
             s.d2_attn.resize(s.cfg.n_layers);

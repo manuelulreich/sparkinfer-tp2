@@ -977,6 +977,7 @@ struct Qwen35Model::Impl {
     const int** h_vr_ma_tptr = nullptr;    // pinned twin
     int *vr_ma_tab = nullptr, *vr_ma_tab_win = nullptr;   // [R][max_blocks]
     int *vr_ma_pairs = nullptr, *h_vr_ma_pairs = nullptr;   // [2R]: row pairs of one session (B1)
+    int *vr_ma_grp = nullptr, *h_vr_ma_grp = nullptr;       // [8R]: nvfp4 row groups (plan 10)
     float *vr_ma_m = nullptr, *vr_ma_l = nullptr, *vr_ma_acc = nullptr;
     // (dual-GPU C2) Segmented multi-session verify: one GDN snapshot per segment (session),
     // grown on demand, agreed across the ranks, released when the group run ends.
@@ -4204,6 +4205,9 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                   cudaMalloc(&s.vr_ma_pairs, (size_t)2 * R * sizeof(int)) == cudaSuccess &&
                   cudaHostAlloc(&s.h_vr_ma_pairs, (size_t)2 * R * sizeof(int),
                                 cudaHostAllocDefault) == cudaSuccess &&
+                  cudaMalloc(&s.vr_ma_grp, (size_t)8 * R * sizeof(int)) == cudaSuccess &&
+                  cudaHostAlloc(&s.h_vr_ma_grp, (size_t)8 * R * sizeof(int),
+                                cudaHostAllocDefault) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_m, fa * sizeof(float)) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_l, fa * sizeof(float)) == cudaSuccess &&
                   cudaMalloc(&s.vr_ma_acc, fa * HD * sizeof(float)) == cudaSuccess;
@@ -4211,7 +4215,7 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
         s.vr_ma_state = ok ? 1 : -1;
     }
     if (ma && s.vr_ma_state != 1) ma = false;
-    int ma_maxlen = 0, ma_pairs = 0;
+    int ma_maxlen = 0, ma_pairs = 0, ma_groups = 0, ma_grp_rows = 0;
     if (ma) {
         for (int r = 0; r < n; r++) {
             s.h_vr_ma_tptr[r] = s.kv->block_table(row_kv[r]);
@@ -4241,6 +4245,49 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                cudaMemcpyHostToDevice, st), "tp rows attn pairs");
         else
             ma_pairs = 0;
+        // (plan 10) nvfp4: the rows of one session with one split size in groups of up to 8,
+        // for launch_flash_decode_split_rows_nvfp4 (one K/V read a group). Only when every row
+        // takes the tensor-core kernel on its own (more than 512 keys and a split of 32+), which is
+        // what ordinary decode runs for it; otherwise the rows keep the per-row path.
+        static const int kRowsGroupMax = [] {
+            const char* e = getenv("SPARKINFER_FA_ROWS_GROUP");
+            return (e && atoi(e) == 4) ? 4 : 8;
+        }();
+        if (s.kv->kv_dtype() == 3) {
+            bool all_mma = true;
+            for (int r = 0; r < n && all_mma; r++) {
+                const int len = pos_of(r) + 1;
+                all_mma = len > 512 && (len + s.n_splits - 1) / s.n_splits >= 32;
+            }
+            int largest = 0;
+            bool grouped[kTpVerifyRows] = {};
+            std::vector<std::vector<int>> gl;
+            for (int r = 0; r < n && all_mma; r++) {
+                if (grouped[r]) continue;
+                const int chunk = (pos_of(r) + 1 + s.n_splits - 1) / s.n_splits;
+                std::vector<int> cur;
+                for (int r2 = r; r2 < n; r2++) {
+                    if (grouped[r2] || row_kv[r2] != row_kv[r] ||
+                        (pos_of(r2) + 1 + s.n_splits - 1) / s.n_splits != chunk)
+                        continue;
+                    grouped[r2] = true;
+                    cur.push_back(r2);
+                    if ((int)cur.size() == kRowsGroupMax) { gl.push_back(cur); cur.clear(); }
+                }
+                if (!cur.empty()) gl.push_back(cur);
+            }
+            for (const auto& gr : gl) largest = std::max(largest, (int)gr.size());
+            if (all_mma && !gl.empty()) {
+                ma_grp_rows = largest > 4 ? 8 : 4;
+                for (size_t gi = 0; gi < gl.size(); gi++)
+                    for (int i = 0; i < ma_grp_rows; i++)
+                        s.h_vr_ma_grp[gi * ma_grp_rows + i] = i < (int)gl[gi].size() ? gl[gi][i] : -1;
+                ma_groups = (int)gl.size();
+                cu(cudaMemcpyAsync(s.vr_ma_grp, s.h_vr_ma_grp,
+                                   (size_t)ma_groups * ma_grp_rows * sizeof(int),
+                                   cudaMemcpyHostToDevice, st), "tp rows attn groups");
+            }
+        }
     }
 
     // DSpark capture (end of each layer below): the leader's, or with a split capture
@@ -4342,7 +4389,13 @@ int Qwen35Model::tp_rows_forward(const int* ids, int n, int start_pos, const int
                                                            (bf16*)vpool, tab, s.vr_pos, n, n_q, n_kv,
                                                            HD, c.rope_dim, c.rope_theta,
                                                            s.kv->block_size(), mbs, st);
-                if (!(ma_pairs > 0 && !w.swa &&
+                if (!(ma_groups > 0 && !w.swa &&
+                      kernels::launch_flash_decode_split_rows_nvfp4(
+                          s.vr_q, kpool, vpool, tab, s.vr_seq, s.vr_ma_grp, ma_groups, ma_grp_rows,
+                          s.vr_attn, s.vr_ma_m, s.vr_ma_l, s.vr_ma_acc, n, n_q, n_kv, HD,
+                          s.kv->block_size(), s.n_splits, mbs, 1.f / sqrtf((float)HD), st, kscale,
+                          vscale)) &&
+                    !(ma_pairs > 0 && !w.swa &&
                       kernels::launch_flash_decode_split_pairs(
                           s.vr_q, kpool, vpool, tab, s.vr_seq, s.vr_ma_pairs, ma_pairs, s.vr_attn,
                           s.vr_ma_m, s.vr_ma_l, s.vr_ma_acc, n, n_q, n_kv, HD, s.kv->block_size(),

@@ -901,10 +901,17 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                         // roundf is ties-away-from-zero and lowers to a five-instruction sequence
                         // for a quantum that is already a per-row estimate. The bf16 sibling
                         // kernel has always quantized P' this way.
+                        // The odd page of a causally cut group (see the PV loop) is retired by a
+                        // k=32 mma whose upper 16 P' columns lie past the group: they are written
+                        // too (their scores are masked, so they quantize to 0). Left as whatever
+                        // shared memory held, they were multiplied by a zero B operand -- exact
+                        // for int8 codes, but an e4m3 NaN/Inf byte times zero is NaN, and the fp8
+                        // and nvfp4 prefill changed from one identical request to the next.
+                        const int pcols = ((gblk + 1) & ~1) * 16;
                         #pragma unroll
                         for (int v = 0; v < VU; v++) {
                             const int t0 = (v * 32 + lane) * VW;
-                            if (FULL || t0 < gblk * 16) {
+                            if (FULL || t0 < pcols) {
                                 unsigned packed = 0u;
                                 #pragma unroll
                                 for (int j = 0; j < VW; j++) {

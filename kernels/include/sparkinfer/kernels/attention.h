@@ -231,6 +231,18 @@ bool launch_flash_decode_split_pairs(
     int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream,
     int seqlen, const void* k_scale, const void* v_scale, int kv_format);
 
+// (plan 10) The verify's long-context nvfp4 split for groups of up to group_rows (4 or 8) rows of
+// one session with one split size (groups[g * group_rows + i], -1 = none): one K/V read for
+// the group, bit-identical to fa_split_gqa_mma_nvfp4_kernel on each row (SPARKINFER_FA_ROWS_CHECK=1
+// verifies that in place). False (nothing launched) when not applicable. Then the combine.
+bool launch_flash_decode_split_rows_nvfp4(
+    const void* q, const void* k_pool, const void* v_pool,
+    const int* block_table, const int* seq_lens, const int* groups, int n_groups, int group_rows,
+    void* out, float* part_m, float* part_l, float* part_acc,
+    int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
+    int block_size, int n_splits, int max_blocks, float scale, cudaStream_t stream,
+    const void* k_scale, const void* v_scale);
+
 void launch_flash_decode_split_sparse(const void* q, const void* k_pool_layer, const void* v_pool_layer,
     const int* block_table, const int* seq_lens, const int* sel_blk, float* part_m, float* part_l,
     float* part_acc, int num_q_heads, int num_kv_heads, int head_dim, int block_size, int max_blocks,

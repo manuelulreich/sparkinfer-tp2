@@ -17,6 +17,7 @@
 // Portable CUDA — sm_89/90/100/120, the set CMAKE_CUDA_ARCHITECTURES builds; sm_121 is excluded.
 
 #include <cuda_bf16.h>
+#include <cstdio>
 #include <cuda_fp16.h>
 #include <climits>
 #include <type_traits>
@@ -1819,6 +1820,329 @@ __global__ void __launch_bounds__(256, (GQA <= 8) ? 3 : 2) fa_split_gqa_mma_nvfp
         part_m[idx] = s_m[tid]; part_l[idx] = s_l[tid];
     }
 }
+// SPARKINFER_FA_ROWS_CHECK: bitwise comparison of two partial sets over the live splits.
+__global__ void fa_rows_cmp_kernel(const float* m0, const float* l0, const float* a0, const float* m1,
+                                   const float* l1, const float* a1, int num_seqs, int num_q_heads,
+                                   int n_splits, const int* seq_lens, unsigned* bad) {
+    const size_t nm = (size_t)num_seqs * num_q_heads * n_splits;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < nm * 257; i += (size_t)gridDim.x * blockDim.x) {
+        const size_t idx = i < nm * 256 ? i / 256 : i - nm * 256;
+        const int seq = (int)(idx / ((size_t)num_q_heads * n_splits)), split = (int)(idx % n_splits);
+        const int sl = seq_lens[seq], chunk = (sl + n_splits - 1) / n_splits;
+        if (split * chunk >= sl) continue;           // an empty split's partials are never read
+        unsigned x, y;
+        if (i < nm * 256) { x = __float_as_uint(a0[i]); y = __float_as_uint(a1[i]); }
+        else { x = __float_as_uint(m0[idx]) ^ __float_as_uint(l0[idx]); y = __float_as_uint(m1[idx]) ^ __float_as_uint(l1[idx]); }
+        if (x != y && !((x | y) == 0x80000000u)) {
+            const unsigned k = atomicAdd(bad, 1u);
+            if (k == 0) { bad[1] = (unsigned)seq; bad[2] = (unsigned)split; bad[3] = i < nm * 256 ? 0u : 1u;
+                          bad[4] = (unsigned)((idx / n_splits) % num_q_heads); bad[5] = x; bad[6] = y; }
+        }
+    }
+}
+
+// (plan 10) fa_split_gqa_mma_nvfp4_kernel for up to R verify rows of ONE session per CTA. Each
+// (row, q head) is a "virtual head": the GQA*R of them are the mma's N columns, so the group's K
+// and V are read and decoded once for every row instead of once per row. A column of an mma does
+// not depend on the other columns, and every row keeps its own causal end inside the shared
+// split range (its scores past its end are masked; its P' there is 0, so the V rows it now sees
+// add exact zeros), so each row's partials are bit-identical to the single-row kernel's. The
+// rows of a group share one block table and one split size (ceil(len / n_splits)); the
+// launcher forms such groups. Dynamic shared memory (~82 KB at R = 8).
+template <int HEAD_DIM, int GQA, int R>
+__global__ void __launch_bounds__(512, 1) fa_split_gqa_mma_nvfp4_rows_kernel(
+    const __nv_bfloat16* __restrict__ q, const unsigned char* __restrict__ k_pool,
+    const unsigned char* __restrict__ v_pool, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens, const int* __restrict__ groups,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    float scale, int num_q_heads, int num_kv_heads, int max_blocks, int n_splits,
+    const __half* __restrict__ k_scale, const __half* __restrict__ v_scale
+) {
+    static_assert(HEAD_DIM == 256, "8 warps x 32 output dims, 4 lanes x 64 QK dims");
+    constexpr int GV = GQA * R;                      // virtual heads
+    constexpr int ROWB = HEAD_DIM / 16 * 9;
+    constexpr int CH = ROWB / 16;
+    constexpr int NQT = (GV + 7) / 8;
+    constexpr int PR = NQT * 8;
+    // 16 warps: half hb = warp / 8 takes the mma column tiles [hb * NTH, hb * NTH + NTH) in QK and
+    // PV, and every row's softmax runs on one warp as before (rows spread over all 16).
+    constexpr int NTH = (NQT + 1) / 2;
+    constexpr int RPW = (GV + 15) / 16;              // softmax rows per warp
+    constexpr int SLD = 128 + 4;
+    const int grp = blockIdx.y, split = blockIdx.x % n_splits, kvh = blockIdx.x / n_splits;
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const int warp = wid & 7, hb = wid >> 3, nq0 = hb * NTH;
+    const int g = lane >> 2, c = lane & 3;
+
+    extern __shared__ __align__(16) unsigned char fa_rows_smem[];
+    uint2 (*s_qf)[NQT][32] = reinterpret_cast<uint2 (*)[NQT][32]>(fa_rows_smem);
+    float (*s_s)[SLD] = reinterpret_cast<float (*)[SLD]>(fa_rows_smem + (size_t)(HEAD_DIM / 16) * NQT * 32 * 8);
+    __half (*s_p)[128] = reinterpret_cast<__half (*)[128]>(
+        reinterpret_cast<unsigned char*>(s_s) + (size_t)GV * SLD * 4);
+    unsigned char* s_v = reinterpret_cast<unsigned char*>(s_p) + (size_t)PR * 128 * 2;
+    float* s_ks = reinterpret_cast<float*>(s_v + 128 * ROWB);
+    float* s_vs = s_ks + 128;
+    float* s_m = s_vs + 128;
+    float* s_l = s_m + PR;
+    float* s_corr = s_l + PR;
+    float* s_pd = s_corr + PR;
+    __shared__ int s_row[R], s_end[R];
+
+    if (tid < R) s_row[tid] = groups[grp * R + tid];
+    __syncthreads();
+    const int row0 = s_row[0];
+    const int chunk = (seq_lens[row0] + n_splits - 1) / n_splits;
+    const int start = split * chunk;
+    int end = start;
+    if (tid < R) {
+        const int rw = s_row[tid];
+        s_end[tid] = rw >= 0 ? min(seq_lens[rw], start + chunk) : start;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < R; i++) end = max(end, s_end[i]);
+
+    {   // Q -> f16 in s_s (as scratch), then into fragment order; virtual head v = slot * GQA + h
+        __half* qh = reinterpret_cast<__half*>(&s_s[0][0]);
+        static_assert(GV * HEAD_DIM * 2 <= GV * SLD * 4, "Q staging fits the score buffer");
+        for (int i = tid; i < GV * HEAD_DIM; i += blockDim.x) {
+            const int v = i / HEAD_DIM, d = i - v * HEAD_DIM, slot = v / GQA, h = v - slot * GQA;
+            const int rw = s_row[slot];
+            qh[i] = rw >= 0 ? __float2half(__bfloat162float(
+                                  q[((size_t)rw * num_q_heads + kvh * GQA + h) * HEAD_DIM + d]))
+                            : __float2half(0.f);
+        }
+        __syncthreads();
+        for (int e = tid; e < (HEAD_DIM / 16) * NQT * 32; e += blockDim.x) {
+            const int ln = e & 31, nq = (e >> 5) % NQT, ks = (e >> 5) / NQT;
+            const int r = nq * 8 + (ln >> 2), cc = ln & 3;
+            const int base = 64 * cc + 8 * (ks >> 1), h = ks & 1;
+            int l0, h0, l1, h1;
+            fa_nvfp4_pair(2 * h, l0, h0);
+            fa_nvfp4_pair(2 * h + 1, l1, h1);
+            auto pk = [&](int dl, int dh) -> unsigned {
+                if (r >= GV) return 0u;
+                const __half2 v = __halves2half2(qh[r * HEAD_DIM + base + dl], qh[r * HEAD_DIM + base + dh]);
+                return *reinterpret_cast<const unsigned*>(&v);
+            };
+            s_qf[ks][nq][ln] = make_uint2(pk(l0, h0), pk(l1, h1));
+        }
+    }
+    if (tid < PR) { s_m[tid] = -1e30f; s_l[tid] = 0.f; s_corr[tid] = 0.f; s_pd[tid] = 0.f; }
+    for (int i = tid; i < (PR - GV) * 128; i += blockDim.x) s_p[GV + i / 128][i % 128] = __float2half(0.f);
+    float o[NTH][2][4];
+    #pragma unroll
+    for (int nq = 0; nq < NTH; nq++)
+        #pragma unroll
+        for (int mt = 0; mt < 2; mt++) o[nq][mt][0] = o[nq][mt][1] = o[nq][mt][2] = o[nq][mt][3] = 0.f;
+    const float qk_scale = scale * 128.f;
+    __syncthreads();
+
+    const int first_blk = start / 16;
+    const int nblk = (end > start) ? ((end - 1) / 16 - first_blk + 1) : 0;
+    for (int g0 = 0; g0 < nblk; g0 += 8) {
+        const int gblk = min(8, nblk - g0);
+        const int gbase = (first_blk + g0) * 16;
+        const int* bt = block_table + row0 * max_blocks + first_blk + g0;
+        __syncthreads();
+        for (int i = tid; i < gblk * 16 * CH; i += blockDim.x) {
+            const int tok = i / CH, ch = i - tok * CH, gtok = gbase + tok;
+            unsigned char* dst = s_v + tok * ROWB + ch * 16;
+            if (gtok >= start && gtok < end) {
+                const size_t row = (size_t)(bt[tok >> 4] * 16 + (tok & 15)) * num_kv_heads + kvh;
+                fa_cp_async16(dst, v_pool + row * ROWB + ch * 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+        for (int j = tid; j < gblk * 16; j += blockDim.x) {
+            const size_t si = (size_t)(bt[j >> 4] * 16 + (j & 15)) * num_kv_heads + kvh;
+            s_ks[j] = __half2float(k_scale[si]);
+            s_vs[j] = __half2float(v_scale[si]);
+        }
+        if (warp < gblk) {
+            const int pb = bt[warp];
+            uint4 kc[2][2];
+            unsigned ksc[2];
+            #pragma unroll
+            for (int tr = 0; tr < 2; tr++) {
+                const size_t row = ((size_t)(pb * 16 + tr * 8 + g)) * num_kv_heads + kvh;
+                const unsigned char* kr = k_pool + row * ROWB;
+                kc[tr][0] = __ldg(reinterpret_cast<const uint4*>(kr + 32 * c));
+                kc[tr][1] = __ldg(reinterpret_cast<const uint4*>(kr + 32 * c + 16));
+                ksc[tr] = __ldg(reinterpret_cast<const unsigned*>(kr + HEAD_DIM / 2 + 4 * c));
+            }
+            float acc[NTH][2][4];
+            #pragma unroll
+            for (int nq = 0; nq < NTH; nq++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) acc[nq][h][0] = acc[nq][h][1] = acc[nq][h][2] = acc[nq][h][3] = 0.f;
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                __half2 sc[2];
+                #pragma unroll
+                for (int tr = 0; tr < 2; tr++)
+                    sc[tr] = fa_nvfp4_scale_h2(__byte_perm(ksc[tr], 0u, 0x4040u | (s << 8) | s));
+                #pragma unroll
+                for (int mm = 0; mm < 2; mm++) {
+                    const int m = 2 * s + mm;
+                    unsigned w[2][4];
+                    #pragma unroll
+                    for (int tr = 0; tr < 2; tr++) {
+                        const uint4 kv = kc[tr][m >> 2];
+                        const unsigned wm = (m & 3) == 0 ? kv.x : (m & 3) == 1 ? kv.y : (m & 3) == 2 ? kv.z : kv.w;
+                        fa_e2m1x8_h2x4(wm, sc[tr], w[tr]);
+                    }
+                    const unsigned aA[4] = {w[0][0], w[1][0], w[0][1], w[1][1]};
+                    const unsigned aB[4] = {w[0][2], w[1][2], w[0][3], w[1][3]};
+                    #pragma unroll
+                    for (int nq = 0; nq < NTH; nq++) {
+                        if (nq0 + nq >= NQT) break;
+                        const uint2 qa = s_qf[2 * m][nq0 + nq][lane];
+                        const unsigned b[2] = {qa.x, qa.y};
+                        fa_mma_f16(acc[nq][0], aA, b);
+                    }
+                    #pragma unroll
+                    for (int nq = 0; nq < NTH; nq++) {
+                        if (nq0 + nq >= NQT) break;
+                        const uint2 qb = s_qf[2 * m + 1][nq0 + nq][lane];
+                        const unsigned b[2] = {qb.x, qb.y};
+                        fa_mma_f16(acc[nq][1], aB, b);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int nq = 0; nq < NTH; nq++) {
+                const int q0 = (nq0 + nq) * 8 + 2 * c, col = warp * 16 + g;
+                if (q0 < GV) {
+                    s_s[q0][col]     = acc[nq][0][0] + acc[nq][1][0];
+                    s_s[q0][col + 8] = acc[nq][0][2] + acc[nq][1][2];
+                }
+                if (q0 + 1 < GV) {
+                    s_s[q0 + 1][col]     = acc[nq][0][1] + acc[nq][1][1];
+                    s_s[q0 + 1][col + 8] = acc[nq][0][3] + acc[nq][1][3];
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int rr = 0; rr < RPW; rr++) {
+            const int r = wid * RPW + rr;
+            if (r >= GV) break;                      // warp-uniform
+            const int rend = s_end[r / GQA];         // this row's causal end
+            float sc[4], mx = -1e30f;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int t = lane + u * 32, gtok = gbase + t;
+                sc[u] = (t < gblk * 16 && gtok >= start && gtok < rend) ? s_s[r][t] * s_ks[t] * qk_scale : -1e30f;
+                mx = fmaxf(mx, sc[u]);
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+            const float m_old = s_m[r], m_new = fmaxf(m_old, mx), corr = __expf(m_old - m_new);
+            float pv[4], sum = 0.f, pamax = 0.f;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                pv[u] = 0.f;
+                if (sc[u] > -1e29f) {
+                    const float p = __expf(sc[u] - m_new);
+                    sum += p; pv[u] = p * s_vs[lane + u * 32]; pamax = fmaxf(pamax, fabsf(pv[u]));
+                }
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                sum += __shfl_xor_sync(0xffffffff, sum, off);
+                pamax = fmaxf(pamax, __shfl_xor_sync(0xffffffff, pamax, off));
+            }
+            const float inv = pamax > 0.f ? 1.f / pamax : 0.f;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int t = lane + u * 32, tt = t & 15;
+                s_p[r][(t & ~15) | ((tt & 3) << 2) | (tt >> 2)] = __float2half(pv[u] * inv);
+            }
+            if (lane == 0) { s_m[r] = m_new; s_l[r] = s_l[r] * corr + sum; s_corr[r] = corr; s_pd[r] = pamax * 128.f; }
+        }
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        __syncthreads();
+        {
+            float acc[NTH][2][4];
+            #pragma unroll
+            for (int nq = 0; nq < NTH; nq++)
+                #pragma unroll
+                for (int mt = 0; mt < 2; mt++) acc[nq][mt][0] = acc[nq][mt][1] = acc[nq][mt][2] = acc[nq][mt][3] = 0.f;
+            const unsigned char* vb = s_v + c * ROWB + 16 * warp + 2 * g;
+            const unsigned char* vs = s_v + c * ROWB + HEAD_DIM / 2 + 2 * warp + (g >> 2);
+            #pragma unroll 4
+            for (int kb = 0; kb < gblk; kb++) {
+                unsigned n[4], sb[4];
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    n[r]  = *reinterpret_cast<const unsigned short*>(vb + (kb * 16 + 4 * r) * ROWB);
+                    sb[r] = vs[(kb * 16 + 4 * r) * ROWB];
+                }
+                unsigned w01[4], w23[4];
+                fa_e2m1_tok2_h2x4(n[0], n[1], fa_nvfp4_scale_h2(sb[0] | (sb[1] << 16)), w01);
+                fa_e2m1_tok2_h2x4(n[2], n[3], fa_nvfp4_scale_h2(sb[2] | (sb[3] << 16)), w23);
+                const unsigned a0[4] = {w01[0], w01[1], w23[0], w23[1]};
+                const unsigned a1[4] = {w01[2], w01[3], w23[2], w23[3]};
+                #pragma unroll
+                for (int nq = 0; nq < NTH; nq++) {
+                    if (nq0 + nq >= NQT) break;
+                    const uint2 pa = *reinterpret_cast<const uint2*>(&s_p[(nq0 + nq) * 8 + g][kb * 16 + c * 4]);
+                    const unsigned b[2] = {pa.x, pa.y};
+                    fa_mma_f16(acc[nq][0], a0, b);
+                    fa_mma_f16(acc[nq][1], a1, b);
+                }
+            }
+            #pragma unroll
+            for (int nq = 0; nq < NTH; nq++) {
+                if (nq0 + nq >= NQT) break;
+                const int q0 = (nq0 + nq) * 8 + 2 * c;
+                const float c0 = s_corr[q0], c1 = s_corr[q0 + 1], p0 = s_pd[q0], p1 = s_pd[q0 + 1];
+                #pragma unroll
+                for (int mt = 0; mt < 2; mt++) {
+                    o[nq][mt][0] = o[nq][mt][0] * c0 + acc[nq][mt][0] * p0;
+                    o[nq][mt][1] = o[nq][mt][1] * c1 + acc[nq][mt][1] * p1;
+                    o[nq][mt][2] = o[nq][mt][2] * c0 + acc[nq][mt][2] * p0;
+                    o[nq][mt][3] = o[nq][mt][3] * c1 + acc[nq][mt][3] * p1;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int nq = 0; nq < NTH; nq++) {
+        if (nq0 + nq >= NQT) break;
+        #pragma unroll
+        for (int e = 0; e < 2; e++) {
+            const int v = (nq0 + nq) * 8 + 2 * c + e;
+            if (v < GV) {
+                const int slot = v / GQA, rw = s_row[slot];
+                if (rw >= 0) {
+                    const int idx = (rw * num_q_heads + kvh * GQA + (v - slot * GQA)) * n_splits + split;
+                    *reinterpret_cast<float4*>(&part_acc[(size_t)idx * HEAD_DIM + warp * 32 + 4 * g]) =
+                        make_float4(o[nq][0][e], o[nq][0][e + 2], o[nq][1][e], o[nq][1][e + 2]);
+                }
+            }
+        }
+    }
+    for (int v = tid; v < GV; v += blockDim.x) {
+        const int slot = v / GQA, rw = s_row[slot];
+        if (rw >= 0) {
+            const int idx = (rw * num_q_heads + kvh * GQA + (v - slot * GQA)) * n_splits + split;
+            part_m[idx] = s_m[v]; part_l[idx] = s_l[v];
+        }
+    }
+}
+
+template <int HEAD_DIM, int GQA, int R>
+static size_t fa_rows_smem_bytes() {
+    constexpr int GV = GQA * R, NQT = (GV + 7) / 8, PR = NQT * 8, ROWB = HEAD_DIM / 16 * 9;
+    return (size_t)(HEAD_DIM / 16) * NQT * 32 * 8 + (size_t)GV * (128 + 4) * 4 + (size_t)PR * 128 * 2 +
+           (size_t)128 * ROWB + 256 * 4 + (size_t)4 * PR * 4;
+}
+
 template <int NW>
 static inline void fa_launch_combine(
     const float* part_m, const float* part_l, const float* part_acc,
@@ -3004,6 +3328,97 @@ bool launch_flash_decode_split_pairs(
         reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens, pairs,
         part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, n_splits,
         reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+    fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                     num_q_heads, n_splits, nullptr, num_seqs, stream);
+    return true;
+}
+
+bool launch_flash_decode_split_rows_nvfp4(
+    const void* q, const void* k_pool, const void* v_pool,
+    const int* block_table, const int* seq_lens, const int* groups, int n_groups, int group_rows,
+    void* out, float* part_m, float* part_l, float* part_acc,
+    int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
+    int block_size, int n_splits, int max_blocks, float scale, cudaStream_t stream,
+    const void* k_scale, const void* v_scale
+) {
+    static int env = -1;
+    if (env < 0) { const char* e = getenv("SPARKINFER_FA_ROWS"); env = (e && e[0] == '0') ? 0 : 1; }
+    if (!env || head_dim != 256 || block_size != 16 || num_kv_heads <= 0 ||
+        num_q_heads != num_kv_heads * 6 || n_groups <= 0 || (group_rows != 4 && group_rows != 8))
+        return false;
+    constexpr int GQA = 6;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    static int cfg4[16] = {0}, cfg8[16] = {0};
+    dim3 g(num_kv_heads * n_splits, n_groups);
+    auto launch = [&](auto rtag, int* cfg) -> bool {
+        constexpr int RR = decltype(rtag)::value;
+        const size_t sm = fa_rows_smem_bytes<256, GQA, RR>();
+        if (cfg[dev] == 0)
+            cfg[dev] = cudaFuncSetAttribute(fa_split_gqa_mma_nvfp4_rows_kernel<256, GQA, RR>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)sm) == cudaSuccess ? 1 : -1;
+        if (cfg[dev] < 0) { cudaGetLastError(); return false; }
+        fa_split_gqa_mma_nvfp4_rows_kernel<256, GQA, RR><<<g, 512, sm, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const unsigned char*>(k_pool),
+            reinterpret_cast<const unsigned char*>(v_pool), block_table, seq_lens, groups,
+            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, max_blocks, n_splits,
+            reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+        return cudaPeekAtLastError() == cudaSuccess;
+    };
+    const bool ok = group_rows == 8 ? launch(std::integral_constant<int, 8>{}, cfg8)
+                                    : launch(std::integral_constant<int, 4>{}, cfg4);
+    if (!ok) { cudaGetLastError(); return false; }
+    // SPARKINFER_FA_ROWS_CHECK=1: also run the single-row kernel into shadow partials and count
+    // bitwise mismatches (debug; synchronizes).
+    static int check = -1;
+    if (check < 0) { const char* e = getenv("SPARKINFER_FA_ROWS_CHECK"); check = (e && e[0] == '1') ? 1 : 0; }
+    if (check) {
+        static float *sm_m_[16] = {}, *sm_l_[16] = {}, *sm_acc_[16] = {};
+        static unsigned* d_bad_[16] = {};
+        static size_t cap_[16] = {};
+        static long calls_[16] = {}, bad_calls_[16] = {};
+        float*& sm_m = sm_m_[dev]; float*& sm_l = sm_l_[dev]; float*& sm_acc = sm_acc_[dev];
+        unsigned*& d_bad = d_bad_[dev];
+        long& calls = calls_[dev]; long& bad_calls = bad_calls_[dev];
+        const size_t nm = (size_t)num_seqs * num_q_heads * n_splits;
+        if (nm > cap_[dev]) {
+            cudaFree(sm_m); cudaFree(sm_l); cudaFree(sm_acc);
+            cudaMalloc(&sm_m, nm * 4); cudaMalloc(&sm_l, nm * 4); cudaMalloc(&sm_acc, nm * 256 * 4);
+            cap_[dev] = nm;
+        }
+        if (!d_bad) cudaMalloc(&d_bad, 32);
+        dim3 gq(num_kv_heads * n_splits, num_seqs);
+        fa_split_gqa_mma_nvfp4_kernel<256, GQA><<<gq, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const unsigned char*>(k_pool),
+            reinterpret_cast<const unsigned char*>(v_pool), block_table, seq_lens,
+            sm_m, sm_l, sm_acc, scale, num_q_heads, num_kv_heads, max_blocks, n_splits,
+            reinterpret_cast<const __half*>(k_scale), reinterpret_cast<const __half*>(v_scale));
+        cudaMemsetAsync(d_bad, 0, 32, stream);
+        fa_rows_cmp_kernel<<<256, 256, 0, stream>>>(part_m, part_l, part_acc, sm_m, sm_l, sm_acc,
+                                                     num_seqs, num_q_heads, n_splits, seq_lens, d_bad);
+        unsigned bd[8] = {};
+        cudaMemcpyAsync(bd, d_bad, 32, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        const unsigned bad = bd[0];
+        if (bad && bad_calls < 6) {
+            int hg[64] = {};
+            cudaMemcpy(hg, groups, (size_t)n_groups * group_rows * sizeof(int), cudaMemcpyDeviceToHost);
+            int hs[32] = {};
+            cudaMemcpy(hs, seq_lens, (size_t)num_seqs * sizeof(int), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[fa-rows check] first: seq %u split %u %s head %u got %08x want %08x | n_splits %d groups %d x %d:",
+                    bd[1], bd[2], bd[3] ? "m/l" : "acc", bd[4], bd[5], bd[6], n_splits, n_groups, group_rows);
+            for (int i = 0; i < n_groups * group_rows; i++) fprintf(stderr, " %d", hg[i]);
+            fprintf(stderr, " | lens");
+            for (int i = 0; i < num_seqs; i++) fprintf(stderr, " %d", hs[i]);
+            fprintf(stderr, "\n");
+        }
+        calls++;
+        if (bad) bad_calls++;
+        if (bad || calls % 500 == 0)
+            fprintf(stderr, "[fa-rows check] dev %d: %ld calls, %ld with mismatches (this call %u)\n",
+                    dev, calls, bad_calls, bad);
+    }
     fa_launch_combine_dispatch_hd256(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
                                      num_q_heads, n_splits, nullptr, num_seqs, stream);
     return true;

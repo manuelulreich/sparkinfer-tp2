@@ -35,6 +35,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **fp8 / nvfp4 KV: prefill was not deterministic, so speculation was not lossless with them.**
+  The e4m3 prefill attention (`pf_attn_mma_gqa_kernel<..., F8>`) retires the odd page of a
+  causally cut key group with a k=32 mma whose upper 16 P' columns lie past the group, against a
+  zero B operand. Those columns were never written: harmless with int8 codes (garbage x 0 = 0),
+  but an e4m3 NaN/Inf byte times zero is NaN, so the same prompt gave a different first token
+  from one request to the next (5 distinct logprob sets in 5 identical requests). The columns
+  are now written as zeros. tp2 gates with `SPARKINFER_KV_DTYPE=nvfp4`: determinism, batching
+  and DFlash2 losslessness all pass (before: 3 of 7 prompts differed). int8 unchanged.
+
 - **Streaming was quadratic in the output length, and split characters streamed a U+FFFD.**
   Every streamed token decoded the whole output twice (`ChatTokenizer::decode_delta`) on the
   engine thread, between decode steps: ~0.7 ms a step by 1.5k tokens of output and growing
@@ -195,6 +204,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   one card and two. Truncation is now ignored for packing at temperature 0.
 
 ### Performance
+
+- **tp=2 nvfp4 verify attention reads the KV once per session.** A verify with nvfp4 KV ran the
+  single-row split kernel once per row (8 reads of the whole KV for a DFlash2 block).
+  `fa_split_gqa_mma_nvfp4_rows_kernel` serves up to 8 rows of one session in a CTA, each (row,
+  q-head) a column of the mma, so every row's partials stay bit-identical to the single-row
+  kernel (checked in place, `SPARKINFER_FA_ROWS_CHECK=1`: 0 mismatches over 4,500 calls a card at
+  20k and 60k). Verify at 60k 28.8 -> 27.5 ms (86.7 -> ~100 tok/s), at 20k -0.3 ms.
+  `SPARKINFER_FA_ROWS=0` restores the per-row path.
 
 - **tp=2 decode with DFlash2: 100 -> 114-117 tok/s at 20k context (sampled, tools on).**
   - The verify and draft heads stay NVFP4: the 0.41 GB-a-card NVFP4 head copy was released on
