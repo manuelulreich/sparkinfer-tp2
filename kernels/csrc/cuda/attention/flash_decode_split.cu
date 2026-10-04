@@ -1944,6 +1944,21 @@ __global__ void __launch_bounds__(512, 1) fa_split_gqa_mma_nvfp4_rows_kernel(
         const int gblk = min(8, nblk - g0);
         const int gbase = (first_blk + g0) * 16;
         const int* bt = block_table + row0 * max_blocks + first_blk + g0;
+        // This group's K first: its loads are in flight while V is staged and the scales load
+        // (bench, 60k context: 233 -> 222 us a call).
+        uint4 kc[2][2];
+        unsigned ksc[2];
+        if (warp < gblk) {
+            const int pb = bt[warp];
+            #pragma unroll
+            for (int tr = 0; tr < 2; tr++) {
+                const size_t row = ((size_t)(pb * 16 + tr * 8 + g)) * num_kv_heads + kvh;
+                const unsigned char* kr = k_pool + row * ROWB;
+                kc[tr][0] = __ldg(reinterpret_cast<const uint4*>(kr + 32 * c));
+                kc[tr][1] = __ldg(reinterpret_cast<const uint4*>(kr + 32 * c + 16));
+                ksc[tr] = __ldg(reinterpret_cast<const unsigned*>(kr + HEAD_DIM / 2 + 4 * c));
+            }
+        }
         __syncthreads();
         for (int i = tid; i < gblk * 16 * CH; i += blockDim.x) {
             const int tok = i / CH, ch = i - tok * CH, gtok = gbase + tok;
@@ -1962,17 +1977,6 @@ __global__ void __launch_bounds__(512, 1) fa_split_gqa_mma_nvfp4_rows_kernel(
             s_vs[j] = __half2float(v_scale[si]);
         }
         if (warp < gblk) {
-            const int pb = bt[warp];
-            uint4 kc[2][2];
-            unsigned ksc[2];
-            #pragma unroll
-            for (int tr = 0; tr < 2; tr++) {
-                const size_t row = ((size_t)(pb * 16 + tr * 8 + g)) * num_kv_heads + kvh;
-                const unsigned char* kr = k_pool + row * ROWB;
-                kc[tr][0] = __ldg(reinterpret_cast<const uint4*>(kr + 32 * c));
-                kc[tr][1] = __ldg(reinterpret_cast<const uint4*>(kr + 32 * c + 16));
-                ksc[tr] = __ldg(reinterpret_cast<const unsigned*>(kr + HEAD_DIM / 2 + 4 * c));
-            }
             float acc[NTH][2][4];
             #pragma unroll
             for (int nq = 0; nq < NTH; nq++)
