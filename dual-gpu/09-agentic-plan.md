@@ -245,7 +245,8 @@ Original B5 reasoning:
 
 ### C. Prefill memory: reserve it, then size the KV pool
 
-- **C1. Reserve the prefill arena at startup.**
+- **C1. Reserve the prefill arena at startup.** Done 2026-10-04, with 4096-token windows
+  (see plan 10, "Fixed prefill reservation").
   - Reserve it for a chosen window (16384, fallback 8192) after weights and drafter, and size
     the KV pool from what remains.
   - Alternatively, refuse a `--ctx` that leaves no arena, as vLLM's profile run does.

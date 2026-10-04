@@ -5862,16 +5862,21 @@ bool prefill_samples_lmhead() {
 // the Qwythos dense-hybrid AND the Qwen3.6-35B-A3B MoE hybrid (dense_ffn=false, n_experts>0) — both
 // share the GDN + attention batched kernels; only the FFN differs. From position 0 only.
 bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
-    static int want_batched = -1, batched_maxctx = -1;
-    if (want_batched < 0) {
+    // Function-local statics with initializers, not a "< 0 means unset" check: at tp=2 both ranks'
+    // threads make their first call at once, and with the check one could see want_batched set
+    // while batched_maxctx still read -1 -- that rank then took the token loop while its peer ran
+    // the batched pass, and the ranks' collectives no longer paired up ("agreement out of step").
+    static const int want_batched = [] {
         const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
-        want_batched = (e && e[0] == '0') ? 0 : 1;
-        // 128k: the windowed prefill attention (#455) is O(N*window) and the FFN scratch is chunked
-        // (prefill_batched_run), so the batched pass now fits VRAM and stays flat ~18k pp up to 128k
-        // (vs the ~300 pp sequential fallback). Raised from 64k. SPARKINFER_PREFILL_BATCHED_MAXCTX overrides.
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    // 128k: the windowed prefill attention (#455) is O(N*window) and the FFN scratch is chunked
+    // (prefill_batched_run), so the batched pass now fits VRAM and stays flat ~18k pp up to 128k
+    // (vs the ~300 pp sequential fallback). Raised from 64k. SPARKINFER_PREFILL_BATCHED_MAXCTX overrides.
+    static const int batched_maxctx = [] {
         const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
-        batched_maxctx = mc ? atoi(mc) : 131072;
-    }
+        return mc ? atoi(mc) : 131072;
+    }();
     // dense hybrid (Qwythos) or the Qwen3.6 MoE hybrid — prefill_batched_run validates the
     // MoE requirements (256 experts, quantized experts + router) itself and returns -1 to
     // fall back if unsupported.

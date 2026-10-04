@@ -66,6 +66,18 @@ prompt, `startup.sh`, by pool size: 131k 3.7 / 13.8 s (20k / 60k), 262k 3.7 / 13
 Note: more free memory can change the prefill's window choices (16k windows where 8k were
 taken), which changes long-prompt output slightly -- the known "windows follow free memory".
 
+**Fixed prefill reservation (plan 09 C1).** At `--tp 2` prefill now runs fixed 4096-token
+windows out of scratch reserved at load (`SPARKINFER_PREFILL_RESERVE`): the warm-up takes
+~1.9 GB per card (arena 1,257 MB, the rest the nvfp4 history plane for a full context, GDN
+workspace and first-request decode/drafter buffers that a request took anyway). Measured
+first: window 4096 / 8192 / adaptive = 20k 3.7 / 3.7 / 3.6 s, 60k 14.1 / 13.7 / 13.6 s, and the
+adaptive one was really 8k (16k and the single pass declined every time at a 131k pool). With
+the reservation: 3.6 / 13.8 s, at a 262k pool too. Greedy outputs identical with a 2.2 GB
+ballast taken after load. The arena reuses buffers in allocation order, so the warm-up runs
+every pass-shape class at its largest member (4096, 512 = largest split-K pass, 127 = largest
+unaligned tail); remaining growth after it: 2 MB once. Exposed and fixed a startup race in
+`batched_prefill_enabled()` (a rank could take the token loop alone).
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |

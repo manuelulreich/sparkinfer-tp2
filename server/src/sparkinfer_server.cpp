@@ -1075,6 +1075,18 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[sparkinfer-server] tp=%d: CUDA_MODULE_LOADING=EAGER (lazy loading can fail "
                         "silently on a near-full card)\n", sparkinfer_server::g_tp);
     }
+    // (dual-GPU) tp>1: prefill in fixed 4096-token windows out of scratch reserved at load
+    // (ModelEngine::reserve_prefill), so a pass never sizes itself by what happens to be free --
+    // its output no longer depends on how full the card is, and the KV pool is all that competes
+    // for memory. Costs ~3-4% of a long prefill against free-memory-sized windows. Explicit
+    // values win; SPARKINFER_PREFILL_RESERVE=0 restores the adaptive sizing.
+    if (sparkinfer_server::g_tp > 1) {
+        setenv("SPARKINFER_PREFILL_RESERVE", "1", 0);
+        if (getenv("SPARKINFER_PREFILL_RESERVE")[0] == '1') {
+            setenv("SPARKINFER_PREFILL_WINDOW", "4096", 0);
+            setenv("SPARKINFER_PREFILL_SINGLE_MAX", getenv("SPARKINFER_PREFILL_WINDOW"), 0);
+        }
+    }
 
     const std::string root = repo_root();
     std::string tok_path = tokenizer_json.empty() ? root + "/models/tokenizer.json" : tokenizer_json;
@@ -1137,6 +1149,14 @@ int main(int argc, char** argv) {
         }
     }
     engine.release_unused_head();
+    {
+        std::string perr;
+        if (!engine.reserve_prefill(perr)) {
+            fprintf(stderr, "[sparkinfer-server] %s -- lower --ctx or SPARKINFER_KV_POOL_TOKENS, or "
+                            "set SPARKINFER_PREFILL_RESERVE=0\n", perr.c_str());
+            return 1;
+        }
+    }
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {

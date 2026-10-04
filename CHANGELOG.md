@@ -7,6 +7,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2: prefill scratch reserved at load, fixed 4096-token windows** (`SPARKINFER_PREFILL_RESERVE`,
+  on by default at `--tp 2`). A warm-up of each pass shape (two windows, a 512-row and a 127-row
+  pass, ~2 s) takes the scratch once; every pass then reuses it, and the per-pass choices that
+  followed free memory (FFN chunk, ffn_down int8 staging, the headroom decline that halved the
+  window, the nvfp4 KV history plane) are fixed. Output no longer depends on how full the card is:
+  greedy 300 / 9k / 20k-token prompts are byte-identical with 2.8 GB or 0.6 GB free. Prefill at
+  `startup.sh`'s config: 20k 3.6 s, 60k 13.8 s (the adaptive default, which declined to 8k
+  windows after two failed attempts, measured the same). Idle per card at `--ctx 131072`:
+  ~12.9 GiB, 2.8 GiB free; at 262144, 1.4 GiB free.
+
 - **tp=2: opt-in speculative (rejection) sampling for DFlash2** (`SPARKINFER_SPEC_REJECTION=1`).
   The selector's sampled walk reports its proposal distribution q (the candidates it draws from,
   softmax(score / temperature)); the verify accepts a drafted token with probability min(1, p/q)
@@ -44,6 +54,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   `completion_tokens_details.reasoning_tokens`, and streamed usage `speculative_tokens`.
 
 ### Fixed
+
+- **tp=2: the first prompt could hang one rank in the token loop.** `batched_prefill_enabled()`
+  cached two settings behind one "unset" check; both ranks' first calls race, and a rank that saw
+  the first set but the second still -1 took the token loop while its peer ran the batched pass
+  ("agreement out of step", context lost). Seen in 1 of 3 starts in deterministic mode without a
+  draft once prompts above 4096 tokens were windowed.
 
 - **fp8 / nvfp4 KV: prefill was not deterministic, so speculation was not lossless with them.**
   The e4m3 prefill attention (`pf_attn_mma_gqa_kernel<..., F8>`) retires the odd page of a

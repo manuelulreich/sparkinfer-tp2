@@ -137,6 +137,21 @@ __attribute__((format(printf, 1, 2))) void verify_decline(const char* fmt, ...) 
 bf16* gdn_conv_repad_dev(int l);
 void gdn_conv_repad_prime(const Qwen35PrefillCtx& s, const Qwen35Config& c, cudaStream_t st);
 
+// (dual-GPU) Fixed prefill reservation, SPARKINFER_PREFILL_RESERVE=1 (the server sets it at tp>1,
+// together with 4096-token windows). Every per-pass choice below that otherwise follows free VRAM
+// -- the FFN chunk, the int8 staging of ffn_down, the history plane of an fp8/nvfp4 KV cache, and
+// the headroom decline that halves the window -- takes a fixed value instead, and the arenas stay
+// held between passes. The server runs a short warm-up at load, so the scratch is taken
+// before the first request and a pass computes the same way however full the card is.
+std::atomic<bool> g_prefill_reserve_sealed{false};   // set once the load's warm-up has run
+bool prefill_reserved_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_RESERVE");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
 struct Arena {
     std::vector<void*> bufs;
     std::vector<size_t> sizes;
@@ -145,6 +160,7 @@ struct Arena {
     // Advances whenever a buffer this arena handed out is freed. Anything that kept one of its
     // pointers past a call -- the whole-prefill CUDA graph -- is stale once this has moved.
     uint64_t gen = 0;
+    uint64_t grown = 0;   // cudaMallocs so far: a pass that moved this took new device memory
     template <class T> T* alloc(size_t n) {
         if (n == 0) n = 1;
         const size_t bytes = n * sizeof(T);
@@ -160,6 +176,7 @@ struct Arena {
             sizes.erase(sizes.begin() + cursor);
         }
         if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
+        ++grown;
         bufs.insert(bufs.begin() + cursor, p);
         sizes.insert(sizes.begin() + cursor, bytes);
         ++cursor;
@@ -583,6 +600,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     Arena once_a, once_a8, once_am, once_aw;                       // per-call otherwise
     if (arena_reuse) { keep_a.rewind(); keep_a8.rewind(); keep_am.rewind(); keep_aw.rewind(); }
     Arena& a = arena_reuse ? keep_a : once_a;
+    const bool reserved = prefill_reserved_on() && arena_reuse;
+    const uint64_t grown0 = keep_a.grown + keep_a8.grown;
 
     // ---- CUDA-graph replay of the whole batched prefill -------------------------------------
     // Muse's batched prefill is the only hot path here that is NOT graph-captured: decode gets a
@@ -927,7 +946,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const bool ffn_alias = !moe && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)wide
                                 && (size_t)FC * (size_t)ffn <= (size_t)N * (size_t)lvdim;
     // An explicit SPARKINFER_PREFILL_FFN_CHUNK is an operator decision -- honour it as given.
-    if (!ffn_alias && !moe && !getenv("SPARKINFER_PREFILL_FFN_CHUNK")) {
+    if (!ffn_alias && !moe && !reserved && !getenv("SPARKINFER_PREFILL_FFN_CHUNK")) {
         size_t fb = 0, tb = 0;
         if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
             // What still has to come out of `fb` after the FC-scaled pair, so the chunk is sized
@@ -1061,8 +1080,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // fp8/nvfp4 KV: the attention's bf16 history plane is taken here too, with the arena, so it
     // cannot fail on one rank alone mid-pass (see kernels::prefill_kvq_reserve). Sized for all
     // KV heads: the attention launch below passes the rank's share only on the tp wide branch.
+    // Reserved: sized for a whole context at once, so it never grows with the history.
     if (a.ok && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer &&
-        !kernels::prefill_kvq_reserve(pos0 + N, c.n_kv_heads, c.head_dim, s.kv->block_size(),
+        !kernels::prefill_kvq_reserve(reserved ? std::max(pos0 + N, c.max_seq) : pos0 + N, c.n_kv_heads, c.head_dim, s.kv->block_size(),
                                       (int)s.kv->kv_dtype()))
         a.ok = false;
     // Headroom: the arena used to take the card down to a few MB, and whatever the pass or the
@@ -1071,7 +1091,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // up and the context is lost). Below the floor the pass declines here, where both ranks
     // agree, and the retry takes a smaller window. SPARKINFER_PREFILL_HEADROOM_MB (default 384;
     // tp only -- a single card has nothing to fall out of step with).
-    if (a.ok && tp_active) {
+    // Reserved: only a pass that took new memory can have pushed the card under the floor.
+    if (a.ok && tp_active && !(reserved && keep_a.grown + keep_a8.grown == grown0)) {
         static const size_t kHeadroom = [] {
             const char* e = getenv("SPARKINFER_PREFILL_HEADROOM_MB");
             return (size_t)(e ? std::max(0, atoi(e)) : 384) << 20;
@@ -1158,7 +1179,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return e && e[0] == '1';
     }();
     bool ffn_i8_stage = true;
-    if (ffn_all_fp4 && !ffn_i8_stage_force && a_i8_full > a_i8_rows_n) {
+    if (ffn_all_fp4 && !ffn_i8_stage_force && !reserved && a_i8_full > a_i8_rows_n) {
         size_t fb = 0, tb = 0;
         if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
             // Ask whether the ffn-wide term is the thing that does not fit -- not merely whether
@@ -4816,9 +4837,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     pf_cu(cudaStreamSynchronize(st), "prefill sync");
     int seed = *s.h_out_id;
 
+    // Reserved: name any growth past the warm-up's footprint (a pass shape it did not cover).
+    if (reserved) {
+        static thread_local size_t held = 0;
+        const size_t now = a.total() + a8.total() + am.total() + aw.total();
+        if (g_prefill_reserve_sealed && held && now > held)
+            fprintf(stderr, "[prefill] reserved scratch grew %zu -> %zu MB (n=%d, pos0=%d)\n",
+                    held >> 20, now >> 20, N, pos0);
+        if (now > held) held = now;
+    }
     // Release rather than hold when this call's scratch is too big to keep resident.
-    if (!arena_reuse ||
-        a.total() + a8.total() + am.total() + aw.total() > kArenaKeepBytes) {
+    if (!reserved && (!arena_reuse ||
+        a.total() + a8.total() + am.total() + aw.total() > kArenaKeepBytes)) {
         a.free_all();
         a8.free_all();
         am.free_all();
@@ -7503,5 +7533,7 @@ verify_forward_done:
     if (!async_commit) pf_cu(cudaStreamSynchronize(st), "verify commit");
     return keep;
 }
+
+void prefill_reserve_seal() { g_prefill_reserve_sealed = true; }
 
 } // namespace sparkinfer

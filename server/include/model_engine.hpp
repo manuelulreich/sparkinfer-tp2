@@ -279,6 +279,9 @@ public:
     // every head row from the NVFP4 head (~340 MB per card) -- unless a DSpark draft reads it.
     // SPARKINFER_HEAD_NVFP4_ONLY=0 keeps both. No-op at tp=1.
     void release_unused_head();
+    // (tp=2) With SPARKINFER_PREFILL_RESERVE=1: one warm-up prefill of two windows, so the
+    // prefill scratch is taken at load and every later pass reuses it. false = it did not fit.
+    bool reserve_prefill(std::string& err);
     bool speculative() const;
     struct SpeculativeStats {
         bool enabled = false;

@@ -31,6 +31,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -1361,6 +1362,59 @@ void ModelEngine::release_unused_head() {
         fprintf(stderr, "[sparkinfer-server] lm_head: release failed on one card only -- the two "
                         "cards now score with different head kernels\n");
     }
+}
+
+bool ModelEngine::reserve_prefill(std::string& err) {
+    const char* e = getenv("SPARKINFER_PREFILL_RESERVE");
+    if (!(e && e[0] == '1') || !impl_->model) return true;
+    const char* w = getenv("SPARKINFER_PREFILL_WINDOW");
+    const int window = w ? atoi(w) : 4096;
+    // The pass shapes requests take, each at the largest size of its class: the arena reuses
+    // buffers in allocation order and only while they are big enough, so a larger member of a
+    // class the warm-up never ran would grow it later. Prefill runs to a 128-aligned position and
+    // the rest (< 128 rows) as its own pass; passes up to 512 rows take split-K partials. So:
+    // two full windows (the second starts mid-sequence), a 512-row and a 127-row pass behind them,
+    // and the same two short shapes again from position zero.
+    const int n = std::min(2 * std::max(window, 512) + 512 + 127, impl_->cfg.max_seq - 8);
+    if (n < 1024) return true;
+    auto make_prompt = [](int len) {
+        std::vector<int> p(len);
+        for (int i = 0; i < len; i++) p[i] = 1000 + (int)((i * 7919u) % 50000u);
+        return p;
+    };
+    std::vector<size_t> free0;
+    auto card_free = [&] {
+        std::vector<size_t> f;
+        int cur = 0, cnt = 0;
+        cudaGetDevice(&cur);
+        cudaGetDeviceCount(&cnt);
+        for (int d = 0; d < cnt; d++) {
+            size_t fb = 0, tb = 0;
+            if (cudaSetDevice(d) == cudaSuccess && cudaMemGetInfo(&fb, &tb) == cudaSuccess) f.push_back(fb);
+        }
+        cudaSetDevice(cur);
+        return f;
+    };
+    free0 = card_free();
+    const auto t0 = std::chrono::steady_clock::now();
+    CompletionResult r = complete(make_prompt(n), 2);
+    if (r.error.empty()) r = complete(make_prompt(512 + 127), 2);
+    if (r.error.empty()) r = complete(make_prompt(127), 2);
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!r.error.empty()) {
+        err = "prefill reservation failed (" + r.error + ")";
+        return false;
+    }
+    sparkinfer::prefill_reserve_seal();
+    const std::vector<size_t> free1 = card_free();
+    fprintf(stderr, "[sparkinfer-server] prefill reserved: %d-token windows, warm-up %d + 639 + 127 tokens in %.1f s;",
+            window, n, s);
+    for (size_t d = 0; d < free1.size() && d < free0.size(); d++)
+        fprintf(stderr, " dev%zu +%lld MiB (%zu MiB free)", d,
+                ((long long)free0[d] - (long long)free1[d]) / (1 << 20), free1[d] >> 20);
+    fprintf(stderr, "\n");
+    mem_mark("prefill reserved");
+    return true;
 }
 
 bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
