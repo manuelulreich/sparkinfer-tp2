@@ -49,6 +49,12 @@ bool launch_prefill_attn_mma_f8(
     cudaStream_t stream = nullptr,
     int q_pos0 = 0);
 
+// Sizes the fp8 attention's V repack plane (the six-head tier's [block][kv head][dim][16 keys]
+// copy of V) for a history of `total_tokens` now, on the calling thread, which owns it. It is
+// otherwise grown on demand as the history grows and then held. The tier keeps its numerics
+// without the plane (paged loads), so false only means it will be tried again per pass.
+bool prefill_attn_f8_vpack_reserve(int total_tokens, int n_kv_heads, int head_dim);
+
 // BF16-KV twin, full causal, hd256 GQA. The int8 entry above cannot serve a bf16 KV pool, and the
 // bf16 pool is what the DSpark harness runs (dspark_tau_check pins int8_kv=false), so without this
 // the bf16 branch falls to a scalar warp-per-query kernel. Returns false when the shape is not

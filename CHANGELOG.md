@@ -7,6 +7,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **tp=2 prefill: ~590 MiB more free per card** (`SPARKINFER_PREFILL_FP4_ONLY`,
+  `SPARKINFER_ARENA_DUMP`). On the all-NVFP4 checkpoint the reserved prefill arena no longer
+  takes the bf16/int8 fallback scratch no projection uses (1,257 -> 794 MB), the nvfp4 KV
+  history plane is sized for the card's own KV heads (537 -> 268 MB at 262k), and the V repack
+  plane that grew after load is reserved with the rest. `CTX=262144`: 1,580 -> 2,174 MiB free
+  per card after load; outputs and prefill speed unchanged. The tp=2 gate's lossless check now
+  keeps the same lm_head on both servers (it compared the NVFP4 head against the Q4_K one).
+
 - **tp=2 DFlash2: ~280 MiB more free on card 0, ~35 MiB less per running stream**
   (`SPARKINFER_DFLASH2_SELECTOR_HOST`, `SPARKINFER_DFLASH2_TIGHT`). The selector's codebooks
   (243 MiB, card 0 only) moved to pinned, mapped host memory, read row by row by the unchanged

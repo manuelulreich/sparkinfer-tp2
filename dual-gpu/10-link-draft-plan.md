@@ -97,6 +97,23 @@ join capture capped at the same span: deterministic acceptance unchanged at 2k/4
 reservation for 4 streams (item 1) would therefore take ~520 MiB per card (~57k pool tokens).
 360k pool: 646 MiB free after load, 4 x 89k concurrent ran with no allocation failure.
 
+**Prefill arena audit (2026-10-04, work package 1 of the follow-up list).**
+`SPARKINFER_ARENA_DUMP=1` lists each arena buffer >= 1 MB with its allocating source line and
+the share of its bytes the pass wrote (every buffer is filled with 0xA5 after each dump). Across
+all warm-up passes at tp=2 the all-NVFP4 path wrote 0 bytes of: the bf16 dequant scratch (170 MB),
+the int8/fp8 operand scratch (W_i8 85 MB, A_i8 24 MB, split-K partials 110 MB) and the full-width
+FFN pair (2 x 34 MB; the tp FFN arm has its own rank-width pair). `SPARKINFER_PREFILL_FP4_ONLY`
+(default on when reserved, every layer's projections NVFP4 and no A/B knob set) skips them:
+arena 1,257 -> 794 MB. The nvfp4 history plane was reserved for all 4 KV heads while a rank
+attends over its 2: now per rank, 537 -> 268 MB at 262k. The six-head tier's V repack plane
+(134 MB at 262k) used to grow with the history after load and stay; it is now part of the
+reservation. Reservation at `CTX=262144`: +2,148 -> +1,554 MiB per card, 1,580 -> 2,174 MiB free
+(~65k pool tokens), memory after a 60k prompt equal to idle. Deterministic greedy 300 / 9k / 20k
+outputs and logprobs identical; prefill 20k 3.7 s, 60k 13.9 s (unchanged); gates pass.
+Gate fix found on the way: since 71ca887 a server without a draft releases the Q4_K lm_head and
+a DSpark server keeps it, so the gate's "lossless" compared two different heads (4 of 7 prompts
+differed already at 9e4cc0d); the deterministic gate servers now both keep it.
+
 ## Where the time goes (measured 2026-10-03, `SPARKINFER_DSPARK_TIMING`)
 
 | | draft ms/step | verify ms/step (8 rows) | tokens/step | tok/s |

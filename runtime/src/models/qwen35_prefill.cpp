@@ -19,6 +19,7 @@
 #include "sparkinfer/kernels/prefill_gdn_chunk.h"
 #include "sparkinfer/kernels/vision.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
+#include "sparkinfer/kernels/prefill_attn_mma.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/scratch_epoch.h"
 #include "sparkinfer/device_health.h"
@@ -157,17 +158,19 @@ bool prefill_reserved_on() {
 struct Arena {
     std::vector<void*> bufs;
     std::vector<size_t> sizes;
+    std::vector<int> lines;   // allocating source line per buffer (SPARKINFER_ARENA_DUMP)
     size_t cursor = 0;
     bool ok = true;
     // Advances whenever a buffer this arena handed out is freed. Anything that kept one of its
     // pointers past a call -- the whole-prefill CUDA graph -- is stale once this has moved.
     uint64_t gen = 0;
     uint64_t grown = 0;   // cudaMallocs so far: a pass that moved this took new device memory
-    template <class T> T* alloc(size_t n) {
+    template <class T> T* alloc(size_t n, int line = __builtin_LINE()) {
         if (n == 0) n = 1;
         const size_t bytes = n * sizeof(T);
         void* p = nullptr;
         if (cursor < bufs.size() && sizes[cursor] >= bytes) {
+            lines[cursor] = line;
             p = bufs[cursor++];
             return static_cast<T*>(p);
         }
@@ -176,11 +179,13 @@ struct Arena {
             ++gen;
             bufs.erase(bufs.begin() + cursor);
             sizes.erase(sizes.begin() + cursor);
+            lines.erase(lines.begin() + cursor);
         }
         if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
         ++grown;
         bufs.insert(bufs.begin() + cursor, p);
         sizes.insert(sizes.begin() + cursor, bytes);
+        lines.insert(lines.begin() + cursor, line);
         ++cursor;
         return static_cast<T*>(p);
     }
@@ -188,9 +193,27 @@ struct Arena {
     void free_all() {
         if (!bufs.empty()) ++gen;
         for (void* b : bufs) cudaFree(b);
-        bufs.clear(); sizes.clear(); cursor = 0;
+        bufs.clear(); sizes.clear(); lines.clear(); cursor = 0;
     }
     size_t total() const { size_t t = 0; for (size_t b : sizes) t += b; return t; }
+    // Debug: list buffers >= 1 MB, whether this pass wrote any byte of them (each buffer is
+    // filled with 0xA5 after the dump, so "untouched" is meaningful from the second pass on).
+    void dump(const char* name) const {
+        std::vector<unsigned char> h;
+        for (size_t i = 0; i < bufs.size(); ++i) {
+            if (sizes[i] < (1u << 20)) continue;
+            h.resize(sizes[i]);
+            cudaDeviceSynchronize();
+            cudaMemcpy(h.data(), bufs[i], sizes[i], cudaMemcpyDeviceToHost);
+            size_t w = 0;
+            for (unsigned char b : h) w += b != 0xA5;
+            fprintf(stderr, "[arena] %s #%zu line %d %.1f MB%s written %.1f%%\n", name, i, lines[i],
+                    sizes[i] / 1048576.0, i < cursor ? "" : " (unused this pass)",
+                    100.0 * w / sizes[i]);
+            cudaMemset(bufs[i], 0xA5, sizes[i]);
+            cudaDeviceSynchronize();
+        }
+    }
 };
 
 // Widest verify block dflash_verify_short_run accepts. Also the number of GRAPH TIERS it keeps:
@@ -924,6 +947,36 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // of size 20971520", i.e. N*H, from the o-projection quantize at N x 6144).
     // So: N rows x the widest K any N-row projection uses, OR FC rows x ffn for the chunked FFN.
     // MoE: no chunked FFN; projections quantize N rows x maxAK.
+    // All-NVFP4 tp prefill (reserved windows): every projection is a block-scaled FP4 GEMM straight
+    // off the checkpoint bytes, and the FFN runs the rank-width tp arm with its own scratch. The
+    // bf16 dequant scratch (wbuf), the int8/fp8 operand scratch (A_i8/W_i8/sx/sw, split-K partials)
+    // and the full-width FFN pair (ffg/ffu) are then never written -- measured 0 bytes across every
+    // warm-up pass shape, ~460 MB per card on Qwen3.8-27B. A GEMM that still declines finds wbuf
+    // null and dq() takes a buffer outside the arena (logged once) rather than failing the pass.
+    // SPARKINFER_PREFILL_FP4_ONLY=0 keeps the fallback scratch.
+    const bool fp4_only = reserved && tp_active && !moe && !c.muse_glimmer && c.dense_ffn &&
+                          c.hybrid && N <= bf16_minctx && [&] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP4_ONLY");
+        if (e && e[0] == '0') return false;
+        for (const char* k : {"SPARKINFER_Q38_NVFP4", "SPARKINFER_Q38_GDN_NVFP4_PREFILL",
+                              "SPARKINFER_Q38_ATTN_NVFP4_PREFILL", "SPARKINFER_TP_GDN_NVFP4",
+                              "SPARKINFER_Q38_GDN_NVFP4_MAXN", "SPARKINFER_Q38_ATTN_NVFP4_MAXN",
+                              "SPARKINFER_PREFILL_I8", "SPARKINFER_PREFILL_FP8_GDN"})
+            if (getenv(k)) return false;   // an A/B knob is set: keep every arm's scratch
+        if (s.gdn_window.v_count <= 0) return false;
+        const int rk = c.linear_v_heads / s.gdn_window.v_count;
+        if (rk < 2 || ffn % rk || qdim % 128 || kvdim % 128 || lqkv % 128 || lvdim % 128 ||
+            ffn % 128 || H % 128)
+            return false;
+        for (const auto& lw : s.w.layers) {
+            if (!lw.gate_fp4 || !lw.up_fp4 || !lw.down_fp4) return false;
+            if (lw.linear_attn ? !(lw.gdn_qkv_fp4 && lw.gdn_z_fp4 && lw.gdn_out_fp4)
+                               : !(lw.wq_fp4 && lw.wk_fp4 && lw.wv_fp4 && lw.wo_fp4))
+                return false;
+        }
+        return kernels::prefill_nvfp4_supported(N, ffn, H);
+    }();
+    if (fp4_only) { use_i8 = use_i8_ffn = use_i8_attn = use_fp8_gdn = false; }
     const bool need_i8 = use_i8 || use_i8_ffn || use_i8_attn || use_fp8_gdn || moe_shared_i8 || moe_fp8;
 
     pf_vram("before ffg/ffu");
@@ -1028,10 +1081,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const int want = ((N + tp_chunks - 1) / tp_chunks + 127) & ~127;
         if (tp_chunks > 1 && want < FC) FC = want;
     }
-    bf16* ffg  = ffn_alias ? b8 : a.alloc<bf16>((size_t)FC * ffn);   // ffn gate, bounded to FC tokens
-    bf16* ffu  = ffn_alias ? lz : a.alloc<bf16>((size_t)FC * ffn);   // ffn up,   bounded to FC tokens
+    bf16* ffg  = ffn_alias ? b8 : fp4_only ? nullptr : a.alloc<bf16>((size_t)FC * ffn);   // ffn gate, bounded to FC tokens
+    bf16* ffu  = ffn_alias ? lz : fp4_only ? nullptr : a.alloc<bf16>((size_t)FC * ffn);   // ffn up,   bounded to FC tokens
     bf16* ffh  = ffg;                                    // SwiGLU computed in-place into ffg (down reads it)
-    bf16* wbuf = a.alloc<bf16>(maxw);                    // dequantized-weight scratch (reused)
+    bf16* wbuf = fp4_only ? nullptr : a.alloc<bf16>(maxw);   // dequantized-weight scratch (reused)
     int*  d_ids = a.alloc<int>((size_t)N);
     // tp per-rank scratch, taken HERE -- before the arena check below -- at the widest size any
     // arm uses. It used to be taken lazily inside the layer loop, past that check: on a card with
@@ -1082,11 +1135,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // fp8/nvfp4 KV: the attention's bf16 history plane is taken here too, with the arena, so it
     // cannot fail on one rank alone mid-pass (see kernels::prefill_kvq_reserve). Sized for all
     // KV heads: the attention launch below passes the rank's share only on the tp wide branch.
-    // Reserved: sized for a whole context at once, so it never grows with the history.
+    // Reserved: sized for a whole context at once, so it never grows with the history -- and for
+    // the rank's share of the heads when the wide branch is the one that runs (both widths
+    // divide; half the plane, 268 MB per card at 262k on Qwen3.8-27B). The V repack plane of the
+    // e4m3 six-head tier is taken here too, instead of growing with the history and then being
+    // held outside the reservation.
+    const int kvq_ranks = (tp_active && s.gdn_window.v_count > 0)
+        ? c.linear_v_heads / s.gdn_window.v_count : 1;
+    const int kvq_heads = (reserved && kvq_ranks > 1 && c.n_kv_heads % kvq_ranks == 0 &&
+                           wide % kvq_ranks == 0 && kvdim % kvq_ranks == 0)
+        ? c.n_kv_heads / kvq_ranks : c.n_kv_heads;
+    const int kvq_tokens = reserved ? std::max(pos0 + N, c.max_seq) : pos0 + N;
     if (a.ok && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer &&
-        !kernels::prefill_kvq_reserve(reserved ? std::max(pos0 + N, c.max_seq) : pos0 + N, c.n_kv_heads, c.head_dim, s.kv->block_size(),
+        !kernels::prefill_kvq_reserve(kvq_tokens, kvq_heads, c.head_dim, s.kv->block_size(),
                                       (int)s.kv->kv_dtype()))
         a.ok = false;
+    if (a.ok && reserved && s.kv->kv_dtype() >= KV_FP8 && !c.muse_glimmer)
+        kernels::prefill_attn_f8_vpack_reserve(kvq_tokens, kvq_heads, c.head_dim);
     // Headroom: the arena used to take the card down to a few MB, and whatever the pass or the
     // engine allocated next -- a session's state, the draft's capture rows, a CUDA stream --
     // failed on that card alone, mid-pass (at tp=2 the ranks' collectives then no longer pair
@@ -2022,6 +2087,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // Dequantize a native GGUF weight [n_out,K] to bf16 scratch; return a bf16 [n_out,K] ptr.
     auto dq = [&](const void* W, int wtype, int n_out, int K) -> const void* {
         if (wtype == 0) return W;   // already bf16 dense
+        if (!wbuf) {
+            // fp4_only declined a GEMM it expected to take: a buffer outside the arena, kept.
+            static thread_local bf16* spill = nullptr;
+            if (!spill) {
+                fprintf(stderr, "[prefill] fp4-only pass needs the bf16 dequant scratch "
+                                "(%.0f MB outside the reservation; SPARKINFER_PREFILL_FP4_ONLY=0 "
+                                "reserves it)\n", maxw * sizeof(bf16) / 1048576.0);
+                pf_cu(cudaMalloc(&spill, maxw * sizeof(bf16)), "fp4-only dequant scratch");
+            }
+            wbuf = spill;
+        }
         if (wtype == kPtq1GgmlType) {
             // Ternary, stored rotated. Every branch below wants ordinary bf16, so decode and take
             // the rotation off here; the resident weight stays in its 28-byte blocks. Matched on
@@ -4851,6 +4927,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             fprintf(stderr, "[prefill] reserved scratch grew %zu -> %zu MB (n=%d, pos0=%d)\n",
                     held >> 20, now >> 20, N, pos0);
         if (now > held) held = now;
+        static const bool dump = getenv("SPARKINFER_ARENA_DUMP") != nullptr;
+        if (dump) {
+            fprintf(stderr, "[arena] pass n=%d pos0=%d total %zu MB\n", N, pos0, now >> 20);
+            a.dump("a"); a8.dump("a8"); am.dump("am"); aw.dump("aw");
+        }
     }
     // Release rather than hold when this call's scratch is too big to keep resident.
     if (!reserved && (!arena_reuse ||

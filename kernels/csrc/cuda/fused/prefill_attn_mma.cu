@@ -1202,13 +1202,16 @@ __global__ void pf_v_pack_kernel(const signed char* __restrict__ v_pool,
 
 // Returns the packed plane for this pass, or nullptr to keep the caller on the paged loads.
 // SPARKINFER_PREFILL_ATTN_VPACK=0 disables it (A/B in ONE binary).
-const signed char* vpack_build(const signed char* v_pool, const int* block_table,
-                               int n_blk, int n_kv_heads, int head_dim, cudaStream_t stream) {
+bool vpack_on() {
     static const bool on = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_VPACK");
         return !(e && e[0] == '0');
     }();
-    if (!on || n_blk <= 0 || head_dim <= 0) return nullptr;
+    return on;
+}
+const signed char* vpack_build(const signed char* v_pool, const int* block_table,
+                               int n_blk, int n_kv_heads, int head_dim, cudaStream_t stream) {
+    if (!vpack_on() || n_blk <= 0 || head_dim <= 0) return nullptr;
     const size_t bytes = (size_t)n_blk * n_kv_heads * head_dim * 16;
     if (!vpack_reserve(bytes)) return nullptr;
     pf_v_pack_kernel<<<dim3(n_blk, n_kv_heads), head_dim, 0, stream>>>(
@@ -1654,6 +1657,11 @@ bool launch_prefill_attn_mma_f8(
                                         v_scale, block_table, attn, n_tokens, n_q_heads,
                                         n_kv_heads, head_dim, block_size, max_blocks_per_seq,
                                         scale, win_blocks, stream, q_pos0);
+}
+bool prefill_attn_f8_vpack_reserve(int total_tokens, int n_kv_heads, int head_dim) {
+    if (!vpack_on() || total_tokens <= 0 || n_kv_heads <= 0 || head_dim <= 0) return true;
+    const size_t n_blk = ((size_t)total_tokens + 15) / 16;
+    return vpack_reserve(n_blk * n_kv_heads * head_dim * 16);
 }
 #endif
 

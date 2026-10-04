@@ -52,6 +52,10 @@ class Server:
         env = dict(os.environ)
         if deterministic:
             env["SPARKINFER_DETERMINISTIC"] = "1"
+            # A DSpark server keeps the Q4_K lm_head (DSpark scores it), a server without a draft
+            # releases it for the NVFP4 one: the two would decode with different heads, and
+            # "lossless" would compare two targets. Keep it on both.
+            env.setdefault("SPARKINFER_HEAD_NVFP4_ONLY", "0")
         cmd = [os.path.join(a.build, "server", "sparkinfer_server"), "-m", a.model,
                "--tokenizer", os.path.join(a.model, "tokenizer.json"), "--ctx", str(a.ctx),
                "--port", str(a.port), "--host", "127.0.0.1", "--tp", "2", "--devices", a.devices]
