@@ -41,6 +41,28 @@ namespace sparkinfer_server {
 
 namespace {
 
+// SPARKINFER_MEM_LOG=1: each card's used device memory at the load milestones below, with the
+// change since the previous mark (the memory audit of plan 10).
+void mem_mark(const char* what) {
+    static const bool on = [] { const char* e = getenv("SPARKINFER_MEM_LOG"); return e && e[0] == '1'; }();
+    if (!on) return;
+    static size_t last[8] = {};
+    int cur = 0, n = 0;
+    cudaGetDevice(&cur);
+    cudaGetDeviceCount(&n);
+    fprintf(stderr, "[mem] %-34s", what);
+    for (int d = 0; d < n && d < 8; d++) {
+        size_t fb = 0, tb = 0;
+        if (cudaSetDevice(d) != cudaSuccess || cudaMemGetInfo(&fb, &tb) != cudaSuccess) continue;
+        const size_t used = tb - fb;
+        fprintf(stderr, "  dev%d %6zu MiB (%+6lld)", d, used >> 20,
+                ((long long)used - (long long)last[d]) / (1 << 20));
+        last[d] = used;
+    }
+    fprintf(stderr, "\n");
+    cudaSetDevice(cur);
+}
+
 bool prompt_starts_with(const std::vector<int>& prompt, const std::vector<int>& prefix) {
     if (prefix.empty() || prompt.size() < prefix.size()) return false;
     return std::equal(prefix.begin(), prefix.end(), prompt.begin());
@@ -496,8 +518,10 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     // slots would hand out 4x the blocks for the same memory rather than shrinking the pool.
     // At tp>1 the budget is this device's (per the rank's head window above); the other ranks'
     // pools in Wave 3 H size the same way from their own windows.
+    mem_mark("start (CUDA contexts)");
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
         kvc, (size_t)kvL * 2 * epb * 2 * blocks);
+    mem_mark("rank0 KV pool");
 
     // Reports the slot count actually used, and the resident bytes rather than the bf16 budget --
     // the old line multiplied by n_layers (all 64) and by 2 regardless of int8, so it overstated
@@ -617,6 +641,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             fprintf(stderr, "[sparkinfer-server] load_compressed_tensors failed\n");
             return false;
         }
+        mem_mark("rank0 weights + decode state");
     } else {
         // Qwen35Model::load_weights() reads a directory of already-converted flat .bin files
         // (runtime/tools/convert_qwen35.py's own offline output format), not a safetensors
@@ -682,6 +707,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
                     win.v_start + win.v_count);
             // (dual-GPU D5) This rank's per-card budget-audit line (same 128k-context estimate).
             impl_->tp_models.back()->print_tp_audit(131072);
+            mem_mark("rank1 KV pool + weights + state");
         }
         // Restore the default device so any post-load host-side work (lmcache, vision) runs as
         // before; the per-instance binds already happened in each ctor.
@@ -708,6 +734,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
                     "[sparkinfer-server] tp=2: GpuLink attached (rank0 dev %d, rank1 dev %d); "
                     "split-weight forward active\n",
                     eff[0], eff[1]);
+            mem_mark("GpuLink (all-reduce scratch)");
         } else {
             // R>2: an explicit --devices list is not tied to tp and not capped at 2, so a
             // >=3-rank load is reachable in principle on a >=3-device box. tp is capped at 2
@@ -758,6 +785,7 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     }
     impl_->batch_engine = std::make_unique<sparkinfer::ContinuousBatchEngine>(
         impl_->model.get(), impl_->kv.get(), batch_tokens_per_step(), policy);
+    mem_mark("batch engine");
     // (dual-GPU WP-9b) The engine's own block ops (shared prefix session, prefix-cache retains,
     // truncation, frees) go to rank 1's identically sized pool too, keeping one block numbering.
     if (impl_->tp_link && !impl_->tp_kvs.empty())
@@ -1318,6 +1346,7 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     if (split_draft) {
         // Built and loaded on the second card's tp worker thread, which is bound to that card (the
         // constructor's stream and every allocation land there).
+        mem_mark("before draft");
         const int peer_dev = impl_->tp_models[0]->tp_rank_view().device;
         sparkinfer::DFlashDraftConfig pcfg = dcfg;
         pcfg.tp_rank = 1;
@@ -1346,6 +1375,7 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
               " -- if the log above shows CUDA out-of-memory errors, lower --ctx (131072 fits a 32 GB card)";
         return false;
     }
+    mem_mark("draft weights (both halves)");
     // At tp>1 the card holding the draft is the tight one, and the quantized copies (~1.2 GB) are
     // otherwise built lazily by the first speculative request -- where running out of memory
     // takes the request (and the tp group) down instead of failing here, cleanly, at load.
@@ -1359,6 +1389,7 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
                   "keeps it on one card)";
             return false;
         }
+        mem_mark("draft quantized + paired");
         // Free-memory floor on every card after the draft is in: below it the server loads but
         // cannot open a session (each holds ~74 MB of GDN state per card on the 27B) or fit a
         // prefill window -- every request would fail with "device out of memory". Measured on

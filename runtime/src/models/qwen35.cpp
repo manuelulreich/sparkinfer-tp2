@@ -75,6 +75,21 @@
 
 namespace sparkinfer {
 
+// SPARKINFER_MEM_LOG=1: this card's used device memory at load milestones, with the change since
+// the previous mark on the same card (the plan 10 memory audit; the server marks the steps around).
+static void q35_mem_mark(const char* what) {
+    static const bool on = [] { const char* e = getenv("SPARKINFER_MEM_LOG"); return e && e[0] == '1'; }();
+    if (!on) return;
+    static thread_local size_t last[8] = {};
+    int d = 0;
+    size_t fb = 0, tb = 0;
+    if (cudaGetDevice(&d) != cudaSuccess || cudaMemGetInfo(&fb, &tb) != cudaSuccess || d >= 8) return;
+    const size_t used = tb - fb;
+    fprintf(stderr, "[mem]   dev%d %-30s %6zu MiB (%+6lld)\n", d, what, used >> 20,
+            last[d] ? ((long long)used - (long long)last[d]) / (1 << 20) : 0LL);
+    last[d] = used;
+}
+
 namespace {
 inline void cu(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return;
@@ -12132,6 +12147,7 @@ void Qwen35Model::print_tp_audit(int ctx) const {
 // alpha = 1/weight_global_scale) and a Q4_K decode copy (native GEMV is slower).
 bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     Impl& s = *p_;
+    q35_mem_mark("ctor done (load start)");
     SafeTensorsModel st;
     if (!st.open(model_dir)) {
         fprintf(stderr, "[compressed-tensors] failed to open %s\n", model_dir.c_str());
@@ -12985,6 +13001,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // NEW residency beyond that payload is the re-laid-out scale copy -- 0.0625 B/weight, 79 MB
     // at this head's 248320x5120.
     //
+    q35_mem_mark("embed/head/norms");
     // Gated on free VRAM with a reserve, decided here and once: this model already peaks near the
     // card at long context, and the batched-prefill scratch arena is allocated later and per run.
     // Spending the arena's headroom on a decode-only operand would trade a no-regression floor
@@ -13045,6 +13062,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
     }
 
+    q35_mem_mark("NVFP4 lm_head keep");
     s.w.layers.resize(c.n_layers);
     int gu_ready = 0;
     for (int i = 0; i < c.n_layers; i++) {
@@ -13323,6 +13341,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             return false;
         }
     }
+    q35_mem_mark("64 layers");
     fprintf(stderr, "[compressed-tensors] loaded %d layers, native NVFP4 prefill FFN %d/%d, "
             "decode FFN %s\n", c.n_layers, gu_ready, c.n_layers,
             kDecodeNvfp4 ? "NVFP4" : "Q4_K");
