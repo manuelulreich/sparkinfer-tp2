@@ -7,6 +7,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **Swift 1.5 as an alternative target** (plan 11). `dual-gpu/tools/swift_to_nvfp4.py` turns
+  `ukisai/Swift-1.5-Qwen3.8-27b-NVFP4` (ModelOpt mixed NVFP4/FP8) into the all-NVFP4 layout of the
+  served Qwen3.8 checkpoint. It requantizes the 208 FP8 GDN/attention projections from the BF16
+  originals, fetched by HTTP range (~14 GB), with a per-block scale search: rel RMS error 0.0833
+  against ModelOpt's own 0.0847 on Swift's FFN. Tensor inventory, memory (456k-token pool, 4
+  stream slots), DFlash2 and the gates are unchanged (all pass). On the captured opencode final step
+  Swift wrote 1,504 tokens on average against 1,855 (4 seeds), at 115 vs 118 tok/s.
+
 - **Stream slots reserved at load** (`SPARKINFER_STREAM_SLOTS`, default 4 at `--tp 2`;
   `SPARKINFER_STREAM_SLOT_MB` 100, `SPARKINFER_STREAM_HEADROOM_MB` 192). The per-stream buffers of
   that many concurrent requests (recurrent state, sampling arrays, the drafter's session KV and
@@ -25,6 +33,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   `CTX=262144` 1,554 -> 1,266 MiB per card; 20k / 60k prefill unchanged (3.7 / 13.9 s).
 
 ### Fixed
+
+- **Reasoning effort text for Qwen3.8.** Every effort got the xhigh instruction with its own name
+  in it ("Reasoning effort is set to low. Please think carefully ..."). It now renders the
+  checkpoints' own template: xhigh (the default) and low have their own texts, medium injects
+  nothing, `high` renders as xhigh and `minimal` as low. On six harder problems the median
+  reasoning at low fell from 2,681 to 1,273 tokens (12/12 correct both); on easy questions the
+  xhigh text gives the shortest answers on both models, so low/medium can run longer there.
 
 - **nvfp4 prefill attention read unwritten plane rows.** The rows past the history in its last
   16-token page were never written by the nvfp4 -> e4m3 conversion, and the smaller attention

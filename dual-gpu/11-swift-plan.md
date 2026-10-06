@@ -1,6 +1,58 @@
 # 11. Swift 1.5 (Qwen3.8-27B fine-tune) as an alternative target
 
-Written 2026-10-05. Plan only; nothing here is implemented yet.
+Written 2026-10-05.
+
+## Status (2026-10-06): Path A done, `PRESET=swift ./startup.sh`
+
+- **Conversion.** Output in `~/models/Swift-1.5-Qwen3.8-27b-NVFP4-sparkinfer` (17.9 GB, 19 min on
+  3 cores).
+  - Inputs:
+    - the NVFP4 export (manifest sha256 OK);
+    - the BF16 originals of the 208 FP8 Linears, fetched by range from
+      `ukisai/Swift-1.5-Qwen3.8-27b@b4c84d42`.
+  - The tensor inventory (2,387 names, dtypes, shapes) is identical to the served Qwen3.8
+    checkpoint.
+- **Quantizer.**
+  - The tensor-wide scale follows ModelOpt's `amax/(6*448)` and matches it exactly
+    (`--selftest`).
+  - ModelOpt does not use a plain `block_amax/6` block scale (only ~30 % of its block bytes
+    match it). It picks lower-error scales: rel RMS 0.0847 for its bytes, 0.095 for the plain
+    scale.
+  - `quant_nvfp4` searches ±4 e4m3 codes per block: 0.0833 on all 208 tensors.
+- **Memory.** Identical to Qwen3.8: 456k-token pool, 4 stream slots, 216 MiB free per card.
+- **Gates** (`tp2_gates.py`, DFlash2): lossless 7/7, determinism and batching exact, no perf
+  regression against `baseline_2x5060ti.json`.
+- **Quality and speed against Qwen3.8 on the same build:**
+
+  | | Swift | Qwen3.8 |
+  |---|---|---|
+  | perplexity (ppl.py) | 4.51 | 4.46 |
+  | greedy C1 / C4 tok/s | 107 / ~315 | 105 / ~302 |
+  | DFlash2 tokens/step: sampled C1, C4; greedy C4 | 2.61, 2.85; 3.08 | 2.39, 2.68; 2.75 |
+  | opencode final step (cap_e2e3 007, 4 seeds): tokens / s / tok/s | 1,504 / 13.3 / 115 | 1,855 / 15.9 / 118 |
+  | 12 easy tasks x2: correct, mean reasoning | 24/24, 172 | 24/24, 192 |
+  | 6 hard tasks x2 (xhigh): correct, mean / median reasoning | 11/12, 2,407 / 849 | 12/12, 2,946 / 2,681 |
+  | same at low | 12/12, 2,740 / 874 | 12/12, 3,573 / 1,273 |
+
+  - The drafter, trained on base Qwen3.8, accepts as well or better on Swift.
+  - One sampled C4 run ended its group halfway on the gain guard; a rerun did not. Sampled runs
+    vary.
+- **Template (S4)**, checked by a read-only comparison of Swift's `chat_template.jinja` with
+  the server's renderer.
+  - **Default effort, thinking off, user/system/tools framing:** identical.
+  - **Effort text:** low and medium were wrong for both models (every effort got the xhigh
+    sentence). Fixed in the server; see the CHANGELOG.
+  - **Remaining differences.** All of them apply equally to the current model's own template:
+    - tool JSON key order;
+    - tool-call argument order (sorted);
+    - Swift's upstream template emits an empty `<think>\n\n</think>` for a replayed assistant
+      turn without reasoning, where the served template, and so the server, emits none.
+- **Not done.**
+  - **No absolute reference.** There is no KL against a Swift GGUF reference: it would need a
+    llama.cpp build plus a 24–29 GB download.
+  - **Quantization quality** is argued from the per-tensor error instead. It is the same
+    recipe class as the served checkpoint, with a lower error than ModelOpt's own.
+  - **Path B** was not needed.
 
 Candidate: [`ukisai/Swift-1.5-Qwen3.8-27b-NVFP4`](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-NVFP4)
 (revision `25482027debd5485e8108897ba9fed8d3ba16595`, 21.9 GB).

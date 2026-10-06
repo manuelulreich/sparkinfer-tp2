@@ -1880,12 +1880,23 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
     size_t first_message = 0;
     const bool tools_active = !request.tools.empty() && request.tool_choice != ToolChoiceMode::kNone;
     const bool json_mode = request.response_format.type != ResponseFormatType::kText;
-    const std::string effort = request.reasoning_effort.empty() ? "xhigh" : request.reasoning_effort;
-    const std::string reasoning_instructions = (inject_reasoning_effort && enable_thinking)
-        ? "Reasoning effort is set to " + effort + ". Please think carefully through the task, validate "
-          "key assumptions, consider plausible alternatives, and prioritize correctness, "
-          "consistency, and clarity in the final answer."
-        : std::string();
+    // Qwen3.8's template knows three efforts, each with its own text: xhigh (the default), low,
+    // and medium, which emits nothing. The other values the API accepts map to the nearest one
+    // (high -> xhigh, minimal -> low); "Reasoning effort is set to high" is a string the model
+    // never saw in training. Before 2026-10-05 every effort got the xhigh sentence.
+    const std::string& asked = request.reasoning_effort;
+    std::string reasoning_instructions;
+    if (inject_reasoning_effort && enable_thinking) {
+        if (asked == "low" || asked == "minimal")
+            reasoning_instructions =
+                "Reasoning effort is set to low. Keep your thinking brief and focused, moving "
+                "directly to the conclusion without unnecessary elaboration.";
+        else if (asked != "medium")
+            reasoning_instructions =
+                "Reasoning effort is set to xhigh. Please think carefully through the task, "
+                "validate key assumptions, consider plausible alternatives, and prioritize "
+                "correctness, consistency, and clarity in the final answer.";
+    }
     const bool has_leading_system = !request.messages.empty() && request.messages[0].role == "system";
     // Request-time validation (parse_chat_request_json) rejects tools + response_format
     // together, so tools_active and json_mode are never both true -- written as two independent

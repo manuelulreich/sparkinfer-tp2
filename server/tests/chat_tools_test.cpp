@@ -875,15 +875,29 @@ bool test_reasoning_effort_controls() {
     // Calling with two arguments enables thinking but not injection, so this asserted a string the
     // call could not produce. Broken since the assertion was written (3881e0c), which added it
     // against the three-parameter signature 8dbfcdb had already introduced.
-    CHECK(contains(apply_qwen36_tools_template(request, true, true),
-                   "Reasoning effort is set to medium"));
+    // Qwen3.8's template (the served checkpoints' chat_template.jinja) emits nothing for medium.
+    CHECK(!contains(apply_qwen36_tools_template(request, true, true), "Reasoning effort is set to"));
+    // xhigh is the default, with the "think carefully" text.
+    ChatRequest plain;
+    CHECK(parse_request(R"({"messages":[{"role":"user","content":"hi"}]})", plain));
+    CHECK(contains(apply_qwen36_tools_template(plain, true, true),
+                   "Reasoning effort is set to xhigh. Please think carefully"));
     // And the default really is off, or the assertion above would pass for the wrong reason.
-    CHECK(!contains(apply_qwen36_tools_template(request, true), "Reasoning effort is set to"));
+    CHECK(!contains(apply_qwen36_tools_template(plain, true), "Reasoning effort is set to"));
 
     CHECK(parse_request(
         R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"})",
         request));
     CHECK(request.reasoning_effort == "low");
+    // low has its own text, not the xhigh sentence with "low" in it.
+    CHECK(contains(apply_qwen36_tools_template(request, true, true),
+                   "Reasoning effort is set to low. Keep your thinking brief and focused"));
+    CHECK(!contains(apply_qwen36_tools_template(request, true, true), "think carefully"));
+    // high is not a Qwen3.8 effort: it renders as xhigh.
+    CHECK(parse_request(
+        R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"})",
+        request));
+    CHECK(contains(apply_qwen36_tools_template(request, true, true), "Reasoning effort is set to xhigh."));
     CHECK(parse_request(
         R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"max","exclude":true}})",
         request));
